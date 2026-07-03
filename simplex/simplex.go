@@ -221,9 +221,7 @@ func duals(st *State, cost []float64, m int) []float64 {
 		if cb == 0 {
 			continue
 		}
-		for k := 0; k < m; k++ {
-			y[k] += cb * st.binv[i][k]
-		}
+		axpy(y, st.binv[i], cb)
 	}
 	return y
 }
@@ -472,11 +470,7 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 		if i == leaveRow || a[i] == 0 {
 			continue
 		}
-		factor := a[i]
-		row := st.binv[i]
-		for k := 0; k < lp.m; k++ {
-			row[k] -= factor * rowR[k]
-		}
+		axpy(st.binv[i], rowR, -a[i])
 	}
 	st.basicOf[leaveRow] = q
 	st.status[q] = basic
