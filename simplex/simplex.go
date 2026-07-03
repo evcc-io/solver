@@ -198,32 +198,30 @@ func (lp *LP) recomputeBasics(st *State) {
 	}
 }
 
-func (lp *LP) alpha(st *State, j int) []float64 {
+// alpha fills dst (length lp.m, assumed zeroed) with column j's entries
+// against the current basis: Binv * column(j).
+func (lp *LP) alpha(st *State, j int, dst []float64) {
 	rows, vals := lp.column(j)
-	a := make([]float64, lp.m)
 	for k, r := range rows {
 		c := vals[k]
 		if c == 0 {
 			continue
 		}
 		for i := 0; i < lp.m; i++ {
-			a[i] += st.binv[i][r] * c
+			dst[i] += st.binv[i][r] * c
 		}
 	}
-	return a
 }
 
-// duals computes y = cost_B^T * Binv (as a length-m row vector).
-func duals(st *State, cost []float64, m int) []float64 {
-	y := make([]float64, m)
+// duals fills dst (length m, assumed zeroed) with y = cost_B^T * Binv.
+func duals(st *State, cost []float64, m int, dst []float64) {
 	for i := 0; i < m; i++ {
 		cb := cost[st.basicOf[i]]
 		if cb == 0 {
 			continue
 		}
-		axpy(y, st.binv[i], cb)
+		axpy(dst, st.binv[i], cb)
 	}
-	return y
 }
 
 func (lp *LP) reducedCost(y []float64, cost []float64, j int) float64 {
@@ -273,38 +271,43 @@ func (lp *LP) SetBound(j int, lb, ub float64) { lp.lb[j] = lb; lp.ub[j] = ub }
 // NumCols returns the number of structural columns.
 func (lp *LP) NumCols() int { return lp.n }
 
-// phaseCost recomputes the Phase-1 cost vector: -1 for a basic var below
-// its lower bound, +1 above its upper bound; false once all are feasible.
-func (lp *LP) phaseCost(st *State) ([]float64, bool) {
-	cost := make([]float64, lp.nTotal())
+// phaseCost fills dst (length nTotal, zeroed) with the Phase-1 cost
+// vector; returns false once all basic variables are feasible.
+func (lp *LP) phaseCost(st *State, dst []float64) bool {
 	inPhase1 := false
 	for i := 0; i < lp.m; i++ {
 		bv := st.basicOf[i]
 		v := st.value[bv]
 		switch {
 		case v < lp.lb[bv]-eps:
-			cost[bv] = -1
+			dst[bv] = -1
 			inPhase1 = true
 		case v > lp.ub[bv]+eps:
-			cost[bv] = 1
+			dst[bv] = 1
 			inPhase1 = true
 		}
 	}
-	return cost, inPhase1
+	return inPhase1
 }
 
 // run recomputes the active cost vector fresh before every pivot, so a
 // variable that becomes feasible mid-sequence stops influencing pricing.
 func (lp *LP) run(st *State) Status {
+	phase1Cost := make([]float64, lp.nTotal())
+	y := make([]float64, lp.m)
+	a := make([]float64, lp.m)
 	for iter := 0; ; iter++ {
 		if iter > maxIter {
 			return IterLimit
 		}
-		cost, inPhase1 := lp.phaseCost(st)
+		clear(phase1Cost)
+		inPhase1 := lp.phaseCost(st, phase1Cost)
+		cost := phase1Cost
 		if !inPhase1 {
 			cost = lp.cost
 		}
-		y := duals(st, cost, lp.m)
+		clear(y)
+		duals(st, cost, lp.m, y)
 		q, dir := lp.chooseEntering(st, y, cost)
 		if q < 0 {
 			if inPhase1 {
@@ -312,7 +315,8 @@ func (lp *LP) run(st *State) Status {
 			}
 			return Optimal
 		}
-		a := lp.alpha(st, q)
+		clear(a)
+		lp.alpha(st, q, a)
 		t, row, isFlip := lp.ratioTest(st, a, q, dir, inPhase1)
 		if row < 0 && !isFlip {
 			if inPhase1 {
@@ -484,7 +488,8 @@ func (lp *LP) Solution(st *State) (x, rowActivity, reducedCost, rowPrice []float
 	for i := 0; i < lp.m; i++ {
 		rowActivity[i] = -st.value[lp.n+i] * -1 // logical var value == row activity (y_i = Ax_i)
 	}
-	y := duals(st, lp.cost, lp.m)
+	y := make([]float64, lp.m)
+	duals(st, lp.cost, lp.m, y)
 	rowPrice = make([]float64, lp.m)
 	for i := range rowPrice {
 		rowPrice[i] = y[i] * lp.objSign
