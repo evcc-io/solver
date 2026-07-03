@@ -1,0 +1,11 @@
+# Known-failing tests in PuLP 3.3.2's COIN_CMDTest suite, and why.
+# See README.md's "Known shortcomings" section for full explanations.
+# Format: ClassName::test_name, one per line.
+
+# Expects exact variable values on a degenerate infeasible LP that depend on
+# CBC's own internal pivoting tie-breaks, not on correctness of the status.
+COIN_CMDTest::test_infeasible
+
+# Expects a feasible incumbent for a ~16,500-variable bin-packing instance
+# within 10s; needs a primal heuristic (rounding/diving) we don't have.
+COIN_CMDTest::test_measuring_solving_time
