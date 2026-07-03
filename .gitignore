@@ -3,3 +3,4 @@ debug.mps
 .pulpenv-bin
 .pulpenv/
 bin/
+simplex.test
