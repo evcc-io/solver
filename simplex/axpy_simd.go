@@ -1,11 +1,11 @@
-//go:build goexperiment.simd
+//go:build goexperiment.simd && !arm64
 
 package simplex
 
 import "simd"
 
-// axpy computes dst[k] += factor*src[k] for all k, vectorized via the
-// experimental simd package (Go 1.27+, GOEXPERIMENT=simd).
+// axpy computes dst[k] += factor*src[k], vectorized via the portable simd
+// package. arm64 uses simd/archsimd directly (axpy_archsimd_arm64.go).
 func axpy(dst, src []float64, factor float64) {
 	fv := simd.BroadcastFloat64s(factor)
 	width := fv.Len()

@@ -1,0 +1,21 @@
+//go:build goexperiment.simd && arm64
+
+package simplex
+
+import "simd/archsimd"
+
+// axpy computes dst[k] += factor*src[k], using NEON directly (no portable
+// dispatch stub) via simd/archsimd's Float64x2 (128-bit, 2 lanes).
+func axpy(dst, src []float64, factor float64) {
+	fv := archsimd.BroadcastFloat64x2(factor)
+	n := len(dst)
+	k := 0
+	for ; k+2 <= n; k += 2 {
+		d := archsimd.LoadFloat64x2(dst[k : k+2])
+		s := archsimd.LoadFloat64x2(src[k : k+2])
+		s.MulAdd(fv, d).Store(dst[k : k+2])
+	}
+	for ; k < n; k++ {
+		dst[k] += factor * src[k]
+	}
+}
