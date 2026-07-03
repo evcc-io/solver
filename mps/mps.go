@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"cbcgo/internal/problem"
+	"cbcgo/problem"
 )
 
 var sectionNames = map[string]bool{

@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"cbcgo/internal/problem"
+	"cbcgo/problem"
 )
 
 func almost(a, b float64) bool { return math.Abs(a-b) < 1e-6 }

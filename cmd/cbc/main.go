@@ -9,10 +9,10 @@ import (
 	"strconv"
 	"strings"
 
-	"cbcgo/internal/mip"
-	"cbcgo/internal/mps"
-	"cbcgo/internal/problem"
-	"cbcgo/internal/solfile"
+	"cbcgo/mip"
+	"cbcgo/mps"
+	"cbcgo/problem"
+	"cbcgo/solfile"
 )
 
 // valueOnlyFlags are accepted (with their following value consumed) but

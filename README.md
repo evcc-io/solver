@@ -52,11 +52,14 @@ why they haven't been fixed.
 
 ```
 cmd/cbc/            CLI entry point: flag parsing, orchestration
-internal/mps/        MPS reader (free format) and CPLEX-LP reader
-internal/solfile/     .sol file writer, .mst warm-start file reader
-internal/problem/     mutable LP/MIP model: rows, cols, bounds, SOS
-internal/simplex/     bounded-variable primal simplex, dense Binv
-internal/mip/         branch-and-bound: best-first search, SOS branching
+mps/                 MPS reader (free format) and CPLEX-LP reader
+solfile/             .sol file writer, .mst warm-start file reader
+problem/             mutable LP/MIP model: rows, cols, bounds, SOS
+simplex/             bounded-variable primal simplex, dense Binv
+mip/                 branch-and-bound: best-first search, SOS branching
+test/                 Go wrapper for the PuLP compatibility suite (below)
+scripts/               run-pulp-tests.sh: the PuLP suite runner itself
+testdata/              pulp_known_failures.txt: the documented-failure allowlist
 ```
 
 Package dependency order (no cycles): `problem` and nothing else at the
@@ -72,16 +75,34 @@ go test ./...
 go build -o bin/cbc ./cmd/cbc
 ```
 
-To verify against real PuLP (requires Python):
+### Verifying against real PuLP
+
+`go test ./...` alone does **not** run the PuLP suite, since it needs
+`python3` and (on first run) network access to `pip install`. Opt in with:
 
 ```
-python3 -m venv /tmp/pulpenv && source /tmp/pulpenv/bin/activate
-pip install pulp==3.3.2 pytest
-mkdir -p /tmp/cbcpath && ln -sf "$(pwd)/bin/cbc" /tmp/cbcpath/cbc
-PATH="/tmp/cbcpath:$PATH" python -m pytest \
-  "$(python -c 'import pulp,os;print(os.path.dirname(pulp.__file__))')/tests/test_pulp.py" \
-  -k COIN_CMDTest -q
+RUN_PULP_TESTS=1 go test ./test/...
 ```
+
+or run the underlying script directly for more output:
+
+```
+./scripts/run-pulp-tests.sh
+```
+
+Either way this creates/reuses a venv at `.pulpenv/` (gitignored), installs
+`pulp==3.3.2` and `pytest` if not already present, builds `bin/cbc`, symlinks
+it onto `PATH` as `cbc` (`COIN_CMD`'s default path is the bare string `"cbc"`,
+resolved via `shutil.which`), and runs PuLP's own
+`pulp/tests/test_pulp.py::COIN_CMDTest`.
+
+The test **passes** as long as no failure appears beyond the ones listed in
+`testdata/pulp_known_failures.txt` (currently `test_infeasible` and
+`test_measuring_solving_time` — see
+[Known shortcomings](#known-shortcomings)). It fails loudly on any new,
+undocumented failure — a real regression. If a listed failure starts
+passing (e.g. after implementing a fix), the script reports it as
+resolved and you should remove it from that file.
 
 (`COIN_CMD`'s default path is the bare string `"cbc"`, resolved via
 `shutil.which` — hence the `PATH` symlink trick rather than passing `path=`

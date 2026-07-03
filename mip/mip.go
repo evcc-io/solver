@@ -7,8 +7,8 @@ import (
 	"math"
 	"time"
 
-	"cbcgo/internal/problem"
-	"cbcgo/internal/simplex"
+	"cbcgo/problem"
+	"cbcgo/simplex"
 )
 
 type Status int

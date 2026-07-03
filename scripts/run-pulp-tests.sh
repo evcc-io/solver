@@ -34,8 +34,12 @@ ln -sf "$ROOT/bin/cbc" "$PATH_SHIM/cbc"
 PULP_TESTS="$(python -c 'import pulp, os; print(os.path.dirname(pulp.__file__))')/tests/test_pulp.py"
 
 echo "==> running PuLP's COIN_CMDTest suite"
+DURATIONS_ARGS=()
+if [ -n "${PULP_DURATIONS:-}" ]; then
+  DURATIONS_ARGS=(--durations="$PULP_DURATIONS")
+fi
 set +e
-OUTPUT="$(PATH="$PATH_SHIM:$PATH" python -m pytest "$PULP_TESTS" -k COIN_CMDTest -q -rf --no-header 2>&1)"
+OUTPUT="$(PATH="$PATH_SHIM:$PATH" python -m pytest "$PULP_TESTS" -k COIN_CMDTest -q -rf --no-header "${DURATIONS_ARGS[@]}" 2>&1)"
 set -e
 echo "$OUTPUT"
 

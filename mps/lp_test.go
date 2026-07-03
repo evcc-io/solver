@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"cbcgo/internal/mip"
-	"cbcgo/internal/problem"
+	"cbcgo/mip"
+	"cbcgo/problem"
 )
 
 // lpText mirrors PuLP's writeLP shape for test_infeasible: an empty

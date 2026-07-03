@@ -1,3 +1,5 @@
 debug.lp
 debug.mps
 .pulpenv-bin
+.pulpenv/
+bin/

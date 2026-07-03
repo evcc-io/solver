@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"cbcgo/internal/problem"
+	"cbcgo/problem"
 )
 
 // ReadLP reads PuLP's CPLEX-style .lp format (pulp/mps_lp.py's writeLP),

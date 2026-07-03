@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"cbcgo/internal/mip"
+	"cbcgo/mip"
 )
 
 const knapsackMPS = `NAME          TEST

@@ -7,7 +7,7 @@ package simplex
 import (
 	"math"
 
-	"cbcgo/internal/problem"
+	"cbcgo/problem"
 )
 
 const (
