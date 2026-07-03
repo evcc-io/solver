@@ -1,11 +1,11 @@
-//go:build goexperiment.simd && arm64
+//go:build goexperiment.simd && amd64
 
 package simplex
 
 import "simd/archsimd"
 
-// axpy computes dst[k] += factor*src[k], using NEON directly (no portable
-// dispatch stub) via simd/archsimd's Float64x2 (128-bit, 2 lanes).
+// axpy computes dst[k] += factor*src[k], using SSE2 directly (no portable
+// dispatch stub) via simd/archsimd's Float64x2 — part of the amd64 baseline.
 func axpy(dst, src []float64, factor float64) {
 	fv := archsimd.BroadcastFloat64x2(factor)
 	n := len(dst)
@@ -20,7 +20,7 @@ func axpy(dst, src []float64, factor float64) {
 	}
 }
 
-// scale computes dst[k] /= divisor for all k, using NEON directly.
+// scale computes dst[k] /= divisor for all k, using SSE2 directly.
 func scale(dst []float64, divisor float64) {
 	dv := archsimd.BroadcastFloat64x2(divisor)
 	n := len(dst)

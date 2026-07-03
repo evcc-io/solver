@@ -9,3 +9,10 @@ func axpy(dst, src []float64, factor float64) {
 		dst[k] += factor * src[k]
 	}
 }
+
+// scale computes dst[k] /= divisor for all k.
+func scale(dst []float64, divisor float64) {
+	for k := range dst {
+		dst[k] /= divisor
+	}
+}
