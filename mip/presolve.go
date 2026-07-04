@@ -15,6 +15,12 @@ const presolvePasses = 10
 func presolve(p *problem.Problem) {
 	for range presolvePasses {
 		if !presolvePass(p) {
+			break
+		}
+	}
+	probe(p)
+	for range presolvePasses {
+		if !presolvePass(p) {
 			return
 		}
 	}
@@ -170,6 +176,158 @@ func setCoef(p *problem.Problem, ri, k int, v float64) {
 		if rr == ri {
 			c.Coef[pos] = v
 			return
+		}
+	}
+}
+
+// propagate tightens the working bound slices from row activity ranges,
+// iterating to a fixpoint; reports false when some row proves infeasible.
+func propagate(p *problem.Problem, lb, ub []float64) bool {
+	inf := problem.Inf
+	for pass := 0; pass < 4; pass++ {
+		changed := false
+		for ri := range p.Rows {
+			r := &p.Rows[ri]
+			rlb, rub := r.Bounds()
+			var minSum, maxSum float64
+			var minInf, maxInf int
+			for k, j := range r.Idx {
+				a := r.Coef[k]
+				l, u := lb[j], ub[j]
+				if l <= -inf {
+					l = math.Inf(-1)
+				}
+				if u >= inf {
+					u = math.Inf(1)
+				}
+				lo, hi := a*l, a*u
+				if a < 0 {
+					lo, hi = hi, lo
+				}
+				if math.IsInf(lo, -1) {
+					minInf++
+				} else {
+					minSum += lo
+				}
+				if math.IsInf(hi, 1) {
+					maxInf++
+				} else {
+					maxSum += hi
+				}
+			}
+			// row-level infeasibility against the activity range
+			if minInf == 0 && rub < inf && minSum > rub+1e-7 {
+				return false
+			}
+			if maxInf == 0 && rlb > -inf && maxSum < rlb-1e-7 {
+				return false
+			}
+			for k, j := range r.Idx {
+				a := r.Coef[k]
+				if a == 0 {
+					continue
+				}
+				l, u := lb[j], ub[j]
+				lf, uf := l, u
+				if lf <= -inf {
+					lf = math.Inf(-1)
+				}
+				if uf >= inf {
+					uf = math.Inf(1)
+				}
+				lo, hi := a*lf, a*uf
+				if a < 0 {
+					lo, hi = hi, lo
+				}
+				omin, omax := math.Inf(-1), math.Inf(1)
+				if minInf == 0 {
+					omin = minSum - lo
+				} else if minInf == 1 && math.IsInf(lo, -1) {
+					omin = minSum
+				}
+				if maxInf == 0 {
+					omax = maxSum - hi
+				} else if maxInf == 1 && math.IsInf(hi, 1) {
+					omax = maxSum
+				}
+				nl, nu := l, u
+				if rub < inf && !math.IsInf(omin, -1) {
+					if a > 0 {
+						nu = math.Min(nu, (rub-omin)/a)
+					} else {
+						nl = math.Max(nl, (rub-omin)/a)
+					}
+				}
+				if rlb > -inf && !math.IsInf(omax, 1) {
+					if a > 0 {
+						nl = math.Max(nl, (rlb-omax)/a)
+					} else {
+						nu = math.Min(nu, (rlb-omax)/a)
+					}
+				}
+				if p.Cols[j].Integer {
+					nl = math.Ceil(nl - 1e-9)
+					nu = math.Floor(nu + 1e-9)
+				}
+				if nl > nu+1e-9 {
+					return false
+				}
+				if nl > l+1e-9 || nu < u-1e-9 {
+					lb[j], ub[j] = math.Max(l, nl), math.Min(u, nu)
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			return true
+		}
+	}
+	return true
+}
+
+// probe tentatively fixes each binary both ways (CglProbing-style): an
+// infeasible side fixes the binary; otherwise merged implied bounds apply.
+func probe(p *problem.Problem) {
+	n := len(p.Cols)
+	base := make([]float64, 2*n)
+	lb0, ub0 := make([]float64, n), make([]float64, n)
+	lb1, ub1 := make([]float64, n), make([]float64, n)
+	for j, c := range p.Cols {
+		base[j], base[n+j] = c.LB, c.UB
+	}
+	for j, c := range p.Cols {
+		if !c.Integer || c.LB != 0 || c.UB != 1 {
+			continue
+		}
+		copy(lb0, base[:n])
+		copy(ub0, base[n:])
+		copy(lb1, base[:n])
+		copy(ub1, base[n:])
+		ub0[j] = 0
+		lb1[j] = 1
+		feas0 := propagate(p, lb0, ub0)
+		feas1 := propagate(p, lb1, ub1)
+		switch {
+		case !feas0 && !feas1:
+			return // infeasible problem: leave it to the LP to report
+		case !feas0:
+			p.Cols[j].LB = 1
+			base[j] = 1
+		case !feas1:
+			p.Cols[j].UB = 0
+			base[n+j] = 0
+		default:
+			// merged implied bounds are valid regardless of y_j
+			for i := range n {
+				if l := math.Min(lb0[i], lb1[i]); l > base[i]+1e-9 {
+					p.Cols[i].LB = l
+					base[i] = l
+				}
+				if u := math.Max(ub0[i], ub1[i]); u < base[n+i]-1e-9 {
+					p.Cols[i].UB = u
+					base[n+i] = u
+				}
+			}
 		}
 	}
 }
