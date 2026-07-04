@@ -72,7 +72,7 @@ type State struct {
 	status  []varStat
 	basicOf []int // row -> basic variable index
 	value   []float64
-	binv    [][]float64
+	binv    []float64 // flat m*m, row-major: binv[i*m+k]
 }
 
 func Build(p *problem.Problem) *LP {
@@ -129,15 +129,15 @@ func (lp *LP) column(j int) ([]int, []float64) {
 // finite bound is available (lower preferred), or free at 0.
 func (lp *LP) initState() *State {
 	nt := lp.nTotal()
+	m := lp.m
 	st := &State{
 		status:  make([]varStat, nt),
-		basicOf: make([]int, lp.m),
+		basicOf: make([]int, m),
 		value:   make([]float64, nt),
-		binv:    make([][]float64, lp.m),
+		binv:    make([]float64, m*m),
 	}
-	for i := 0; i < lp.m; i++ {
-		st.binv[i] = make([]float64, lp.m)
-		st.binv[i][i] = -1
+	for i := 0; i < m; i++ {
+		st.binv[i*m+i] = -1
 		st.basicOf[i] = lp.n + i
 		st.status[lp.n+i] = basic
 	}
@@ -167,16 +167,12 @@ func (lp *LP) resetNonbasic(st *State, j int) {
 // Clone returns a deep copy, safe to mutate independently of st (used to
 // warm-start a branch-and-bound child node from its parent's basis).
 func (st *State) Clone() *State {
-	c := &State{
+	return &State{
 		status:  append([]varStat(nil), st.status...),
 		basicOf: append([]int(nil), st.basicOf...),
 		value:   append([]float64(nil), st.value...),
-		binv:    make([][]float64, len(st.binv)),
+		binv:    append([]float64(nil), st.binv...),
 	}
-	for i, row := range st.binv {
-		c.binv[i] = append([]float64(nil), row...)
-	}
-	return c
 }
 
 // WarmSolve resolves from st after bound changes on touched, instead of
@@ -211,8 +207,9 @@ func (lp *LP) recomputeBasics(st *State) {
 	}
 	for i := 0; i < m; i++ {
 		var s float64
+		row := st.binv[i*m : i*m+m]
 		for k := 0; k < m; k++ {
-			s += st.binv[i][k] * (-residual[k])
+			s += row[k] * (-residual[k])
 		}
 		st.value[st.basicOf[i]] = s
 	}
@@ -221,14 +218,15 @@ func (lp *LP) recomputeBasics(st *State) {
 // alpha fills dst (length lp.m, assumed zeroed) with column j's entries
 // against the current basis: Binv * column(j).
 func (lp *LP) alpha(st *State, j int, dst []float64) {
+	m := lp.m
 	rows, vals := lp.column(j)
 	for k, r := range rows {
 		c := vals[k]
 		if c == 0 {
 			continue
 		}
-		for i := 0; i < lp.m; i++ {
-			dst[i] += st.binv[i][r] * c
+		for i := 0; i < m; i++ {
+			dst[i] += st.binv[i*m+r] * c
 		}
 	}
 }
@@ -240,8 +238,9 @@ func duals(st *State, cost []float64, m int, dst []float64) {
 		if cb == 0 {
 			continue
 		}
+		row := st.binv[i*m : i*m+m]
 		for k := 0; k < m; k++ {
-			dst[k] += cb * st.binv[i][k]
+			dst[k] += cb * row[k]
 		}
 	}
 }
@@ -514,18 +513,19 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 		st.value[leaving] = ub
 	}
 
+	m := lp.m
 	pivotVal := a[leaveRow]
-	rowR := st.binv[leaveRow]
-	for k := 0; k < lp.m; k++ {
+	rowR := st.binv[leaveRow*m : leaveRow*m+m]
+	for k := 0; k < m; k++ {
 		rowR[k] /= pivotVal
 	}
-	for i := 0; i < lp.m; i++ {
+	for i := 0; i < m; i++ {
 		if i == leaveRow || a[i] == 0 {
 			continue
 		}
 		factor := a[i]
-		row := st.binv[i]
-		for k := 0; k < lp.m; k++ {
+		row := st.binv[i*m : i*m+m]
+		for k := 0; k < m; k++ {
 			row[k] -= factor * rowR[k]
 		}
 	}
