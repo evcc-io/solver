@@ -49,7 +49,7 @@ func TestFactorFtranBtran(t *testing.T) {
 	for trial := range 50 {
 		m := 5 + rng.Intn(60)
 		colRow, colVal := randomBasis(rng, m)
-		f := factorize(m, colRow, colVal)
+		f := factorize(m, colRow, colVal, nil)
 		if f == nil {
 			continue // singular draw: skip
 		}
@@ -94,7 +94,7 @@ func TestFactorEtaUpdate(t *testing.T) {
 	for trial := range 30 {
 		m := 5 + rng.Intn(40)
 		colRow, colVal := randomBasis(rng, m)
-		f := factorize(m, colRow, colVal)
+		f := factorize(m, colRow, colVal, nil)
 		if f == nil {
 			continue
 		}

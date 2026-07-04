@@ -44,19 +44,39 @@ type factor struct {
 	xScratch, kScratch []float64
 }
 
+// factorWS holds factorize's reusable working arrays; nil means allocate
+// fresh (the solver is single-threaded, so one per LP suffices).
+type factorWS struct {
+	rowCount, colCount   []int
+	rowActive, colActive []bool
+	rowCols              [][]int32
+	queue                []int
+}
+
+func newFactorWS(m int) *factorWS {
+	return &factorWS{
+		rowCount: make([]int, m), colCount: make([]int, m),
+		rowActive: make([]bool, m), colActive: make([]bool, m),
+		rowCols: make([][]int32, m), queue: make([]int, 0, m),
+	}
+}
+
 // factorize builds a factorization of the basis whose pos-th column is
 // (colRow[pos], colVal[pos]); returns nil if the kernel is singular.
-func factorize(m int, colRow [][]int32, colVal [][]float64) *factor {
+func factorize(m int, colRow [][]int32, colVal [][]float64, ws *factorWS) *factor {
 	f := &factor{m: m, colRow: colRow, colVal: colVal}
 
-	rowCount := make([]int, m) // active nonzeros per row
-	colCount := make([]int, m) // active nonzeros per col (basis position)
-	rowActive := make([]bool, m)
-	colActive := make([]bool, m)
-	// rowCols[r] lists (pos) with a structural entry in row r
-	rowCols := make([][]int32, m)
+	if ws == nil {
+		ws = newFactorWS(m)
+	}
+	rowCount, colCount := ws.rowCount, ws.colCount
+	rowActive, colActive := ws.rowActive, ws.colActive
+	rowCols := ws.rowCols
+	clear(rowCount)
+	clear(colCount)
 	for i := range rowActive {
 		rowActive[i], colActive[i] = true, true
+		rowCols[i] = rowCols[i][:0]
 	}
 	for pos := range m {
 		for k, r := range colRow[pos] {
@@ -78,7 +98,7 @@ func factorize(m int, colRow [][]int32, colVal [][]float64) *factor {
 	}
 
 	// phase 1: row singletons resolve forward
-	queue := make([]int, 0, m)
+	queue := ws.queue[:0]
 	for r := range m {
 		if rowCount[r] == 1 {
 			queue = append(queue, r)

@@ -53,6 +53,11 @@ type LP struct {
 	colRow [][]int
 	colVal [][]float64
 
+	// immutable int32 mirror of every column (incl. logicals), shared by
+	// all factorizations instead of being converted per refactorize
+	colRow32 [][]int32
+	colVal32 [][]float64
+
 	lb, ub  []float64 // length n+m
 	cost    []float64 // length n+m, signed for internal minimization
 	rawObj  []float64 // length n, unsigned (as given in the problem)
@@ -66,6 +71,8 @@ type LP struct {
 	// (partial pricing) instead of all n+m every pivot; 0 means full scan.
 	pricingWindow int
 	pricingCursor int // scan position for partial pricing
+
+	fws *factorWS // reusable factorization workspace
 
 	// Stats accumulates pivot counts across solves (diagnostics only).
 	Stats struct {
@@ -102,14 +109,12 @@ func (lp *LP) refactorize(st *State) bool {
 	colRow := make([][]int32, lp.m)
 	colVal := make([][]float64, lp.m)
 	for pos, j := range st.basicOf {
-		rows, vals := lp.column(j)
-		cr := make([]int32, len(rows))
-		for k, r := range rows {
-			cr[k] = int32(r)
-		}
-		colRow[pos], colVal[pos] = cr, vals
+		colRow[pos], colVal[pos] = lp.colRow32[j], lp.colVal32[j]
 	}
-	f := factorize(lp.m, colRow, colVal)
+	if lp.fws == nil {
+		lp.fws = newFactorWS(lp.m)
+	}
+	f := factorize(lp.m, colRow, colVal, lp.fws)
 	if f == nil {
 		return false
 	}
@@ -148,6 +153,16 @@ func Build(p *problem.Problem) *LP {
 		lb, ub := r.Bounds()
 		lp.lb[n+i], lp.ub[n+i] = lb, ub
 		lp.cost[n+i] = 0
+	}
+	lp.colRow32 = make([][]int32, n+m)
+	lp.colVal32 = make([][]float64, n+m)
+	for j := range n + m {
+		rows, vals := lp.column(j)
+		cr := make([]int32, len(rows))
+		for k, r := range rows {
+			cr[k] = int32(r)
+		}
+		lp.colRow32[j], lp.colVal32[j] = cr, vals
 	}
 	// partial pricing disabled: extra pivots from window-local entering
 	// choices dominate scan savings when each pivot is O(m^2) on dense binv
