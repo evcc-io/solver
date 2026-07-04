@@ -437,14 +437,24 @@ func (m *Model) Solve() Result {
 			}
 			if diveTries < 8 && branchCol >= 0 && (nodeCount == 1 || nodeCount%256 == 0) {
 				diveTries++
-				// box the heuristic burst: dives must never eat the tree's time
+				// box the heuristic burst: dives must never eat the tree's time.
+				// The root burst gets more — success there ends the whole solve
 				savedDL := m.LP.Deadline
 				if m.Limits.MaxTime > 0 {
-					if hb := time.Now().Add(m.Limits.MaxTime / 8); savedDL.IsZero() || hb.Before(savedDL) {
+					div := time.Duration(8)
+					if nodeCount == 1 {
+						div = 3
+					}
+					if hb := time.Now().Add(m.Limits.MaxTime / div); savedDL.IsZero() || hb.Before(savedDL) {
 						m.LP.Deadline = hb
 					}
 				}
-				hObj, hx, hAct, hRC, hPrice, ok := m.rensImprove(nd, x)
+				hObj, hx, hAct, hRC, hPrice, ok := m.faceWalk(nd, x, endState, obj)
+				if ok {
+					debugf("facewalk: integral vertex on face obj=%g", hObj)
+				} else {
+					hObj, hx, hAct, hRC, hPrice, ok = m.rensImprove(nd, x)
+				}
 				if !ok {
 					hObj, hx, hAct, hRC, hPrice, ok = m.feasibilityPump(nd, x, endState)
 					if !ok {
@@ -739,6 +749,50 @@ func (m *Model) rinsImprove(nd *node, x []float64) (obj float64, dx, rowAct, rc,
 	}
 	// remaining fractional integers: finish with the rounding dive
 	return m.diveForIncumbent(child, cx, cState)
+}
+
+// faceWalk fixes fractional ints one by one, only keeping fixes that hold the
+// objective on the node's LP-optimal face: an integral vertex proves the bound
+func (m *Model) faceWalk(nd *node, x []float64, st *simplex.State, faceObj float64) (obj float64, dx, rowAct, rc, price []float64, ok bool) {
+	tol := math.Max(m.Limits.GapAbs, 1e-7)
+	cur, curX, curState := nd, x, st
+	for {
+		if !m.LP.Deadline.IsZero() && time.Now().After(m.LP.Deadline) {
+			return 0, nil, nil, nil, nil, false
+		}
+		col, sosIdx, _ := m.findBranch(curX)
+		if sosIdx >= 0 {
+			return 0, nil, nil, nil, nil, false
+		}
+		if col < 0 {
+			dx, rowAct, rc, price = m.LP.Solution(curState)
+			return m.LP.InternalObjective(curState), dx, rowAct, rc, price, true
+		}
+		lb, ub := m.nodeBound(cur, col)
+		v := math.Max(lb, math.Min(ub, math.Round(curX[col])))
+		alt, hasAlt := 2*math.Floor(curX[col])+1-v, true
+		if alt < lb || alt > ub {
+			hasAlt = false
+		}
+		var child *node
+		var cx []float64
+		var cState *simplex.State
+		for {
+			child = childNodeMulti(cur, curState, []boundOverride{{col, v, v}}, cur.bound)
+			status, x2, _, _, _, cObj, cs := m.solveNode(child)
+			if status == simplex.Optimal && cObj <= faceObj+tol {
+				cx, cState = x2, cs
+				break
+			}
+			if !hasAlt {
+				debugf("facewalk: off face at depth %d col %d status=%d obj=%g face=%g",
+					child.depth-nd.depth, col, status, cObj, faceObj)
+				return 0, nil, nil, nil, nil, false
+			}
+			v, hasAlt = alt, false
+		}
+		cur, curX, curState = child, cx, cState
+	}
 }
 
 // rensImprove (CBC RENS) fixes integers already integral in the node LP and
