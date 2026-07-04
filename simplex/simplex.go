@@ -645,7 +645,7 @@ func (lp *LP) run(st *State) Status {
 		}
 		clear(a)
 		lp.alpha(st, q, a)
-		t, row, isFlip := lp.ratioTest(st, a, q, dir, inPhase1)
+		t, row, isFlip := lp.ratioTest(st, a, q, dir, inPhase1, degen > blandAfter)
 		if row < 0 && !isFlip {
 			if inPhase1 {
 				return Infeasible
@@ -754,7 +754,7 @@ func (lp *LP) scanEntering(st *State, y, cost []float64, lo, hi int) (q int, dir
 
 // ratioTest finds how far entering variable q can move in direction dir
 // before it flips to its opposite bound or a basic variable hits a bound.
-func (lp *LP) ratioTest(st *State, a []float64, q int, dir float64, phase1 bool) (t float64, leaveRow int, isFlip bool) {
+func (lp *LP) ratioTest(st *State, a []float64, q int, dir float64, phase1, bland bool) (t float64, leaveRow int, isFlip bool) {
 	t = math.Inf(1)
 	leaveRow = -1
 	if lp.lb[q] > -inf && lp.ub[q] < inf {
@@ -812,6 +812,12 @@ func (lp *LP) ratioTest(st *State, a []float64, q int, dir float64, phase1 bool)
 			t = limit
 			leaveRow = i
 			isFlip = false
+		} else if bland && !isFlip && leaveRow >= 0 && limit <= t+eps &&
+			st.basicOf[i] < st.basicOf[leaveRow] {
+			// Bland's leaving rule on ties: smallest basic variable index.
+			// Anti-cycling needs Bland for BOTH entering and leaving.
+			t = math.Min(t, limit)
+			leaveRow = i
 		}
 	}
 	if leaveRow < 0 && !isFlip {
