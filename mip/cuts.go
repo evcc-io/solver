@@ -76,7 +76,10 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 		coef := make([]float64, n)
 		rhs := f0
 		ok := true
-		for j := 0; j < nt && ok; j++ {
+		for j := range nt {
+			if !ok {
+				break
+			}
 			a := tab[j]
 			upper, nonbasic := st.VarStatusAtUpper(j)
 			if !nonbasic {

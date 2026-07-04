@@ -537,7 +537,7 @@ func (m *Model) feasibilityPump(nd *node, x []float64, endState *simplex.State) 
 	st := endState.Clone()
 	curX := x
 	var prev []float64
-	for iter := 0; iter < 30; iter++ {
+	for iter := range 30 {
 		if !m.LP.Deadline.IsZero() && time.Now().After(m.LP.Deadline) {
 			return fail()
 		}

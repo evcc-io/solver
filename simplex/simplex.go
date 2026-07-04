@@ -257,7 +257,7 @@ func (lp *LP) dualRun(st *State) {
 	}
 
 	var skip map[int]bool // rows whose violation the dual cannot fix
-	for iter := 0; iter <= dualPivotCap; iter++ {
+	for iter := range dualPivotCap + 1 {
 		if !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
 			return
 		}

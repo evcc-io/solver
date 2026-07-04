@@ -46,7 +46,7 @@ func multiply(colRow [][]int32, colVal [][]float64, m int, x []float64) []float6
 
 func TestFactorFtranBtran(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
-	for trial := 0; trial < 50; trial++ {
+	for trial := range 50 {
 		m := 5 + rng.Intn(60)
 		colRow, colVal := randomBasis(rng, m)
 		f := factorize(m, colRow, colVal)
@@ -91,7 +91,7 @@ func TestFactorFtranBtran(t *testing.T) {
 
 func TestFactorEtaUpdate(t *testing.T) {
 	rng := rand.New(rand.NewSource(11))
-	for trial := 0; trial < 30; trial++ {
+	for trial := range 30 {
 		m := 5 + rng.Intn(40)
 		colRow, colVal := randomBasis(rng, m)
 		f := factorize(m, colRow, colVal)

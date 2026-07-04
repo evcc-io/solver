@@ -8,7 +8,7 @@ import (
 
 func TestSparseLUSolve(t *testing.T) {
 	rng := rand.New(rand.NewSource(3))
-	for trial := 0; trial < 60; trial++ {
+	for trial := range 60 {
 		k := 2 + rng.Intn(80)
 		// diagonal-dominant-ish sparse kernel: guaranteed diagonal + extras
 		colIdx := make([][]int32, k)
