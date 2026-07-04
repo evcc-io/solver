@@ -4,6 +4,7 @@ package mip
 
 import (
 	"math"
+	"time"
 
 	"cbcgo/problem"
 )
@@ -13,12 +14,6 @@ const presolvePasses = 10
 // presolve tightens col bounds and binary big-M coefficients in place; it
 // preserves the mixed-integer feasible set while tightening the relaxation.
 func presolve(p *problem.Problem) {
-	for range presolvePasses {
-		if !presolvePass(p) {
-			break
-		}
-	}
-	probe(p)
 	for range presolvePasses {
 		if !presolvePass(p) {
 			return
@@ -287,7 +282,8 @@ func propagate(p *problem.Problem, lb, ub []float64) bool {
 
 // probe tentatively fixes each binary both ways (CglProbing-style): an
 // infeasible side fixes the binary; otherwise merged implied bounds apply.
-func probe(p *problem.Problem) {
+// Effort is time-boxed: partial results are valid tightenings.
+func probe(p *problem.Problem, deadline time.Time) {
 	n := len(p.Cols)
 	base := make([]float64, 2*n)
 	lb0, ub0 := make([]float64, n), make([]float64, n)
@@ -298,6 +294,9 @@ func probe(p *problem.Problem) {
 	for j, c := range p.Cols {
 		if !c.Integer || c.LB != 0 || c.UB != 1 {
 			continue
+		}
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return
 		}
 		copy(lb0, base[:n])
 		copy(ub0, base[n:])

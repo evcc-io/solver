@@ -54,8 +54,10 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 - **Basis factorization**: singleton triangularization with a sparse-LU
   kernel and product-form (eta) updates — O(nnz) pivots, periodic
   refactorization. No dense inverse.
-- **Presolve**: iterated activity-based bound tightening and big-M
-  coefficient tightening for binaries.
+- **Presolve**: iterated activity-based bound tightening, big-M
+  coefficient tightening for binaries, and time-boxed binary probing
+  (CglProbing-style: fix each binary both ways, propagate, fix binaries
+  with an infeasible side, merge implied bounds).
 - **Cuts**: Gomory mixed-integer cuts at the root, with support/dynamism
   hygiene, bound-driven round control, and retraction of batches that
   degrade the LP numerically.
@@ -64,8 +66,9 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   exit, root reduced-cost fixing, SOS1/SOS2 via Beale–Tomlin splitting.
 - **Branching**: strong branching at shallow depths seeding pseudocosts;
   pseudocost selection deeper (reliability-branching shape).
-- **Heuristics**: caller-provided MIP start (`mip.Model.MIPStart`),
-  feasibility pump, two-sided rounding dive, RINS-lite improvement.
+- **Heuristics**: caller-provided MIP start (`mip.Model.MIPStart`,
+  completed before the cut loop so reduced-cost fixing bites), feasibility
+  pump, two-sided rounding dive, RINS-lite improvement.
 - **CLI**: honors the flags PuLP sends (`-max`, `-sec`, `-ratio`,
   `-allow`, `-maxNodes`, `-solve`, `-initialSolve`, `-solution`);
   unrecognized flags are consumed tolerantly.
