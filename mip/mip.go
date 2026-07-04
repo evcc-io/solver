@@ -116,7 +116,8 @@ func (m *Model) Solve() Result {
 	rootDone := false
 	rootStatus := simplex.Optimal
 	stopped := false
-	proofLost := false // an unresolved (IterLimit) node was pruned
+	proofLost := false       // an unresolved (IterLimit) node was pruned
+	remaining := math.Inf(1) // best bound among subtrees dropped mid-dive
 
 	for pq.Len() > 0 {
 		if m.Limits.MaxNodes > 0 && nodeCount >= m.Limits.MaxNodes {
@@ -134,6 +135,7 @@ func (m *Model) Solve() Result {
 		for nd != nil {
 			if !deadline.IsZero() && time.Now().After(deadline) {
 				stopped = true
+				remaining = math.Min(remaining, nd.bound)
 				break
 			}
 			status, x, rowAct, rc, price, obj, endState := m.solveNode(nd)
@@ -151,6 +153,7 @@ func (m *Model) Solve() Result {
 					} else {
 						proofLost = true
 					}
+					remaining = math.Min(remaining, nd.bound)
 					break
 				}
 				nd, backtrack = backtrack, nil
@@ -214,12 +217,21 @@ func (m *Model) Solve() Result {
 	}
 	m.live = nil
 
+	// the incumbent is proven optimal (within gap) if no unexplored subtree
+	// — on the heap or dropped mid-dive — has a bound that could still beat it
+	if pq.Len() > 0 {
+		remaining = math.Min(remaining, (*pq)[0].bound)
+	}
+	proven := hasIncumbent && !m.improves(remaining, bestInternal)
+
 	res := Result{HasIncumbent: hasIncumbent, NodeCount: nodeCount}
 	switch {
 	case !rootDone:
 		res.Status = Infeasible
 	case rootStatus == simplex.Unbounded:
 		res.Status = Unbounded
+	case proven:
+		res.Status = Optimal
 	case stopped || proofLost:
 		res.Status = Stopped
 	case hasIncumbent:
