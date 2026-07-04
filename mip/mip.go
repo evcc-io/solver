@@ -293,21 +293,19 @@ func (m *Model) Solve() Result {
 
 	var rootObj float64 // root LP data for reduced-cost fixing
 	var rootX, rootRC []float64
-	rcFixed := false
 	diveTries := 0
 	newIncumbent := func(obj float64, x, rowAct, rc, price []float64) {
 		bestInternal = obj
 		bestX, bestRowAct, bestRC, bestPrice = x, rowAct, rc, price
 		m.bestXSnapshot = x
 		hasIncumbent = true
-		if !rcFixed && rootX != nil {
-			rcFixed = true
+		// re-fix on every improvement: tighter cutoffs fix more columns
+		if rootX != nil {
 			m.reducedCostFix(rootX, rootRC, rootObj, bestInternal)
 		}
 	}
 
 	if haveStart {
-		rcFixed = true // already applied against the true root bound
 		newIncumbent(startObj, startX, startAct, startRC, startPrice)
 	}
 
@@ -449,7 +447,11 @@ func (m *Model) Solve() Result {
 						m.LP.Deadline = hb
 					}
 				}
-				hObj, hx, hAct, hRC, hPrice, ok := m.faceWalk(nd, x, endState, obj)
+				cutoff := math.Inf(1)
+				if hasIncumbent {
+					cutoff = bestInternal
+				}
+				hObj, hx, hAct, hRC, hPrice, ok := m.faceWalk(nd, x, endState, obj, cutoff)
 				if ok {
 					debugf("facewalk: integral vertex on face obj=%g", hObj)
 				} else {
@@ -751,11 +753,12 @@ func (m *Model) rinsImprove(nd *node, x []float64) (obj float64, dx, rowAct, rc,
 	return m.diveForIncumbent(child, cx, cState)
 }
 
-// faceWalk fixes fractional ints one by one, only keeping fixes that hold the
-// objective on the node's LP-optimal face: an integral vertex proves the bound
-func (m *Model) faceWalk(nd *node, x []float64, st *simplex.State, faceObj float64) (obj float64, dx, rowAct, rc, price []float64, ok bool) {
+// faceWalk dives by fixing fractional ints, preferring fixes that keep the LP
+// on its optimal face and lifting the face minimally when neither side fits
+func (m *Model) faceWalk(nd *node, x []float64, st *simplex.State, faceObj, cutoff float64) (obj float64, dx, rowAct, rc, price []float64, ok bool) {
 	tol := math.Max(m.Limits.GapAbs, 1e-7)
 	cur, curX, curState := nd, x, st
+	face := faceObj
 	for {
 		if !m.LP.Deadline.IsZero() && time.Now().After(m.LP.Deadline) {
 			return 0, nil, nil, nil, nil, false
@@ -774,24 +777,41 @@ func (m *Model) faceWalk(nd *node, x []float64, st *simplex.State, faceObj float
 		if alt < lb || alt > ub {
 			hasAlt = false
 		}
-		var child *node
-		var cx []float64
-		var cState *simplex.State
-		for {
-			child = childNodeMulti(cur, curState, []boundOverride{{col, v, v}}, cur.bound)
+		try := func(val float64) (*node, []float64, *simplex.State, float64) {
+			child := childNodeMulti(cur, curState, []boundOverride{{col, val, val}}, cur.bound)
 			status, x2, _, _, _, cObj, cs := m.solveNode(child)
-			if status == simplex.Optimal && cObj <= faceObj+tol {
-				cx, cState = x2, cs
-				break
+			if status != simplex.Optimal {
+				return child, nil, nil, math.Inf(1)
 			}
-			if !hasAlt {
-				debugf("facewalk: off face at depth %d col %d status=%d obj=%g face=%g",
-					child.depth-nd.depth, col, status, cObj, faceObj)
-				return 0, nil, nil, nil, nil, false
-			}
-			v, hasAlt = alt, false
+			return child, x2, cs, cObj
 		}
-		cur, curX, curState = child, cx, cState
+		c1, x1, cs1, o1 := try(v)
+		if o1 <= face+tol {
+			cur, curX, curState = c1, x1, cs1
+			continue
+		}
+		o2 := math.Inf(1)
+		var c2 *node
+		var x2 []float64
+		var cs2 *simplex.State
+		if hasAlt {
+			c2, x2, cs2, o2 = try(alt)
+			if o2 <= face+tol {
+				cur, curX, curState = c2, x2, cs2
+				continue
+			}
+		}
+		// neither side on the face: lift it minimally and keep diving
+		if math.Min(o1, o2) >= cutoff {
+			debugf("facewalk: dead at depth %d col %d lift=%g face=%g cutoff=%g",
+				c1.depth-nd.depth, col, math.Min(o1, o2), face, cutoff)
+			return 0, nil, nil, nil, nil, false
+		}
+		if o1 <= o2 {
+			cur, curX, curState, face = c1, x1, cs1, o1
+		} else {
+			cur, curX, curState, face = c2, x2, cs2, o2
+		}
 	}
 }
 
