@@ -43,6 +43,12 @@ type node struct {
 	parentState *simplex.State // warm-start basis; nil at the root (cold start)
 	bound       float64        // valid lower bound (internal, minimized scale)
 	depth       int
+
+	// pseudocost bookkeeping: which column/direction/fraction created this
+	// child; -1 when not a branching child
+	brCol  int
+	brUp   bool
+	brFrac float64
 }
 
 type nodeHeap []*node
@@ -84,6 +90,58 @@ type Model struct {
 	live          []boundOverride // bounds currently applied to LP; see solveNode
 	rcTouched     []int           // columns tightened by reducedCostFix
 	bestXSnapshot []float64       // incumbent X for the RINS neighborhood
+
+	// per-column pseudocosts: observed bound gain per unit fraction
+	psUp, psDn   []float64
+	psUpN, psDnN []int
+}
+
+// psRecord accumulates one observed branching gain for column j.
+func (m *Model) psRecord(j int, up bool, frac, gain float64) {
+	if m.psUp == nil {
+		n := len(m.P.Cols)
+		m.psUp, m.psDn = make([]float64, n), make([]float64, n)
+		m.psUpN, m.psDnN = make([]int, n), make([]int, n)
+	}
+	if gain < 0 {
+		gain = 0
+	}
+	if up {
+		if d := 1 - frac; d > intTol {
+			m.psUp[j] += gain / d
+			m.psUpN[j]++
+		}
+	} else if frac > intTol {
+		m.psDn[j] += gain / frac
+		m.psDnN[j]++
+	}
+}
+
+// psSelect picks the fractional column with the best pseudocost score
+// (min of both directions' estimated gains); -1 if none is reliable.
+func (m *Model) psSelect(x []float64) int {
+	if m.psUp == nil {
+		return -1
+	}
+	best, col := 0.0, -1
+	for j, c := range m.P.Cols {
+		if !c.Integer {
+			continue
+		}
+		frac := x[j] - math.Floor(x[j])
+		if math.Min(frac, 1-frac) <= intTol {
+			continue
+		}
+		if m.psUpN[j] == 0 || m.psDnN[j] == 0 {
+			continue
+		}
+		up := m.psUp[j] / float64(m.psUpN[j]) * (1 - frac)
+		dn := m.psDn[j] / float64(m.psDnN[j]) * frac
+		if score := math.Min(up, dn); score > best {
+			best, col = score, j
+		}
+	}
+	return col
 }
 
 func New(p *problem.Problem) *Model {
@@ -177,7 +235,7 @@ func (m *Model) Solve() Result {
 		m.LP.Deadline = deadline
 	}
 
-	pq := &nodeHeap{{bound: math.Inf(-1)}}
+	pq := &nodeHeap{{bound: math.Inf(-1), brCol: -1}}
 	heap.Init(pq)
 
 	bestInternal := math.Inf(1)
@@ -248,6 +306,9 @@ func (m *Model) Solve() Result {
 				nd, backtrack = backtrack, nil
 				continue
 			}
+			if nd.brCol >= 0 {
+				m.psRecord(nd.brCol, nd.brUp, nd.brFrac, obj-nd.bound)
+			}
 			if hasIncumbent && !m.improves(obj, bestInternal) {
 				nd, backtrack = backtrack, nil
 				continue
@@ -264,10 +325,14 @@ func (m *Model) Solve() Result {
 				break
 			}
 			// shallow nodes pick the branch variable by probing (strong
-			// branching); deeper plunges keep the cheap rule
-			if branchCol >= 0 && nd.depth < 8 {
-				if sb := m.strongBranch(nd, x, endState, obj); sb >= 0 {
-					branchCol = sb
+			// branching); deeper plunges use pseudocosts once seeded
+			if branchCol >= 0 {
+				if nd.depth < 8 {
+					if sb := m.strongBranch(nd, x, endState, obj); sb >= 0 {
+						branchCol = sb
+					}
+				} else if ps := m.psSelect(x); ps >= 0 {
+					branchCol = ps
 				}
 			}
 
@@ -278,6 +343,9 @@ func (m *Model) Solve() Result {
 				ceilV := math.Ceil(x[branchCol] - 1e-7)
 				floorChild := childNode(nd, endState, boundOverride{branchCol, lb, floorV}, obj)
 				ceilChild := childNode(nd, endState, boundOverride{branchCol, ceilV, ub}, obj)
+				frac := x[branchCol] - floorV
+				floorChild.brCol, floorChild.brUp, floorChild.brFrac = branchCol, false, frac
+				ceilChild.brCol, ceilChild.brUp, ceilChild.brFrac = branchCol, true, frac
 				if x[branchCol]-floorV >= 0.5 {
 					near, far = ceilChild, floorChild
 				} else {
@@ -395,14 +463,14 @@ func childNode(parent *node, parentState *simplex.State, ov boundOverride, bound
 	ovs = append(ovs, ov)
 	// bounds only tighten down a branch; max() stops numerical drift from
 	// chained warm starts leaking below the true LP bound over deep dives
-	return &node{overrides: ovs, parentState: parentState, bound: math.Max(parent.bound, bound), depth: parent.depth + 1}
+	return &node{overrides: ovs, parentState: parentState, bound: math.Max(parent.bound, bound), depth: parent.depth + 1, brCol: -1}
 }
 
 func childNodeMulti(parent *node, parentState *simplex.State, extra []boundOverride, bound float64) *node {
 	ovs := make([]boundOverride, len(parent.overrides), len(parent.overrides)+len(extra))
 	copy(ovs, parent.overrides)
 	ovs = append(ovs, extra...)
-	return &node{overrides: ovs, parentState: parentState, bound: math.Max(parent.bound, bound), depth: parent.depth + 1}
+	return &node{overrides: ovs, parentState: parentState, bound: math.Max(parent.bound, bound), depth: parent.depth + 1, brCol: -1}
 }
 
 // solveNode diffs m.live against nd.overrides (touching only changed
@@ -726,6 +794,7 @@ func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj
 			switch status {
 			case simplex.Optimal:
 				score = math.Min(score, cObj-obj) // bound gain of this side
+				m.psRecord(cd.j, b[0] == floorV+1, x[cd.j]-floorV, cObj-obj)
 			case simplex.Infeasible:
 				// side prunes outright: keep score as-is (excellent)
 			default:
