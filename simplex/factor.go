@@ -36,7 +36,7 @@ type factor struct {
 	bwd     []triPivot  // col-singleton pivots, applied in reverse
 	kRows   []int       // kernel rows (original indices)
 	kPos    []int       // kernel basis positions
-	kinv    []float64   // dense k*k inverse of the kernel, row-major
+	klu     *sparseLU   // sparse LU of the kernel
 	rowKIdx []int       // row -> kernel row index, -1 otherwise
 
 	// solve scratch, reused across calls (solver is single-threaded);
@@ -182,62 +182,22 @@ func factorize(m int, colRow [][]int32, colVal [][]float64) *factor {
 		return nil // structurally singular
 	}
 	if k > 0 {
-		km := make([]float64, k*k)
+		colIdx := make([][]int32, k)
+		colVal := make([][]float64, k)
 		for kc, pos := range f.kPos {
 			for kk, r := range f.colRow[pos] {
 				if ki := f.rowKIdx[r]; ki >= 0 {
-					km[ki*k+kc] = f.colVal[pos][kk]
+					colIdx[kc] = append(colIdx[kc], int32(ki))
+					colVal[kc] = append(colVal[kc], f.colVal[pos][kk])
 				}
 			}
 		}
-		f.kinv = denseInverse(km, k)
-		if f.kinv == nil {
+		f.klu = luFactorize(k, colIdx, colVal)
+		if f.klu == nil {
 			return nil
 		}
 	}
 	return f
-}
-
-// denseInverse inverts a row-major k*k matrix via Gauss-Jordan with partial
-// pivoting; returns nil if singular.
-func denseInverse(a []float64, k int) []float64 {
-	inv := make([]float64, k*k)
-	for i := 0; i < k; i++ {
-		inv[i*k+i] = 1
-	}
-	for col := 0; col < k; col++ {
-		p, best := -1, pivotTol
-		for r := col; r < k; r++ {
-			if v := math.Abs(a[r*k+col]); v > best {
-				best, p = v, r
-			}
-		}
-		if p < 0 {
-			return nil
-		}
-		if p != col {
-			for j := 0; j < k; j++ {
-				a[p*k+j], a[col*k+j] = a[col*k+j], a[p*k+j]
-				inv[p*k+j], inv[col*k+j] = inv[col*k+j], inv[p*k+j]
-			}
-		}
-		d := a[col*k+col]
-		for j := 0; j < k; j++ {
-			a[col*k+j] /= d
-			inv[col*k+j] /= d
-		}
-		for r := 0; r < k; r++ {
-			if r == col || a[r*k+col] == 0 {
-				continue
-			}
-			f := a[r*k+col]
-			for j := 0; j < k; j++ {
-				a[r*k+j] -= f * a[col*k+j]
-				inv[r*k+j] -= f * inv[col*k+j]
-			}
-		}
-	}
-	return inv
 }
 
 // ftranFactor solves B*x = v in place: v becomes x indexed by basis
@@ -267,12 +227,9 @@ func (f *factor) ftran(v []float64) {
 		for ki, r := range f.kRows {
 			kv[ki] = v[r]
 		}
+		f.klu.solve(kv) // kv now holds x by kernel-local col
 		for ki := 0; ki < k; ki++ {
-			var s float64
-			row := f.kinv[ki*k : ki*k+k]
-			for kj := 0; kj < k; kj++ {
-				s += row[kj] * kv[kj]
-			}
+			s := kv[ki]
 			pos := f.kPos[ki]
 			x[pos] = s
 			if s != 0 {
@@ -315,7 +272,7 @@ func (f *factor) btran(w []float64) {
 		}
 		y[tp.row] = s / tp.a
 	}
-	// adjoint of kernel: y_K = kinv^T * (w_K - cols^T y_known)
+	// adjoint of kernel: solve K^T y_K = (w_K - cols^T y_known)
 	k := len(f.kRows)
 	if k > 0 {
 		kw := f.kScratch
@@ -328,12 +285,9 @@ func (f *factor) btran(w []float64) {
 			}
 			kw[ki] = s
 		}
+		f.klu.solveT(kw) // kw now holds y by kernel-local row
 		for ki, r := range f.kRows {
-			var s float64
-			for kj := 0; kj < k; kj++ {
-				s += f.kinv[kj*k+ki] * kw[kj]
-			}
-			y[r] = s
+			y[r] = kw[ki]
 		}
 	}
 	// adjoint of forward pass, in reverse order
