@@ -47,7 +47,7 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 		frac float64
 	}
 	var cands []cand
-	for r := 0; r < mm; r++ {
+	for r := range mm {
 		j, v := st.BasicVar(r)
 		if j >= n || !m.P.Cols[j].Integer {
 			continue

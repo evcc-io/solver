@@ -58,7 +58,7 @@ func factorize(m int, colRow [][]int32, colVal [][]float64) *factor {
 	for i := range rowActive {
 		rowActive[i], colActive[i] = true, true
 	}
-	for pos := 0; pos < m; pos++ {
+	for pos := range m {
 		for k, r := range colRow[pos] {
 			if math.Abs(colVal[pos][k]) < pivotTol {
 				continue
@@ -79,7 +79,7 @@ func factorize(m int, colRow [][]int32, colVal [][]float64) *factor {
 
 	// phase 1: row singletons resolve forward
 	queue := make([]int, 0, m)
-	for r := 0; r < m; r++ {
+	for r := range m {
 		if rowCount[r] == 1 {
 			queue = append(queue, r)
 		}
@@ -118,7 +118,7 @@ func factorize(m int, colRow [][]int32, colVal [][]float64) *factor {
 	}
 
 	// recount active cols, then phase 2: column singletons resolve backward
-	for pos := 0; pos < m; pos++ {
+	for pos := range m {
 		if !colActive[pos] {
 			continue
 		}
@@ -166,13 +166,13 @@ func factorize(m int, colRow [][]int32, colVal [][]float64) *factor {
 	for i := range f.rowKIdx {
 		f.rowKIdx[i] = -1
 	}
-	for r := 0; r < m; r++ {
+	for r := range m {
 		if rowActive[r] {
 			f.rowKIdx[r] = len(f.kRows)
 			f.kRows = append(f.kRows, r)
 		}
 	}
-	for pos := 0; pos < m; pos++ {
+	for pos := range m {
 		if colActive[pos] {
 			f.kPos = append(f.kPos, pos)
 		}
@@ -228,7 +228,7 @@ func (f *factor) ftran(v []float64) {
 			kv[ki] = v[r]
 		}
 		f.klu.solve(kv) // kv now holds x by kernel-local col
-		for ki := 0; ki < k; ki++ {
+		for ki := range k {
 			s := kv[ki]
 			pos := f.kPos[ki]
 			x[pos] = s

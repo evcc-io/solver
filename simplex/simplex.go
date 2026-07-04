@@ -178,12 +178,12 @@ func (lp *LP) initState() *State {
 		basicOf: make([]int, m),
 		value:   make([]float64, nt),
 	}
-	for i := 0; i < m; i++ {
+	for i := range m {
 		st.basicOf[i] = lp.n + i
 		st.status[lp.n+i] = basic
 	}
 	lp.refactorize(st)
-	for j := 0; j < lp.n; j++ {
+	for j := range lp.n {
 		lp.resetNonbasic(st, j)
 	}
 	lp.recomputeBasics(st)
@@ -250,7 +250,7 @@ func (lp *LP) dualRun(st *State) {
 	clear(y)
 	duals(st, lp.cost, m, y)
 	d := make([]float64, nt)
-	for j := 0; j < nt; j++ {
+	for j := range nt {
 		if st.status[j] != basic {
 			d[j] = lp.reducedCost(y, lp.cost, j)
 		}
@@ -267,7 +267,7 @@ func (lp *LP) dualRun(st *State) {
 		}
 		// leaving variable: the most primal-infeasible basic
 		r, bound, worst := -1, 0.0, 100*eps
-		for i := 0; i < m; i++ {
+		for i := range m {
 			if skip[i] {
 				continue
 			}
@@ -294,7 +294,7 @@ func (lp *LP) dualRun(st *State) {
 		st.btranVec(rowBuf)
 		rowR := rowBuf
 		var cands []dualCand
-		for j := 0; j < nt; j++ {
+		for j := range nt {
 			if st.status[j] == basic {
 				alphaRow[j] = 0
 				continue
@@ -355,7 +355,7 @@ func (lp *LP) dualRun(st *State) {
 				lp.Stats.DualFlips++
 			}
 			st.ftranVec(delta)
-			for pos := 0; pos < m; pos++ {
+			for pos := range m {
 				st.value[st.basicOf[pos]] -= delta[pos]
 			}
 		}
@@ -388,7 +388,7 @@ func (lp *LP) dualRun(st *State) {
 		lp.pivot(st, q, qdir, a, t, r, false)
 		// incremental reduced-cost update from the pivot row
 		step := d[q] / alphaRow[q]
-		for j := 0; j < nt; j++ {
+		for j := range nt {
 			if st.status[j] == basic {
 				d[j] = 0
 			} else if alphaRow[j] != 0 {
@@ -430,7 +430,7 @@ var (
 func (lp *LP) recomputeBasics(st *State) {
 	m := lp.m
 	residual := make([]float64, m)
-	for j := 0; j < lp.nTotal(); j++ {
+	for j := range lp.nTotal() {
 		if st.status[j] == basic {
 			continue
 		}
@@ -443,11 +443,11 @@ func (lp *LP) recomputeBasics(st *State) {
 			residual[r] += vals[k] * v
 		}
 	}
-	for i := 0; i < m; i++ {
+	for i := range m {
 		residual[i] = -residual[i]
 	}
 	st.ftranVec(residual)
-	for pos := 0; pos < m; pos++ {
+	for pos := range m {
 		st.value[st.basicOf[pos]] = residual[pos]
 	}
 }
@@ -464,7 +464,7 @@ func (lp *LP) alpha(st *State, j int, dst []float64) {
 
 // duals fills dst (length m, assumed zeroed) with y = cost_B^T * Binv.
 func duals(st *State, cost []float64, m int, dst []float64) {
-	for pos := 0; pos < m; pos++ {
+	for pos := range m {
 		dst[pos] = cost[st.basicOf[pos]]
 	}
 	st.btranVec(dst)
@@ -497,7 +497,7 @@ func (lp *LP) solveFrom(st *State) (Status, *State, float64) {
 
 func (lp *LP) objective(st *State) float64 {
 	var s float64
-	for j := 0; j < lp.n; j++ {
+	for j := range lp.n {
 		s += lp.rawObj[j] * st.value[j]
 	}
 	return s
@@ -543,7 +543,7 @@ func (lp *LP) TableauRow(st *State, r int, dst []float64) {
 	rowR := make([]float64, lp.m)
 	rowR[r] = 1
 	st.btranVec(rowR)
-	for j := 0; j < lp.nTotal(); j++ {
+	for j := range lp.nTotal() {
 		rows, vals := lp.column(j)
 		var s float64
 		for k, rr := range rows {
@@ -574,7 +574,7 @@ func (lp *LP) NumCols() int { return lp.n }
 // vector; returns false once all basic variables are feasible.
 func (lp *LP) phaseCost(st *State, dst []float64) bool {
 	inPhase1 := false
-	for i := 0; i < lp.m; i++ {
+	for i := range lp.m {
 		bv := st.basicOf[i]
 		v := st.value[bv]
 		switch {
@@ -700,7 +700,7 @@ func (lp *LP) ratioTest(st *State, a []float64, q int, dir float64, phase1 bool)
 		t = lp.ub[q] - lp.lb[q]
 		isFlip = true
 	}
-	for i := 0; i < lp.m; i++ {
+	for i := range lp.m {
 		if math.Abs(a[i]) < eps {
 			continue
 		}
@@ -764,7 +764,7 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 		t = 0
 	}
 	// update all basic values
-	for i := 0; i < lp.m; i++ {
+	for i := range lp.m {
 		if a[i] == 0 {
 			continue
 		}
@@ -818,7 +818,7 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 func (lp *LP) Solution(st *State) (x, rowActivity, reducedCost, rowPrice []float64) {
 	x = append([]float64(nil), st.value[:lp.n]...)
 	rowActivity = make([]float64, lp.m)
-	for i := 0; i < lp.m; i++ {
+	for i := range lp.m {
 		rowActivity[i] = -st.value[lp.n+i] * -1 // logical var value == row activity (y_i = Ax_i)
 	}
 	y := make([]float64, lp.m)
@@ -828,7 +828,7 @@ func (lp *LP) Solution(st *State) (x, rowActivity, reducedCost, rowPrice []float
 		rowPrice[i] = y[i] * lp.objSign
 	}
 	reducedCost = make([]float64, lp.n)
-	for j := 0; j < lp.n; j++ {
+	for j := range lp.n {
 		reducedCost[j] = lp.reducedCost(y, lp.cost, j) * lp.objSign
 	}
 	return

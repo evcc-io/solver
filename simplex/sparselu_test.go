@@ -13,7 +13,7 @@ func TestSparseLUSolve(t *testing.T) {
 		// diagonal-dominant-ish sparse kernel: guaranteed diagonal + extras
 		colIdx := make([][]int32, k)
 		colVal := make([][]float64, k)
-		for c := 0; c < k; c++ {
+		for c := range k {
 			colIdx[c] = []int32{int32(c)}
 			colVal[c] = []float64{2 + rng.Float64()}
 			seen := map[int32]bool{int32(c): true}
@@ -32,7 +32,7 @@ func TestSparseLUSolve(t *testing.T) {
 		}
 		mul := func(x []float64) []float64 {
 			v := make([]float64, k)
-			for c := 0; c < k; c++ {
+			for c := range k {
 				for t2, r := range colIdx[c] {
 					v[r] += colVal[c][t2] * x[c]
 				}
@@ -61,7 +61,7 @@ func TestSparseLUSolve(t *testing.T) {
 			wantW[i] = w[i]
 		}
 		lu.solveT(w)
-		for c := 0; c < k; c++ {
+		for c := range k {
 			var s float64
 			for t2, r := range colIdx[c] {
 				s += colVal[c][t2] * w[r]

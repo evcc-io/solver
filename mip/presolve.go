@@ -13,7 +13,7 @@ const presolvePasses = 10
 // presolve tightens col bounds and binary big-M coefficients in place; it
 // preserves the mixed-integer feasible set while tightening the relaxation.
 func presolve(p *problem.Problem) {
-	for pass := 0; pass < presolvePasses; pass++ {
+	for range presolvePasses {
 		if !presolvePass(p) {
 			return
 		}

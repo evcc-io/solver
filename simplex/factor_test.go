@@ -12,7 +12,7 @@ func randomBasis(rng *rand.Rand, m int) ([][]int32, [][]float64) {
 	colRow := make([][]int32, m)
 	colVal := make([][]float64, m)
 	perm := rng.Perm(m)
-	for pos := 0; pos < m; pos++ {
+	for pos := range m {
 		r := perm[pos]
 		// guaranteed diagonal under permutation keeps it nonsingular-ish
 		rows := []int32{int32(r)}
@@ -33,7 +33,7 @@ func randomBasis(rng *rand.Rand, m int) ([][]int32, [][]float64) {
 
 func multiply(colRow [][]int32, colVal [][]float64, m int, x []float64) []float64 {
 	v := make([]float64, m)
-	for pos := 0; pos < m; pos++ {
+	for pos := range m {
 		if x[pos] == 0 {
 			continue
 		}
@@ -77,7 +77,7 @@ func TestFactorFtranBtran(t *testing.T) {
 		}
 		f.btran(w)
 		// (B^T y)[pos] = col_pos . y
-		for pos := 0; pos < m; pos++ {
+		for pos := range m {
 			var s float64
 			for k, r := range colRow[pos] {
 				s += colVal[pos][k] * w[r]
@@ -152,7 +152,7 @@ func TestFactorEtaUpdate(t *testing.T) {
 		}
 		applyEtasT(etas, w)
 		f.btran(w)
-		for pos := 0; pos < m; pos++ {
+		for pos := range m {
 			var s float64
 			for k, rr := range colRow2[pos] {
 				s += colVal2[pos][k] * w[rr]

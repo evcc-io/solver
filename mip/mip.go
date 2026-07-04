@@ -191,7 +191,7 @@ func (m *Model) Solve() Result {
 		prevObj := math.Inf(1)
 		flat := 0       // bound improvement can pause a round and resume
 		lastBatch := -1 // first row index of the previous round's cuts
-		for round := 0; round < maxCutRound; round++ {
+		for round := range maxCutRound {
 			if !cutDeadline.IsZero() && time.Now().After(cutDeadline) {
 				break
 			}
