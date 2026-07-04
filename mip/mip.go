@@ -281,18 +281,31 @@ func (m *Model) solveNode(nd *node) (status simplex.Status, x, rowAct, rc, price
 	for common < len(m.live) && common < len(nd.overrides) && m.live[common] == nd.overrides[common] {
 		common++
 	}
-	var touchedIdx []int
 	for i := len(m.live) - 1; i >= common; i-- {
 		idx := m.live[i].idx
-		m.LP.SetBound(idx, m.P.Cols[idx].LB, m.P.Cols[idx].UB)
-		touchedIdx = append(touchedIdx, idx)
+		// a column overridden twice down a branch reverts to the still-active
+		// prefix override, not to the original problem bounds
+		lb, ub := m.P.Cols[idx].LB, m.P.Cols[idx].UB
+		for j := common - 1; j >= 0; j-- {
+			if m.live[j].idx == idx {
+				lb, ub = m.live[j].lb, m.live[j].ub
+				break
+			}
+		}
+		m.LP.SetBound(idx, lb, ub)
 	}
 	for i := common; i < len(nd.overrides); i++ {
 		ov := nd.overrides[i]
 		m.LP.SetBound(ov.idx, ov.lb, ov.ub)
-		touchedIdx = append(touchedIdx, ov.idx)
 	}
 	m.live = nd.overrides
+
+	// the warm start needs every column whose bounds may differ from the
+	// PARENT state's assumptions, not just the diff vs the last-solved node
+	touchedIdx := make([]int, len(nd.overrides))
+	for i, ov := range nd.overrides {
+		touchedIdx[i] = ov.idx
+	}
 
 	if nd.parentState != nil {
 		status, endState, _ = m.LP.WarmSolve(nd.parentState.Clone(), touchedIdx)
