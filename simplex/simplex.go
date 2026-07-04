@@ -16,6 +16,11 @@ const (
 	eps     = 1e-9
 	optEps  = 1e-7
 	maxIter = 200000
+
+	// partial pricing kicks in only above this many total variables, and
+	// then scans nt/partialPricingDivisor columns per window.
+	partialPricingThreshold = 4000
+	partialPricingDivisor   = 8
 )
 
 type Status int
@@ -55,6 +60,11 @@ type LP struct {
 	// Deadline, when set, aborts a solve with IterLimit once exceeded
 	// (checked periodically inside the pivot loop).
 	Deadline time.Time
+
+	// pricingWindow >0 makes chooseEntering scan a rotating column window
+	// (partial pricing) instead of all n+m every pivot; 0 means full scan.
+	pricingWindow int
+	pricingCursor int // scan position for partial pricing
 }
 
 // State is a mutable basis/solution snapshot, reusable across resolves.
@@ -92,6 +102,11 @@ func Build(p *problem.Problem) *LP {
 		lb, ub := r.Bounds()
 		lp.lb[n+i], lp.ub[n+i] = lb, ub
 		lp.cost[n+i] = 0
+	}
+	// partial pricing only pays off once the full scan is actually
+	// expensive; small problems keep the exact full-scan behavior.
+	if nt := n + m; nt > partialPricingThreshold {
+		lp.pricingWindow = nt / partialPricingDivisor
 	}
 	return lp
 }
@@ -338,11 +353,35 @@ func (lp *LP) run(st *State) Status {
 	}
 }
 
+// chooseEntering scans a rotating column window per pivot above
+// partialPricingThreshold, but always covers everything before declaring optimal.
 func (lp *LP) chooseEntering(st *State, y, cost []float64) (q int, dir float64) {
+	nt := lp.nTotal()
+	if lp.pricingWindow <= 0 {
+		return lp.scanEntering(st, y, cost, 0, nt)
+	}
+	start := lp.pricingCursor
+	for scanned := 0; scanned < nt; {
+		end := start + lp.pricingWindow
+		if end > nt {
+			end = nt
+		}
+		q, dir = lp.scanEntering(st, y, cost, start, end)
+		scanned += end - start
+		if q >= 0 {
+			lp.pricingCursor = end % nt
+			return q, dir
+		}
+		start = end % nt
+	}
+	lp.pricingCursor = 0
+	return -1, 0
+}
+
+func (lp *LP) scanEntering(st *State, y, cost []float64, lo, hi int) (q int, dir float64) {
 	best := optEps
 	q = -1
-	nt := lp.nTotal()
-	for j := 0; j < nt; j++ {
+	for j := lo; j < hi; j++ {
 		if st.status[j] == basic {
 			continue
 		}
