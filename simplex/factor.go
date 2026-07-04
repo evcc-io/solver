@@ -7,7 +7,7 @@ import "math"
 const (
 	pivotTol   = 1e-10 // singleton pivots below this go to the kernel
 	etaDropTol = 1e-12 // eta entries below this are dropped
-	maxEtas    = 96    // refactorize when the eta file grows past this
+	maxEtas    = 32    // refactorize when the eta file grows past this
 )
 
 // triPivot resolves one variable by substitution: basis position pos pivots

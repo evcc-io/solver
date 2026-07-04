@@ -327,7 +327,7 @@ func (m *Model) Solve() Result {
 			// shallow nodes pick the branch variable by probing (strong
 			// branching); deeper plunges use pseudocosts once seeded
 			if branchCol >= 0 {
-				if nd.depth < 8 {
+				if nd.depth < 16 {
 					if sb := m.strongBranch(nd, x, endState, obj); sb >= 0 {
 						branchCol = sb
 					}
@@ -387,7 +387,7 @@ func (m *Model) Solve() Result {
 			}
 			// RINS-lite: fix integers where incumbent and node LP agree,
 			// LP-complete the rest; accept only strict improvements
-			if hasIncumbent && nodeCount%512 == 0 {
+			if hasIncumbent && nodeCount%128 == 0 {
 				if hObj, hx, hAct, hRC, hPrice, ok := m.rinsImprove(nd, x); ok && m.improves(hObj, bestInternal) {
 					debugf("rins: improved %g -> %g", bestInternal, hObj)
 					newIncumbent(hObj, hx, hAct, hRC, hPrice)
