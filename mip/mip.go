@@ -85,6 +85,7 @@ type Model struct {
 }
 
 func New(p *problem.Problem) *Model {
+	presolve(p)
 	return &Model{P: p, LP: simplex.Build(p), Limits: Limits{GapRel: 1e-9, GapAbs: 1e-9}}
 }
 
