@@ -6,6 +6,7 @@ package simplex
 
 import (
 	"math"
+	"time"
 
 	"cbcgo/problem"
 )
@@ -50,6 +51,10 @@ type LP struct {
 	cost    []float64 // length n+m, signed for internal minimization
 	rawObj  []float64 // length n, unsigned (as given in the problem)
 	objSign float64
+
+	// Deadline, when set, aborts a solve with IterLimit once exceeded
+	// (checked periodically inside the pivot loop).
+	Deadline time.Time
 }
 
 // State is a mutable basis/solution snapshot, reusable across resolves.
@@ -300,6 +305,9 @@ func (lp *LP) run(st *State) Status {
 	a := make([]float64, lp.m)
 	for iter := 0; ; iter++ {
 		if iter > maxIter {
+			return IterLimit
+		}
+		if iter%1024 == 0 && !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
 			return IterLimit
 		}
 		clear(phase1Cost)

@@ -101,6 +101,7 @@ func (m *Model) Solve() Result {
 	deadline := time.Time{}
 	if m.Limits.MaxSeconds > 0 {
 		deadline = time.Now().Add(time.Duration(m.Limits.MaxSeconds * float64(time.Second)))
+		m.LP.Deadline = deadline // abort long LP solves at the deadline too
 	}
 
 	pq := &nodeHeap{{bound: math.Inf(-1)}}
@@ -113,12 +114,9 @@ func (m *Model) Solve() Result {
 	rootDone := false
 	rootStatus := simplex.Optimal
 	stopped := false
+	proofLost := false // an unresolved (IterLimit) node was pruned
 
 	for pq.Len() > 0 {
-		if !deadline.IsZero() && time.Now().After(deadline) {
-			stopped = true
-			break
-		}
 		if m.Limits.MaxNodes > 0 && nodeCount >= m.Limits.MaxNodes {
 			stopped = true
 			break
@@ -128,49 +126,85 @@ func (m *Model) Solve() Result {
 			continue
 		}
 
-		status, x, rowAct, rc, price, obj, endState := m.solveNode(nd)
-		nodeCount++
-		if !rootDone {
-			rootDone = true
-			rootStatus = status
-		}
-		if status == simplex.Infeasible {
-			continue
-		}
-		if status == simplex.Unbounded {
-			continue
-		}
-		if hasIncumbent && !m.improves(obj, bestInternal) {
-			continue
-		}
-
-		branchCol, sosIdx, sosSplit := m.findBranch(x)
-		if branchCol < 0 && sosIdx < 0 {
-			bestInternal = obj
-			bestX, bestRowAct, bestRC, bestPrice = x, rowAct, rc, price
-			hasIncumbent = true
-			continue
-		}
-
-		if branchCol >= 0 {
-			lb, ub := m.LP.Bound(branchCol)
-			floorV := math.Floor(x[branchCol] + 1e-7)
-			ceilV := math.Ceil(x[branchCol] - 1e-7)
-			heap.Push(pq, childNode(nd, endState, boundOverride{branchCol, lb, floorV}, obj))
-			heap.Push(pq, childNode(nd, endState, boundOverride{branchCol, ceilV, ub}, obj))
-		} else {
-			members := m.P.SOSs[sosIdx].Idx
-			var loOv, hiOv []boundOverride
-			for k, idx := range members {
-				if k > sosSplit {
-					loOv = append(loOv, boundOverride{idx, 0, 0})
-				}
-				if k <= sosSplit {
-					hiOv = append(hiOv, boundOverride{idx, 0, 0})
-				}
+		// plunge: dive depth-first, keeping the rounding-nearer child.
+		// backtrack is the current level's untried sibling (try before giving up).
+		var backtrack *node
+		for nd != nil {
+			if !deadline.IsZero() && time.Now().After(deadline) {
+				stopped = true
+				break
 			}
-			heap.Push(pq, childNodeMulti(nd, endState, loOv, obj))
-			heap.Push(pq, childNodeMulti(nd, endState, hiOv, obj))
+			status, x, rowAct, rc, price, obj, endState := m.solveNode(nd)
+			nodeCount++
+			if !rootDone {
+				rootDone = true
+				rootStatus = status
+			}
+			if status != simplex.Optimal {
+				// an IterLimit node stays unresolved: prune it and search on,
+				// but optimality can no longer be proven.
+				if status == simplex.IterLimit {
+					if !deadline.IsZero() && time.Now().After(deadline) {
+						stopped = true
+					} else {
+						proofLost = true
+					}
+					break
+				}
+				nd, backtrack = backtrack, nil
+				continue
+			}
+			if hasIncumbent && !m.improves(obj, bestInternal) {
+				nd, backtrack = backtrack, nil
+				continue
+			}
+			// this level solved: the previous level's sibling goes to the heap
+			if backtrack != nil {
+				heap.Push(pq, backtrack)
+				backtrack = nil
+			}
+
+			branchCol, sosIdx, sosSplit := m.findBranch(x)
+			if branchCol < 0 && sosIdx < 0 {
+				bestInternal = obj
+				bestX, bestRowAct, bestRC, bestPrice = x, rowAct, rc, price
+				hasIncumbent = true
+				break
+			}
+
+			var near, far *node
+			if branchCol >= 0 {
+				lb, ub := m.LP.Bound(branchCol)
+				floorV := math.Floor(x[branchCol] + 1e-7)
+				ceilV := math.Ceil(x[branchCol] - 1e-7)
+				floorChild := childNode(nd, endState, boundOverride{branchCol, lb, floorV}, obj)
+				ceilChild := childNode(nd, endState, boundOverride{branchCol, ceilV, ub}, obj)
+				if x[branchCol]-floorV >= 0.5 {
+					near, far = ceilChild, floorChild
+				} else {
+					near, far = floorChild, ceilChild
+				}
+			} else {
+				members := m.P.SOSs[sosIdx].Idx
+				var loOv, hiOv []boundOverride
+				for k, idx := range members {
+					if k > sosSplit {
+						loOv = append(loOv, boundOverride{idx, 0, 0})
+					}
+					if k <= sosSplit {
+						hiOv = append(hiOv, boundOverride{idx, 0, 0})
+					}
+				}
+				near = childNodeMulti(nd, endState, loOv, obj)
+				far = childNodeMulti(nd, endState, hiOv, obj)
+			}
+			nd, backtrack = near, far
+		}
+		if backtrack != nil {
+			heap.Push(pq, backtrack)
+		}
+		if stopped {
+			break
 		}
 	}
 
@@ -180,7 +214,7 @@ func (m *Model) Solve() Result {
 		res.Status = Infeasible
 	case rootStatus == simplex.Unbounded:
 		res.Status = Unbounded
-	case stopped:
+	case stopped || proofLost:
 		res.Status = Stopped
 	case hasIncumbent:
 		res.Status = Optimal
@@ -236,6 +270,11 @@ func (m *Model) solveNode(nd *node) (status simplex.Status, x, rowAct, rc, price
 	}
 	if nd.parentState != nil {
 		status, endState, _ = m.LP.WarmSolve(nd.parentState.Clone(), touchedIdx)
+		// a degenerate warm start can stall at the iteration cap; a fresh
+		// basis usually solves the same node quickly
+		if status == simplex.IterLimit && (m.LP.Deadline.IsZero() || time.Now().Before(m.LP.Deadline)) {
+			status, endState, _ = m.LP.ColdSolve()
+		}
 	} else {
 		status, endState, _ = m.LP.ColdSolve()
 	}
@@ -249,11 +288,11 @@ func (m *Model) solveNode(nd *node) (status simplex.Status, x, rowAct, rc, price
 	return status, x, rowAct, rc, price, internalObj, endState
 }
 
-// findBranch picks the most-fractional integer column, or failing that the
-// first violated SOS constraint (returning its split point).
+// findBranch picks the least-fractional integer column (cheap dives: rounding
+// near-decided vars rarely hurts the LP), or the first violated SOS constraint.
 func (m *Model) findBranch(x []float64) (col, sosIdx, sosSplit int) {
 	col, sosIdx = -1, -1
-	best := intTol
+	best := math.Inf(1)
 	for j, c := range m.P.Cols {
 		if !c.Integer {
 			continue
@@ -261,7 +300,7 @@ func (m *Model) findBranch(x []float64) (col, sosIdx, sosSplit int) {
 		v := x[j]
 		frac := v - math.Floor(v)
 		dist := math.Min(frac, 1-frac)
-		if dist > best {
+		if dist > intTol && dist < best {
 			best, col = dist, j
 		}
 	}
