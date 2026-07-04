@@ -435,6 +435,47 @@ func (lp *LP) InternalObjective(st *State) float64 {
 // Bound returns variable j's current [lb,ub].
 func (lp *LP) Bound(j int) (float64, float64) { return lp.lb[j], lp.ub[j] }
 
+// NumRows returns m, the row (and logical-variable) count.
+func (lp *LP) NumRows() int { return lp.m }
+
+// BasicVar returns the variable basic in row position r and its value.
+func (st *State) BasicVar(r int) (int, float64) {
+	j := st.basicOf[r]
+	return j, st.value[j]
+}
+
+// VarStatusAtUpper reports whether nonbasic variable j sits at its upper
+// bound; (false, false) means basic or free.
+func (st *State) VarStatusAtUpper(j int) (atUpperBound, nonbasicAtBound bool) {
+	switch st.status[j] {
+	case atUpper:
+		return true, true
+	case atLower:
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// IsBasic reports whether variable j is basic in st.
+func (st *State) IsBasic(j int) bool { return st.status[j] == basic }
+
+// TableauRow fills dst (length n+m, assumed zeroed) with row position r of
+// Binv*[A|-I], the simplex tableau row used for cut generation.
+func (lp *LP) TableauRow(st *State, r int, dst []float64) {
+	rowR := make([]float64, lp.m)
+	rowR[r] = 1
+	st.btranVec(rowR)
+	for j := 0; j < lp.nTotal(); j++ {
+		rows, vals := lp.column(j)
+		var s float64
+		for k, rr := range rows {
+			s += rowR[rr] * vals[k]
+		}
+		dst[j] = s
+	}
+}
+
 // ZeroCost returns a zero cost vector of the right length for SwapCost.
 func (lp *LP) ZeroCost() []float64 { return make([]float64, len(lp.cost)) }
 

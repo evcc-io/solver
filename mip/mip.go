@@ -119,6 +119,62 @@ func (m *Model) Solve() Result {
 		m.LP.Deadline = deadline // abort long LP solves at the deadline too
 	}
 
+	// GMI cut rounds tighten the root while its bound still moves; capped
+	// at a fifth of the budget so the tree always gets its time
+	origRows := len(m.P.Rows)
+	if len(m.P.SOSs) == 0 {
+		cutDeadline := deadline
+		if m.Limits.MaxTime > 0 {
+			cutDeadline = time.Now().Add(m.Limits.MaxTime / 5)
+			m.LP.Deadline = cutDeadline
+		}
+		prevObj := math.Inf(1)
+		flat := 0       // bound improvement can pause a round and resume
+		lastBatch := -1 // first row index of the previous round's cuts
+		for round := 0; round < maxCutRound; round++ {
+			if !cutDeadline.IsZero() && time.Now().After(cutDeadline) {
+				break
+			}
+			status, st, _ := m.LP.ColdSolve()
+			if status != simplex.Optimal {
+				// the last batch poisoned the LP (degenerate grind):
+				// retract it and continue with the last good relaxation
+				if lastBatch >= 0 {
+					truncateRows(m.P, lastBatch)
+					m.LP = simplex.Build(m.P)
+					m.LP.Deadline = deadline
+					debugf("cuts: retracted poison batch, back to %d rows", lastBatch)
+				}
+				break
+			}
+			obj := m.LP.InternalObjective(st)
+			if round > 0 && obj-prevObj < math.Max(1e-7, 1e-9*math.Abs(obj)) {
+				if flat++; flat >= 2 {
+					debugf("cuts: bound stalled at %g after %d rounds", obj, round)
+					break
+				}
+			} else {
+				flat = 0
+			}
+			prevObj = obj
+			x, _, _, _ := m.LP.Solution(st)
+			if col, sos, _ := m.findBranch(x); col < 0 && sos < 0 {
+				break // root already integral
+			}
+			lastBatch = len(m.P.Rows)
+			added := m.gomoryCuts(st)
+			debugf("cuts: round %d added %d rows (bound %g)", round, added, obj)
+			if added == 0 {
+				break
+			}
+			stats := m.LP.Stats
+			m.LP = simplex.Build(m.P)
+			m.LP.Stats = stats // carry pivot counters across rebuilds
+			m.LP.Deadline = cutDeadline
+		}
+		m.LP.Deadline = deadline
+	}
+
 	pq := &nodeHeap{{bound: math.Inf(-1)}}
 	heap.Init(pq)
 
@@ -274,6 +330,8 @@ func (m *Model) Solve() Result {
 
 	res := Result{HasIncumbent: hasIncumbent, NodeCount: nodeCount}
 	switch {
+	case !rootDone && stopped:
+		res.Status = Stopped // out of time before the root was even solved
 	case !rootDone:
 		res.Status = Infeasible
 	case rootStatus == simplex.Unbounded:
@@ -290,6 +348,13 @@ func (m *Model) Solve() Result {
 	if hasIncumbent {
 		res.X = bestX
 		res.RowActivity, res.ReducedCost, res.RowPrice = bestRowAct, bestRC, bestPrice
+		// cut rows are internal: report only the caller's original rows
+		if len(res.RowActivity) > origRows {
+			res.RowActivity = res.RowActivity[:origRows]
+		}
+		if len(res.RowPrice) > origRows {
+			res.RowPrice = res.RowPrice[:origRows]
+		}
 		res.Obj = bestInternal * m.P.ObjSense
 	}
 	return res
