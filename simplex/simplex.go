@@ -78,7 +78,7 @@ type LP struct {
 	Stats struct {
 		Solves, Phase1, Phase2, Dual               int64
 		DualStallQ, DualStallA, DualCap, DualFlips int64
-		KernelMax                                  int64
+		KernelMax, Bland                           int64
 	}
 }
 
@@ -251,6 +251,10 @@ func (lp *LP) WarmSolve(st *State, touched []int) (Status, *State, float64) {
 // dualPivotCap bounds dual pivots per re-solve; a degenerate dual bails to
 // the primal run instead of grinding forever.
 const dualPivotCap = 512
+
+// blandAfter switches entering selection to Bland's rule once this many
+// consecutive degenerate (zero-step) pivots occur.
+const blandAfter = 384
 
 // dualRun is a best-effort bounded-variable dual simplex (CBC re-solves via
 // Clp's dual): it bails on any stall and leaves the rest to the primal run.
@@ -610,6 +614,7 @@ func (lp *LP) run(st *State) Status {
 	phase1Cost := make([]float64, lp.nTotal())
 	y := make([]float64, lp.m)
 	a := make([]float64, lp.m)
+	degen := 0 // consecutive zero-step pivots; Bland's rule breaks cycles
 	for iter := 0; ; iter++ {
 		if iter > maxIter {
 			return IterLimit
@@ -625,7 +630,13 @@ func (lp *LP) run(st *State) Status {
 		}
 		clear(y)
 		duals(st, cost, lp.m, y)
-		q, dir := lp.chooseEntering(st, y, cost)
+		var q int
+		var dir float64
+		if degen > blandAfter {
+			q, dir = lp.blandEntering(st, y, cost)
+		} else {
+			q, dir = lp.chooseEntering(st, y, cost)
+		}
 		if q < 0 {
 			if inPhase1 {
 				return Infeasible
@@ -646,8 +657,43 @@ func (lp *LP) run(st *State) Status {
 		} else {
 			lp.Stats.Phase2++
 		}
+		if t <= eps {
+			degen++
+		} else {
+			degen = 0
+		}
 		lp.pivot(st, q, dir, a, t, row, isFlip)
 	}
+}
+
+// blandEntering returns the first eligible entering variable (Bland's
+// rule): slower per pivot but guaranteed to escape degenerate cycles.
+func (lp *LP) blandEntering(st *State, y, cost []float64) (int, float64) {
+	lp.Stats.Bland++
+	for j := range lp.nTotal() {
+		if st.status[j] == basic {
+			continue
+		}
+		d := lp.reducedCost(y, cost, j)
+		switch st.status[j] {
+		case atLower:
+			if -d > optEps {
+				return j, 1
+			}
+		case atUpper:
+			if d > optEps {
+				return j, -1
+			}
+		case free:
+			if math.Abs(d) > optEps {
+				if d < 0 {
+					return j, 1
+				}
+				return j, -1
+			}
+		}
+	}
+	return -1, 0
 }
 
 // chooseEntering scans a rotating column window per pivot above

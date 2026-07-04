@@ -179,19 +179,6 @@ func (m *Model) Solve() Result {
 		m.LP.Deadline = deadline // abort long LP solves at the deadline too
 	}
 
-	// time-boxed binary probing (CglProbing), then rebuild the LP on the
-	// tightened problem
-	if len(m.P.SOSs) == 0 {
-		probeDeadline := time.Time{}
-		if m.Limits.MaxTime > 0 {
-			probeDeadline = time.Now().Add(m.Limits.MaxTime / 6)
-		}
-		probe(m.P, probeDeadline)
-		presolve(m.P)
-		m.LP = simplex.Build(m.P)
-		m.LP.Deadline = deadline
-	}
-
 	// seed the incumbent before cutting: the caller's MIP start plus root
 	// reduced-cost fixing shrinks the problem the cuts then work on
 	var startObj float64

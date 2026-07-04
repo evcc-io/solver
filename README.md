@@ -54,10 +54,8 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 - **Basis factorization**: singleton triangularization with a sparse-LU
   kernel and product-form (eta) updates — O(nnz) pivots, periodic
   refactorization. No dense inverse.
-- **Presolve**: iterated activity-based bound tightening, big-M
-  coefficient tightening for binaries, and time-boxed binary probing
-  (CglProbing-style: fix each binary both ways, propagate, fix binaries
-  with an infeasible side, merge implied bounds).
+- **Presolve**: iterated activity-based bound tightening and big-M
+  coefficient tightening for binaries.
 - **Cuts**: Gomory mixed-integer cuts at the root, with support/dynamism
   hygiene, bound-driven round control, and retraction of batches that
   degrade the LP numerically.
@@ -80,8 +78,8 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 - **`-mips <file>` warm start is parsed but not wired** to
   `Model.MIPStart`, so `warmStart=True` in PuLP buys nothing yet.
 - **No multi-threaded search.** `-threads N` is accepted, ignored.
-- **No anti-cycling rule** (Dantzig pricing with an iteration cap; no
-  Bland fallback, no Harris ratio test, no perturbation).
+- **Limited anti-cycling**: Bland's rule engages after a degenerate-pivot
+  streak, but there is no Harris ratio test or perturbation.
 - **Format gaps**: free-format MPS only; no `OBJSENSE` section (sense
   comes from `-max`, as PuLP conveys it); the negative-`UP`-bound MPS
   convention is not implemented. PuLP never exercises any of these.
