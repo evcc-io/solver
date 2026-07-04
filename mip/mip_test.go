@@ -93,3 +93,23 @@ func TestSOS1(t *testing.T) {
 		t.Fatalf("SOS1 violated: %v", res.X)
 	}
 }
+
+func TestSolveNodeRepeatedColumnOverrides(t *testing.T) {
+	// branching can hit the same column twice, so override lists may carry
+	// two entries for one column; switching to a sibling that shares only
+	// the first must revert the suffix to the kept prefix override, not to
+	// the original problem bounds
+	p := problem.New()
+	p.ObjSense = -1
+	x := p.AddCol("x", 0, 10, 1, true, nil, nil)
+	y := p.AddCol("y", 0, 10, 1, true, nil, nil)
+	p.AddRow("r0", []int{x, y}, []float64{1, 1}, problem.LE, 12)
+	m := New(p)
+
+	m.solveNode(&node{overrides: []boundOverride{{x, 0, 4}, {y, 0, 3}, {x, 2, 2}}})
+	m.solveNode(&node{overrides: []boundOverride{{x, 0, 4}, {y, 0, 3}, {y, 1, 1}}})
+
+	if lb, ub := m.LP.Bound(x); lb != 0 || ub != 4 {
+		t.Fatalf("x bounds after live diff = [%v,%v], want [0,4] from kept prefix override", lb, ub)
+	}
+}
