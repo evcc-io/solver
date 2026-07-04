@@ -66,10 +66,11 @@ type Result struct {
 }
 
 type Model struct {
-	P      *problem.Problem
-	LP     *simplex.LP
-	Limits Limits
-	live   []boundOverride // bounds currently applied to LP; see solveNode
+	P         *problem.Problem
+	LP        *simplex.LP
+	Limits    Limits
+	live      []boundOverride // bounds currently applied to LP; see solveNode
+	rcTouched []int           // columns tightened by reducedCostFix
 }
 
 func New(p *problem.Problem) *Model {
@@ -119,6 +120,20 @@ func (m *Model) Solve() Result {
 	proofLost := false       // an unresolved (IterLimit) node was pruned
 	remaining := math.Inf(1) // best bound among subtrees dropped mid-dive
 
+	var rootObj float64 // root LP data for reduced-cost fixing
+	var rootX, rootRC []float64
+	rcFixed := false
+	diveTries := 0
+	newIncumbent := func(obj float64, x, rowAct, rc, price []float64) {
+		bestInternal = obj
+		bestX, bestRowAct, bestRC, bestPrice = x, rowAct, rc, price
+		hasIncumbent = true
+		if !rcFixed && rootX != nil {
+			rcFixed = true
+			m.reducedCostFix(rootX, rootRC, rootObj, bestInternal)
+		}
+	}
+
 	for pq.Len() > 0 {
 		if m.Limits.MaxNodes > 0 && nodeCount >= m.Limits.MaxNodes {
 			stopped = true
@@ -143,6 +158,9 @@ func (m *Model) Solve() Result {
 			if !rootDone {
 				rootDone = true
 				rootStatus = status
+				if status == simplex.Optimal {
+					rootObj, rootX, rootRC = obj, x, rc
+				}
 			}
 			if status != simplex.Optimal {
 				// an IterLimit node stays unresolved: prune it and search on,
@@ -171,9 +189,7 @@ func (m *Model) Solve() Result {
 
 			branchCol, sosIdx, sosSplit := m.findBranch(x)
 			if branchCol < 0 && sosIdx < 0 {
-				bestInternal = obj
-				bestX, bestRowAct, bestRC, bestPrice = x, rowAct, rc, price
-				hasIncumbent = true
+				newIncumbent(obj, x, rowAct, rc, price)
 				break
 			}
 
@@ -202,6 +218,18 @@ func (m *Model) Solve() Result {
 				}
 				near = childNodeMulti(nd, endState, loOv, obj)
 				far = childNodeMulti(nd, endState, hiOv, obj)
+			}
+			// no incumbent yet: try to manufacture one by diving (children
+			// above already captured their bounds, so the LP may move on)
+			if !hasIncumbent && diveTries < 8 && branchCol >= 0 && (nodeCount == 1 || nodeCount%256 == 0) {
+				diveTries++
+				hObj, hx, hAct, hRC, hPrice, ok := m.feasibilityPump(nd, x, endState)
+				if !ok {
+					hObj, hx, hAct, hRC, hPrice, ok = m.diveForIncumbent(nd, x, endState)
+				}
+				if ok {
+					newIncumbent(hObj, hx, hAct, hRC, hPrice)
+				}
 			}
 			nd, backtrack = near, far
 		}
@@ -302,10 +330,11 @@ func (m *Model) solveNode(nd *node) (status simplex.Status, x, rowAct, rc, price
 
 	// the warm start needs every column whose bounds may differ from the
 	// PARENT state's assumptions, not just the diff vs the last-solved node
-	touchedIdx := make([]int, len(nd.overrides))
-	for i, ov := range nd.overrides {
-		touchedIdx[i] = ov.idx
+	touchedIdx := make([]int, 0, len(nd.overrides)+len(m.rcTouched))
+	for _, ov := range nd.overrides {
+		touchedIdx = append(touchedIdx, ov.idx)
 	}
+	touchedIdx = append(touchedIdx, m.rcTouched...)
 
 	if nd.parentState != nil {
 		status, endState, _ = m.LP.WarmSolve(nd.parentState.Clone(), touchedIdx)
@@ -322,6 +351,176 @@ func (m *Model) solveNode(nd *node) (status simplex.Status, x, rowAct, rc, price
 		internalObj = m.LP.InternalObjective(endState)
 	}
 	return status, x, rowAct, rc, price, internalObj, endState
+}
+
+// feasibilityPump alternates rounding and L1-projection LP solves (CBC's
+// FPump heuristic) to manufacture a first incumbent; fails on cycling.
+func (m *Model) feasibilityPump(nd *node, x []float64, endState *simplex.State) (obj float64, dx, rowAct, rc, price []float64, ok bool) {
+	fail := func() (float64, []float64, []float64, []float64, []float64, bool) {
+		return 0, nil, nil, nil, nil, false
+	}
+	fpCost := m.LP.ZeroCost()
+	orig := m.LP.SwapCost(fpCost)
+	defer func() { m.LP.SwapCost(orig) }()
+
+	st := endState.Clone()
+	curX := x
+	var prev []float64
+	for iter := 0; iter < 30; iter++ {
+		if !m.LP.Deadline.IsZero() && time.Now().After(m.LP.Deadline) {
+			return fail()
+		}
+		// round the current LP point and build the L1 pull-back objective
+		integral := true
+		rounded := make([]float64, 0, 64)
+		for j, c := range m.P.Cols {
+			if !c.Integer {
+				continue
+			}
+			lb, ub := m.LP.Bound(j)
+			v := math.Max(lb, math.Min(ub, math.Round(curX[j])))
+			if frac := math.Abs(curX[j] - v); frac > intTol {
+				integral = false
+			}
+			switch {
+			case v <= lb+intTol:
+				fpCost[j] = 1
+			case v >= ub-intTol:
+				fpCost[j] = -1
+			default:
+				fpCost[j] = 0
+			}
+			rounded = append(rounded, v)
+		}
+		if integral {
+			// polish: real objective, all integers fixed at their values
+			m.LP.SwapCost(orig)
+			ovs := make([]boundOverride, len(nd.overrides), len(nd.overrides)+len(rounded))
+			copy(ovs, nd.overrides)
+			k := 0
+			for j, c := range m.P.Cols {
+				if !c.Integer {
+					continue
+				}
+				ovs = append(ovs, boundOverride{j, rounded[k], rounded[k]})
+				k++
+			}
+			child := &node{overrides: ovs, parentState: st, bound: nd.bound, depth: nd.depth + 1}
+			status, px, pAct, pRC, pPrice, pObj, _ := m.solveNode(child)
+			if status != simplex.Optimal {
+				return fail()
+			}
+			return pObj, px, pAct, pRC, pPrice, true
+		}
+		if prev != nil && slicesEqual(prev, rounded) {
+			return fail() // cycling
+		}
+		prev = rounded
+
+		status, nst, _ := m.LP.WarmSolve(st, nil)
+		if status != simplex.Optimal {
+			return fail()
+		}
+		st = nst
+		curX, _, _, _ = m.LP.Solution(st)
+	}
+	return fail()
+}
+
+func slicesEqual(a, b []float64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// diveForIncumbent fixes the least-fractional column at its nearest integer
+// and re-solves warm until integral (CBC diving); gives up when infeasible.
+func (m *Model) diveForIncumbent(nd *node, x []float64, endState *simplex.State) (obj float64, dx, rowAct, rc, price []float64, ok bool) {
+	cur, curX, curState := nd, x, endState
+	for {
+		if !m.LP.Deadline.IsZero() && time.Now().After(m.LP.Deadline) {
+			return 0, nil, nil, nil, nil, false
+		}
+		col, sosIdx, _ := m.findBranch(curX)
+		if sosIdx >= 0 {
+			return 0, nil, nil, nil, nil, false
+		}
+		if col < 0 {
+			dx, rowAct, rc, price = m.LP.Solution(curState)
+			return m.LP.InternalObjective(curState), dx, rowAct, rc, price, true
+		}
+		lb, ub := m.LP.Bound(col)
+		v := math.Max(lb, math.Min(ub, math.Round(curX[col])))
+		// nearest rounding first; if that goes infeasible, the other side
+		alt, hasAlt := 2*math.Floor(curX[col])+1-v, true
+		if alt < lb || alt > ub {
+			hasAlt = false
+		}
+		var child *node
+		var cx []float64
+		var cState *simplex.State
+		for {
+			ovs := make([]boundOverride, len(cur.overrides)+1)
+			copy(ovs, cur.overrides)
+			ovs[len(ovs)-1] = boundOverride{col, v, v}
+			child = &node{overrides: ovs, parentState: curState, bound: cur.bound, depth: cur.depth + 1}
+			status, x, _, _, _, _, cs := m.solveNode(child)
+			if status == simplex.Optimal {
+				cx, cState = x, cs
+				break
+			}
+			if !hasAlt {
+				return 0, nil, nil, nil, nil, false
+			}
+			v, hasAlt = alt, false
+		}
+		cur, curX, curState = child, cx, cState
+	}
+}
+
+// reducedCostFix tightens integer bounds the root reduced costs prove cannot
+// beat the incumbent by more than the gap (CBC-style); runs on first incumbent.
+func (m *Model) reducedCostFix(rootX, rootRC []float64, rootObj, best float64) {
+	gap := math.Max(m.Limits.GapAbs, m.Limits.GapRel*math.Abs(best))
+	slack := best - gap - rootObj
+	if slack < 0 {
+		return
+	}
+	live := make(map[int]bool, len(m.live))
+	for _, ov := range m.live {
+		live[ov.idx] = true
+	}
+	for j := range m.P.Cols {
+		c := &m.P.Cols[j]
+		if !c.Integer || j >= len(rootRC) {
+			continue
+		}
+		rcInt := rootRC[j] * m.P.ObjSense // undo user-sign back to internal
+		lb, ub := c.LB, c.UB
+		switch {
+		case rcInt > 1e-9:
+			ub = math.Min(ub, math.Floor(rootX[j]+slack/rcInt+intTol))
+		case rcInt < -1e-9:
+			lb = math.Max(lb, math.Ceil(rootX[j]-slack/-rcInt-intTol))
+		default:
+			continue
+		}
+		if (lb == c.LB && ub == c.UB) || ub < lb {
+			continue
+		}
+		c.LB, c.UB = lb, ub
+		m.rcTouched = append(m.rcTouched, j)
+		// overridden columns pick the new bounds up on revert; the rest now
+		if !live[j] {
+			m.LP.SetBound(j, lb, ub)
+		}
+	}
 }
 
 // findBranch picks the least-fractional integer column (cheap dives: rounding

@@ -65,6 +65,9 @@ type LP struct {
 	// (partial pricing) instead of all n+m every pivot; 0 means full scan.
 	pricingWindow int
 	pricingCursor int // scan position for partial pricing
+
+	// Stats accumulates pivot counts across solves (diagnostics only).
+	Stats struct{ Solves, Phase1, Phase2, Dual int64 }
 }
 
 // State is a mutable basis/solution snapshot, reusable across resolves.
@@ -103,11 +106,8 @@ func Build(p *problem.Problem) *LP {
 		lp.lb[n+i], lp.ub[n+i] = lb, ub
 		lp.cost[n+i] = 0
 	}
-	// partial pricing only pays off once the full scan is actually
-	// expensive; small problems keep the exact full-scan behavior.
-	if nt := n + m; nt > partialPricingThreshold {
-		lp.pricingWindow = nt / partialPricingDivisor
-	}
+	// partial pricing disabled: extra pivots from window-local entering
+	// choices dominate scan savings when each pivot is O(m^2) on dense binv
 	return lp
 }
 
@@ -184,8 +184,130 @@ func (lp *LP) WarmSolve(st *State, touched []int) (Status, *State, float64) {
 		}
 	}
 	lp.recomputeBasics(st)
+	// after a bound change the basis stays (near) dual feasible: a few dual
+	// pivots restore primal feasibility far cheaper than a primal Phase 1
+	lp.dualRun(st)
 	return lp.solveFrom(st)
 }
+
+// dualPivotCap bounds dual pivots per re-solve; a degenerate dual bails to
+// the primal run instead of grinding O(m^2) pivots.
+const dualPivotCap = 64
+
+// dualRun is a best-effort bounded-variable dual simplex (CBC re-solves via
+// Clp's dual): it bails on any stall and leaves the rest to the primal run.
+func (lp *LP) dualRun(st *State) {
+	m, nt := lp.m, lp.nTotal()
+	a := make([]float64, m)
+	y := make([]float64, m)
+	alphaRow := make([]float64, nt)
+
+	// reduced costs computed once, then updated incrementally per pivot
+	clear(y)
+	duals(st, lp.cost, m, y)
+	d := make([]float64, nt)
+	for j := 0; j < nt; j++ {
+		if st.status[j] != basic {
+			d[j] = lp.reducedCost(y, lp.cost, j)
+		}
+	}
+
+	for iter := 0; iter <= dualPivotCap; iter++ {
+		if !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
+			return
+		}
+		// leaving variable: the most primal-infeasible basic
+		r, bound, worst := -1, 0.0, 100*eps
+		for i := 0; i < m; i++ {
+			bv := st.basicOf[i]
+			v := st.value[bv]
+			if viol := lp.lb[bv] - v; viol > worst {
+				worst, r, bound = viol, i, lp.lb[bv]
+			}
+			if viol := v - lp.ub[bv]; viol > worst {
+				worst, r, bound = viol, i, lp.ub[bv]
+			}
+		}
+		if r < 0 {
+			return // primal feasible: done
+		}
+		leaving := st.basicOf[r]
+		needSign := 1.0 // required sign of alpha[r]*dir so the violation shrinks
+		if st.value[leaving] < bound {
+			needSign = -1
+		}
+		// pivot row r: alphaRow[j] = binv_r . col_j for all nonbasic j
+		rowR := st.binv[r*m : r*m+m]
+		q, qdir, bestRatio := -1, 0.0, math.Inf(1)
+		for j := 0; j < nt; j++ {
+			if st.status[j] == basic {
+				alphaRow[j] = 0
+				continue
+			}
+			rows, vals := lp.column(j)
+			var alphaJ float64
+			for k, row := range rows {
+				alphaJ += rowR[row] * vals[k]
+			}
+			alphaRow[j] = alphaJ
+			if math.Abs(alphaJ) < 1e-7 {
+				continue
+			}
+			for _, dir := range enterDirs(st.status[j]) {
+				if alphaJ*dir*needSign < eps {
+					continue
+				}
+				ratio := math.Abs(d[j]) / math.Abs(alphaJ)
+				if ratio < bestRatio {
+					bestRatio, q, qdir = ratio, j, dir
+				}
+			}
+		}
+		if q < 0 {
+			return // dual stall: the primal run decides feasibility
+		}
+		clear(a)
+		lp.alpha(st, q, a)
+		if math.Abs(a[r]) < 1e-7 {
+			return
+		}
+		t := (st.value[leaving] - bound) / (a[r] * qdir)
+		if t < 0 || math.IsInf(t, 0) || math.IsNaN(t) {
+			return
+		}
+		lp.Stats.Dual++
+		lp.pivot(st, q, qdir, a, t, r, false)
+		// incremental reduced-cost update from the pivot row
+		step := d[q] / alphaRow[q]
+		for j := 0; j < nt; j++ {
+			if st.status[j] == basic {
+				d[j] = 0
+			} else if alphaRow[j] != 0 {
+				d[j] -= step * alphaRow[j]
+			}
+		}
+		d[leaving] = -step
+		d[q] = 0
+	}
+}
+
+// enterDirs lists the directions a nonbasic variable may enter the basis in.
+func enterDirs(s varStat) []float64 {
+	switch s {
+	case atLower:
+		return dirUp
+	case atUpper:
+		return dirDown
+	default:
+		return dirBoth
+	}
+}
+
+var (
+	dirUp   = []float64{1}
+	dirDown = []float64{-1}
+	dirBoth = []float64{1, -1}
+)
 
 // recomputeBasics sets every basic variable's value from the nonbasic
 // values: x_B = -Binv * N * x_N (the system's RHS is always zero).
@@ -259,6 +381,7 @@ func (lp *LP) ColdSolve() (Status, *State, float64) {
 }
 
 func (lp *LP) solveFrom(st *State) (Status, *State, float64) {
+	lp.Stats.Solves++
 	status := lp.run(st)
 	if status != Optimal {
 		return status, st, 0
@@ -282,6 +405,17 @@ func (lp *LP) InternalObjective(st *State) float64 {
 
 // Bound returns variable j's current [lb,ub].
 func (lp *LP) Bound(j int) (float64, float64) { return lp.lb[j], lp.ub[j] }
+
+// ZeroCost returns a zero cost vector of the right length for SwapCost.
+func (lp *LP) ZeroCost() []float64 { return make([]float64, len(lp.cost)) }
+
+// SwapCost replaces the internal phase-2 cost vector (e.g. for a feasibility
+// pump projection) and returns the previous one; objective() is unaffected.
+func (lp *LP) SwapCost(c []float64) []float64 {
+	old := lp.cost
+	lp.cost = c
+	return old
+}
 
 // SetBound overrides variable j's [lb,ub] for subsequent solves.
 func (lp *LP) SetBound(j int, lb, ub float64) { lp.lb[j] = lb; lp.ub[j] = ub }
@@ -344,6 +478,11 @@ func (lp *LP) run(st *State) Status {
 				return Infeasible
 			}
 			return Unbounded
+		}
+		if inPhase1 {
+			lp.Stats.Phase1++
+		} else {
+			lp.Stats.Phase2++
 		}
 		lp.pivot(st, q, dir, a, t, row, isFlip)
 	}
