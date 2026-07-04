@@ -38,6 +38,10 @@ type factor struct {
 	kPos    []int       // kernel basis positions
 	kinv    []float64   // dense k*k inverse of the kernel, row-major
 	rowKIdx []int       // row -> kernel row index, -1 otherwise
+
+	// solve scratch, reused across calls (solver is single-threaded);
+	// per-call make() showed up as ~8% madvise in profiles
+	xScratch, kScratch []float64
 }
 
 // factorize builds a factorization of the basis whose pos-th column is
@@ -239,7 +243,12 @@ func denseInverse(a []float64, k int) []float64 {
 // ftranFactor solves B*x = v in place: v becomes x indexed by basis
 // position (x[pos] = multiplier of basic column pos).
 func (f *factor) ftran(v []float64) {
-	x := make([]float64, f.m) // by basis position
+	if f.xScratch == nil {
+		f.xScratch = make([]float64, f.m)
+		f.kScratch = make([]float64, len(f.kRows))
+	}
+	x := f.xScratch // by basis position
+	clear(x)
 	// forward: row singletons
 	for _, tp := range f.fwd {
 		xc := v[tp.row] / tp.a
@@ -254,7 +263,7 @@ func (f *factor) ftran(v []float64) {
 	// kernel
 	k := len(f.kRows)
 	if k > 0 {
-		kv := make([]float64, k)
+		kv := f.kScratch
 		for ki, r := range f.kRows {
 			kv[ki] = v[r]
 		}
@@ -290,7 +299,12 @@ func (f *factor) ftran(v []float64) {
 // btran solves B^T*y = w in place: w is indexed by basis position on entry,
 // y by row on exit. Ops are the adjoints of ftran's, in reverse order.
 func (f *factor) btran(w []float64) {
-	y := make([]float64, f.m) // by row
+	if f.xScratch == nil {
+		f.xScratch = make([]float64, f.m)
+		f.kScratch = make([]float64, len(f.kRows))
+	}
+	y := f.xScratch // by row
+	clear(y)
 	// adjoint of backward pass, in forward order
 	for _, tp := range f.bwd {
 		s := w[tp.pos]
@@ -304,7 +318,7 @@ func (f *factor) btran(w []float64) {
 	// adjoint of kernel: y_K = kinv^T * (w_K - cols^T y_known)
 	k := len(f.kRows)
 	if k > 0 {
-		kw := make([]float64, k)
+		kw := f.kScratch
 		for ki, pos := range f.kPos {
 			s := w[pos]
 			for kk, r := range f.colRow[pos] {

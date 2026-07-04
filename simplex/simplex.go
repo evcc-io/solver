@@ -71,6 +71,7 @@ type LP struct {
 	Stats struct {
 		Solves, Phase1, Phase2, Dual               int64
 		DualStallQ, DualStallA, DualCap, DualFlips int64
+		KernelMax                                  int64
 	}
 }
 
@@ -111,6 +112,9 @@ func (lp *LP) refactorize(st *State) bool {
 	f := factorize(lp.m, colRow, colVal)
 	if f == nil {
 		return false
+	}
+	if k := int64(len(f.kRows)); k > lp.Stats.KernelMax {
+		lp.Stats.KernelMax = k
 	}
 	st.f = f
 	st.etas = nil
