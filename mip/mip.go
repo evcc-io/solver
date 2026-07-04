@@ -76,12 +76,13 @@ type Result struct {
 }
 
 type Model struct {
-	P         *problem.Problem
-	LP        *simplex.LP
-	Limits    Limits
-	MIPStart  []float64       // optional structural start point; ints get fixed
-	live      []boundOverride // bounds currently applied to LP; see solveNode
-	rcTouched []int           // columns tightened by reducedCostFix
+	P             *problem.Problem
+	LP            *simplex.LP
+	Limits        Limits
+	MIPStart      []float64       // optional structural start point; ints get fixed
+	live          []boundOverride // bounds currently applied to LP; see solveNode
+	rcTouched     []int           // columns tightened by reducedCostFix
+	bestXSnapshot []float64       // incumbent X for the RINS neighborhood
 }
 
 func New(p *problem.Problem) *Model {
@@ -195,6 +196,7 @@ func (m *Model) Solve() Result {
 	newIncumbent := func(obj float64, x, rowAct, rc, price []float64) {
 		bestInternal = obj
 		bestX, bestRowAct, bestRC, bestPrice = x, rowAct, rc, price
+		m.bestXSnapshot = x
 		hasIncumbent = true
 		if !rcFixed && rootX != nil {
 			rcFixed = true
@@ -304,6 +306,14 @@ func (m *Model) Solve() Result {
 					hObj, hx, hAct, hRC, hPrice, ok = m.diveForIncumbent(nd, x, endState)
 				}
 				if ok {
+					newIncumbent(hObj, hx, hAct, hRC, hPrice)
+				}
+			}
+			// RINS-lite: fix integers where incumbent and node LP agree,
+			// LP-complete the rest; accept only strict improvements
+			if hasIncumbent && nodeCount%512 == 0 {
+				if hObj, hx, hAct, hRC, hPrice, ok := m.rinsImprove(nd, x); ok && m.improves(hObj, bestInternal) {
+					debugf("rins: improved %g -> %g", bestInternal, hObj)
 					newIncumbent(hObj, hx, hAct, hRC, hPrice)
 				}
 			}
@@ -510,6 +520,36 @@ func slicesEqual(a, b []float64) bool {
 		}
 	}
 	return true
+}
+
+// rinsImprove fixes integers where the incumbent and the node LP agree and
+// dives the few disagreeing ones (CBC's RINS neighborhood, LP-approximated).
+func (m *Model) rinsImprove(nd *node, x []float64) (obj float64, dx, rowAct, rc, price []float64, ok bool) {
+	best := m.bestXSnapshot
+	if best == nil {
+		return 0, nil, nil, nil, nil, false
+	}
+	ovs := make([]boundOverride, len(nd.overrides), len(nd.overrides)+len(m.P.Cols))
+	copy(ovs, nd.overrides)
+	for j, c := range m.P.Cols {
+		if !c.Integer {
+			continue
+		}
+		bv := math.Round(best[j])
+		if math.Abs(x[j]-bv) > 0.1 {
+			continue // disagreement: leave free for the sub-solve
+		}
+		lb, ub := m.LP.Bound(j)
+		v := math.Max(lb, math.Min(ub, bv))
+		ovs = append(ovs, boundOverride{j, v, v})
+	}
+	child := &node{overrides: ovs, bound: nd.bound, depth: nd.depth + 1}
+	status, cx, _, _, _, _, cState := m.solveNode(child)
+	if status != simplex.Optimal {
+		return 0, nil, nil, nil, nil, false
+	}
+	// remaining fractional integers: finish with the rounding dive
+	return m.diveForIncumbent(child, cx, cState)
 }
 
 // completePoint fixes every integer column at its rounded value from point

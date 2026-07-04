@@ -6,6 +6,7 @@ package simplex
 
 import (
 	"math"
+	"sort"
 	"time"
 
 	"cbcgo/problem"
@@ -67,7 +68,10 @@ type LP struct {
 	pricingCursor int // scan position for partial pricing
 
 	// Stats accumulates pivot counts across solves (diagnostics only).
-	Stats struct{ Solves, Phase1, Phase2, Dual int64 }
+	Stats struct {
+		Solves, Phase1, Phase2, Dual               int64
+		DualStallQ, DualStallA, DualCap, DualFlips int64
+	}
 }
 
 // State is a mutable basis/solution snapshot, reusable across resolves.
@@ -226,8 +230,8 @@ func (lp *LP) WarmSolve(st *State, touched []int) (Status, *State, float64) {
 }
 
 // dualPivotCap bounds dual pivots per re-solve; a degenerate dual bails to
-// the primal run instead of grinding O(m^2) pivots.
-const dualPivotCap = 64
+// the primal run instead of grinding forever.
+const dualPivotCap = 512
 
 // dualRun is a best-effort bounded-variable dual simplex (CBC re-solves via
 // Clp's dual): it bails on any stall and leaves the rest to the primal run.
@@ -248,13 +252,21 @@ func (lp *LP) dualRun(st *State) {
 		}
 	}
 
+	var skip map[int]bool // rows whose violation the dual cannot fix
 	for iter := 0; iter <= dualPivotCap; iter++ {
 		if !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
+			return
+		}
+		if iter == dualPivotCap {
+			lp.Stats.DualCap++
 			return
 		}
 		// leaving variable: the most primal-infeasible basic
 		r, bound, worst := -1, 0.0, 100*eps
 		for i := 0; i < m; i++ {
+			if skip[i] {
+				continue
+			}
 			bv := st.basicOf[i]
 			v := st.value[bv]
 			if viol := lp.lb[bv] - v; viol > worst {
@@ -265,7 +277,7 @@ func (lp *LP) dualRun(st *State) {
 			}
 		}
 		if r < 0 {
-			return // primal feasible: done
+			return // primal feasible (or only unfixable rows left): done
 		}
 		leaving := st.basicOf[r]
 		needSign := 1.0 // required sign of alpha[r]*dir so the violation shrinks
@@ -277,7 +289,7 @@ func (lp *LP) dualRun(st *State) {
 		rowBuf[r] = 1
 		st.btranVec(rowBuf)
 		rowR := rowBuf
-		q, qdir, bestRatio := -1, 0.0, math.Inf(1)
+		var cands []dualCand
 		for j := 0; j < nt; j++ {
 			if st.status[j] == basic {
 				alphaRow[j] = 0
@@ -296,22 +308,76 @@ func (lp *LP) dualRun(st *State) {
 				if alphaJ*dir*needSign < eps {
 					continue
 				}
-				ratio := math.Abs(d[j]) / math.Abs(alphaJ)
-				if ratio < bestRatio {
-					bestRatio, q, qdir = ratio, j, dir
+				cands = append(cands, dualCand{j, dir, math.Abs(d[j]) / math.Abs(alphaJ)})
+			}
+		}
+		sort.Slice(cands, func(a, b int) bool { return cands[a].ratio < cands[b].ratio })
+
+		// dual long step (Clp "dual with flips"): boxed candidates that
+		// can't absorb the violation get flipped; the overshooter pivots
+		q, qdir := -1, 0.0
+		viol := math.Abs(st.value[leaving] - bound)
+		var flips []int
+		for _, cd := range cands {
+			jlb, jub := lp.lb[cd.j], lp.ub[cd.j]
+			rng := jub - jlb
+			aj := math.Abs(alphaRow[cd.j])
+			if rng >= inf || rng <= 0 || aj*rng >= viol {
+				q, qdir = cd.j, cd.dir
+				break
+			}
+			flips = append(flips, cd.j)
+			viol -= aj * rng
+		}
+		if q >= 0 && len(flips) > 0 {
+			// apply flips: one combined column delta, one ftran for basics
+			delta := make([]float64, m)
+			for _, j := range flips {
+				jlb, jub := lp.lb[j], lp.ub[j]
+				var dv float64
+				if st.status[j] == atLower {
+					dv = jub - jlb
+					st.status[j] = atUpper
+					st.value[j] = jub
+				} else {
+					dv = jlb - jub
+					st.status[j] = atLower
+					st.value[j] = jlb
 				}
+				rows, vals := lp.column(j)
+				for k, row := range rows {
+					delta[row] += vals[k] * dv
+				}
+				lp.Stats.DualFlips++
+			}
+			st.ftranVec(delta)
+			for pos := 0; pos < m; pos++ {
+				st.value[st.basicOf[pos]] -= delta[pos]
 			}
 		}
 		if q < 0 {
-			return // dual stall: the primal run decides feasibility
+			// this row's violation is dual-unfixable: leave it to the
+			// primal run, but keep repairing the other rows
+			lp.Stats.DualStallQ++
+			if skip == nil {
+				skip = make(map[int]bool)
+			}
+			skip[r] = true
+			continue
 		}
 		clear(a)
 		lp.alpha(st, q, a)
 		if math.Abs(a[r]) < 1e-7 {
-			return
+			lp.Stats.DualStallA++
+			if skip == nil {
+				skip = make(map[int]bool)
+			}
+			skip[r] = true
+			continue
 		}
 		t := (st.value[leaving] - bound) / (a[r] * qdir)
 		if t < 0 || math.IsInf(t, 0) || math.IsNaN(t) {
+			lp.Stats.DualStallA++
 			return
 		}
 		lp.Stats.Dual++
@@ -328,6 +394,13 @@ func (lp *LP) dualRun(st *State) {
 		d[leaving] = -step
 		d[q] = 0
 	}
+}
+
+// dualCand is one eligible entering candidate in the dual ratio test.
+type dualCand struct {
+	j     int
+	dir   float64
+	ratio float64
 }
 
 // enterDirs lists the directions a nonbasic variable may enter the basis in.
