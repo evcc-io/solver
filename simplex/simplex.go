@@ -6,6 +6,7 @@ package simplex
 
 import (
 	"math"
+	"time"
 
 	"cbcgo/problem"
 )
@@ -15,6 +16,11 @@ const (
 	eps     = 1e-9
 	optEps  = 1e-7
 	maxIter = 200000
+
+	// partial pricing kicks in only above this many total variables, and
+	// then scans nt/partialPricingDivisor columns per window.
+	partialPricingThreshold = 4000
+	partialPricingDivisor   = 8
 )
 
 type Status int
@@ -50,6 +56,15 @@ type LP struct {
 	cost    []float64 // length n+m, signed for internal minimization
 	rawObj  []float64 // length n, unsigned (as given in the problem)
 	objSign float64
+
+	// Deadline, when set, aborts a solve with IterLimit once exceeded
+	// (checked periodically inside the pivot loop).
+	Deadline time.Time
+
+	// pricingWindow >0 makes chooseEntering scan a rotating column window
+	// (partial pricing) instead of all n+m every pivot; 0 means full scan.
+	pricingWindow int
+	pricingCursor int // scan position for partial pricing
 }
 
 // State is a mutable basis/solution snapshot, reusable across resolves.
@@ -57,7 +72,7 @@ type State struct {
 	status  []varStat
 	basicOf []int // row -> basic variable index
 	value   []float64
-	binv    [][]float64
+	binv    []float64 // flat m*m, row-major: binv[i*m+k]
 }
 
 func Build(p *problem.Problem) *LP {
@@ -88,6 +103,11 @@ func Build(p *problem.Problem) *LP {
 		lp.lb[n+i], lp.ub[n+i] = lb, ub
 		lp.cost[n+i] = 0
 	}
+	// partial pricing only pays off once the full scan is actually
+	// expensive; small problems keep the exact full-scan behavior.
+	if nt := n + m; nt > partialPricingThreshold {
+		lp.pricingWindow = nt / partialPricingDivisor
+	}
 	return lp
 }
 
@@ -109,15 +129,15 @@ func (lp *LP) column(j int) ([]int, []float64) {
 // finite bound is available (lower preferred), or free at 0.
 func (lp *LP) initState() *State {
 	nt := lp.nTotal()
+	m := lp.m
 	st := &State{
 		status:  make([]varStat, nt),
-		basicOf: make([]int, lp.m),
+		basicOf: make([]int, m),
 		value:   make([]float64, nt),
-		binv:    make([][]float64, lp.m),
+		binv:    make([]float64, m*m),
 	}
-	for i := 0; i < lp.m; i++ {
-		st.binv[i] = make([]float64, lp.m)
-		st.binv[i][i] = -1
+	for i := 0; i < m; i++ {
+		st.binv[i*m+i] = -1
 		st.basicOf[i] = lp.n + i
 		st.status[lp.n+i] = basic
 	}
@@ -147,16 +167,12 @@ func (lp *LP) resetNonbasic(st *State, j int) {
 // Clone returns a deep copy, safe to mutate independently of st (used to
 // warm-start a branch-and-bound child node from its parent's basis).
 func (st *State) Clone() *State {
-	c := &State{
+	return &State{
 		status:  append([]varStat(nil), st.status...),
 		basicOf: append([]int(nil), st.basicOf...),
 		value:   append([]float64(nil), st.value...),
-		binv:    make([][]float64, len(st.binv)),
+		binv:    append([]float64(nil), st.binv...),
 	}
-	for i, row := range st.binv {
-		c.binv[i] = append([]float64(nil), row...)
-	}
-	return c
 }
 
 // WarmSolve resolves from st after bound changes on touched, instead of
@@ -191,8 +207,9 @@ func (lp *LP) recomputeBasics(st *State) {
 	}
 	for i := 0; i < m; i++ {
 		var s float64
+		row := st.binv[i*m : i*m+m]
 		for k := 0; k < m; k++ {
-			s += st.binv[i][k] * (-residual[k])
+			s += row[k] * (-residual[k])
 		}
 		st.value[st.basicOf[i]] = s
 	}
@@ -201,14 +218,15 @@ func (lp *LP) recomputeBasics(st *State) {
 // alpha fills dst (length lp.m, assumed zeroed) with column j's entries
 // against the current basis: Binv * column(j).
 func (lp *LP) alpha(st *State, j int, dst []float64) {
+	m := lp.m
 	rows, vals := lp.column(j)
 	for k, r := range rows {
 		c := vals[k]
 		if c == 0 {
 			continue
 		}
-		for i := 0; i < lp.m; i++ {
-			dst[i] += st.binv[i][r] * c
+		for i := 0; i < m; i++ {
+			dst[i] += st.binv[i*m+r] * c
 		}
 	}
 }
@@ -220,7 +238,7 @@ func duals(st *State, cost []float64, m int, dst []float64) {
 		if cb == 0 {
 			continue
 		}
-		axpy(dst, st.binv[i], cb)
+		axpy(dst, st.binv[i*m:i*m+m], cb)
 	}
 }
 
@@ -300,6 +318,9 @@ func (lp *LP) run(st *State) Status {
 		if iter > maxIter {
 			return IterLimit
 		}
+		if iter%1024 == 0 && !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
+			return IterLimit
+		}
 		clear(phase1Cost)
 		inPhase1 := lp.phaseCost(st, phase1Cost)
 		cost := phase1Cost
@@ -328,11 +349,35 @@ func (lp *LP) run(st *State) Status {
 	}
 }
 
+// chooseEntering scans a rotating column window per pivot above
+// partialPricingThreshold, but always covers everything before declaring optimal.
 func (lp *LP) chooseEntering(st *State, y, cost []float64) (q int, dir float64) {
+	nt := lp.nTotal()
+	if lp.pricingWindow <= 0 {
+		return lp.scanEntering(st, y, cost, 0, nt)
+	}
+	start := lp.pricingCursor
+	for scanned := 0; scanned < nt; {
+		end := start + lp.pricingWindow
+		if end > nt {
+			end = nt
+		}
+		q, dir = lp.scanEntering(st, y, cost, start, end)
+		scanned += end - start
+		if q >= 0 {
+			lp.pricingCursor = end % nt
+			return q, dir
+		}
+		start = end % nt
+	}
+	lp.pricingCursor = 0
+	return -1, 0
+}
+
+func (lp *LP) scanEntering(st *State, y, cost []float64, lo, hi int) (q int, dir float64) {
 	best := optEps
 	q = -1
-	nt := lp.nTotal()
-	for j := 0; j < nt; j++ {
+	for j := lo; j < hi; j++ {
 		if st.status[j] == basic {
 			continue
 		}
@@ -465,16 +510,17 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 		st.value[leaving] = ub
 	}
 
+	m := lp.m
 	pivotVal := a[leaveRow]
-	rowR := st.binv[leaveRow]
-	for k := 0; k < lp.m; k++ {
+	rowR := st.binv[leaveRow*m : leaveRow*m+m]
+	for k := 0; k < m; k++ {
 		rowR[k] /= pivotVal
 	}
-	for i := 0; i < lp.m; i++ {
+	for i := 0; i < m; i++ {
 		if i == leaveRow || a[i] == 0 {
 			continue
 		}
-		axpy(st.binv[i], rowR, -a[i])
+		axpy(st.binv[i*m:i*m+m], rowR, -a[i])
 	}
 	st.basicOf[leaveRow] = q
 	st.status[q] = basic

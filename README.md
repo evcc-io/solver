@@ -115,7 +115,7 @@ directly, though that works too.)
   (including its wrapped-line and empty-constraint-dummy-variable quirks).
 - Solves LPs and MIPs: bounded-variable primal simplex with a
   composite-objective Phase 1, best-first branch-and-bound with
-  most-fractional branching, SOS1/SOS2 via Beale–Tomlin splitting.
+  least-fractional branching, SOS1/SOS2 via Beale–Tomlin splitting.
 - Warm-starts each B&B child node from a clone of its parent's basis rather
   than re-deriving the basis from scratch at every node.
 - Writes CBC's exact `.sol` status-line/data-line format, verified directly
@@ -147,7 +147,7 @@ directly, though that works too.)
   within 10 seconds, which realistically needs a heuristic to manufacture a
   feasible point quickly rather than waiting for branch-and-bound to stumble
   onto one. This is the cause of one of the two failing PuLP tests.
-- **No strong/pseudocost branching.** Always most-fractional. `-strong N`
+- **No strong/pseudocost branching.** Always least-fractional. `-strong N`
   is accepted, ignored.
 - **No multi-threaded search.** `-threads N` is accepted, ignored.
 
