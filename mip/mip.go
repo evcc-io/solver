@@ -5,6 +5,7 @@ package mip
 import (
 	"container/heap"
 	"math"
+	"sort"
 	"time"
 
 	"fmt"
@@ -262,10 +263,17 @@ func (m *Model) Solve() Result {
 				newIncumbent(obj, x, rowAct, rc, price)
 				break
 			}
+			// shallow nodes pick the branch variable by probing (strong
+			// branching); deeper plunges keep the cheap rule
+			if branchCol >= 0 && nd.depth < 8 {
+				if sb := m.strongBranch(nd, x, endState, obj); sb >= 0 {
+					branchCol = sb
+				}
+			}
 
 			var near, far *node
 			if branchCol >= 0 {
-				lb, ub := m.LP.Bound(branchCol)
+				lb, ub := m.nodeBound(nd, branchCol)
 				floorV := math.Floor(x[branchCol] + 1e-7)
 				ceilV := math.Ceil(x[branchCol] - 1e-7)
 				floorChild := childNode(nd, endState, boundOverride{branchCol, lb, floorV}, obj)
@@ -656,6 +664,82 @@ func (m *Model) reducedCostFix(rootX, rootRC []float64, rootObj, best float64) {
 			m.LP.SetBound(j, lb, ub)
 		}
 	}
+}
+
+// nodeBound returns column j's effective bounds under nd's overrides,
+// independent of whatever bounds are currently live on the LP.
+func (m *Model) nodeBound(nd *node, j int) (float64, float64) {
+	lb, ub := m.P.Cols[j].LB, m.P.Cols[j].UB
+	for _, ov := range nd.overrides {
+		if ov.idx == j {
+			lb, ub = ov.lb, ov.ub
+		}
+	}
+	return lb, ub
+}
+
+// strongBranch (CBC-style) probes both children of the top candidates and
+// returns the column whose worse child moves the bound most; -1 if none do.
+func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj float64) int {
+	type cand struct {
+		j    int
+		dist float64
+	}
+	var cands []cand
+	for j, c := range m.P.Cols {
+		if !c.Integer {
+			continue
+		}
+		frac := x[j] - math.Floor(x[j])
+		if dist := math.Min(frac, 1-frac); dist > intTol {
+			cands = append(cands, cand{j, dist})
+		}
+	}
+	if len(cands) < 2 {
+		return -1
+	}
+	sort.Slice(cands, func(a, b int) bool { return cands[a].dist > cands[b].dist })
+	if len(cands) > 8 {
+		cands = cands[:8]
+	}
+
+	// short per-probe deadline: strong branching must never eat the budget
+	saved := m.LP.Deadline
+	defer func() { m.LP.Deadline = saved }()
+
+	bestCol, bestScore := -1, math.Inf(-1)
+	for _, cd := range cands {
+		lb, ub := m.nodeBound(nd, cd.j)
+		floorV := math.Floor(x[cd.j])
+		score := math.Inf(1)
+		for _, b := range [2][2]float64{{lb, floorV}, {floorV + 1, ub}} {
+			ovs := make([]boundOverride, len(nd.overrides)+1)
+			copy(ovs, nd.overrides)
+			ovs[len(ovs)-1] = boundOverride{cd.j, b[0], b[1]}
+			child := &node{overrides: ovs, parentState: endState, bound: nd.bound, depth: nd.depth + 1}
+			probeDeadline := time.Now().Add(20 * time.Millisecond)
+			if saved.IsZero() || probeDeadline.Before(saved) {
+				m.LP.Deadline = probeDeadline
+			}
+			status, _, _, _, _, cObj, _ := m.solveNode(child)
+			m.LP.Deadline = saved
+			switch status {
+			case simplex.Optimal:
+				score = math.Min(score, cObj-obj) // bound gain of this side
+			case simplex.Infeasible:
+				// side prunes outright: keep score as-is (excellent)
+			default:
+				score = math.Min(score, 0) // probe unresolved: no credit
+			}
+		}
+		if score > bestScore {
+			bestScore, bestCol = score, cd.j
+		}
+	}
+	if bestScore <= 1e-12 {
+		return -1 // nothing moves the bound; fall back to least-fractional
+	}
+	return bestCol
 }
 
 // findBranch picks the least-fractional integer column (cheap dives: rounding
