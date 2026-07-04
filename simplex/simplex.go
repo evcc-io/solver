@@ -499,11 +499,43 @@ func (lp *LP) reducedCost(y []float64, cost []float64, j int) float64 {
 }
 
 // ColdSolve runs Phase 1 (feasibility) then Phase 2 (optimize the real
-// objective) from the trivial all-logical-variables basis.
+// objective) from the trivial all-logical-variables basis. Bounds are
+// perturbed outward by tiny per-index jitter for the solve and restored
+// for a short warm cleanup: distinct ratios destroy the degenerate-tie
+// plateaus that stall Phase 1 on presolve-tightened problems (Clp-style).
 func (lp *LP) ColdSolve() (Status, *State, float64) {
+	nt := lp.nTotal()
+	savedLb := append([]float64(nil), lp.lb...)
+	savedUb := append([]float64(nil), lp.ub...)
+	touched := make([]int, 0, nt)
+	for j := range nt {
+		jit := perturbEps * float64(1+(uint32(j)*2654435761)%97) / 97
+		changed := false
+		if lp.lb[j] > -inf {
+			lp.lb[j] -= jit * math.Max(1, math.Abs(lp.lb[j]))
+			changed = true
+		}
+		if lp.ub[j] < inf {
+			lp.ub[j] += jit * math.Max(1, math.Abs(lp.ub[j]))
+			changed = true
+		}
+		if changed {
+			touched = append(touched, j)
+		}
+	}
 	st := lp.initState()
-	return lp.solveFrom(st)
+	status := lp.run(st)
+	copy(lp.lb, savedLb)
+	copy(lp.ub, savedUb)
+	if status != Optimal {
+		// perturbed solve failed; retry clean from scratch
+		st = lp.initState()
+		return lp.solveFrom(st)
+	}
+	return lp.WarmSolve(st, touched)
 }
+
+const perturbEps = 1e-7
 
 func (lp *LP) solveFrom(st *State) (Status, *State, float64) {
 	lp.Stats.Solves++
