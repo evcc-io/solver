@@ -179,6 +179,28 @@ func (m *Model) Solve() Result {
 		m.LP.Deadline = deadline // abort long LP solves at the deadline too
 	}
 
+	// seed the incumbent before cutting: the caller's MIP start plus root
+	// reduced-cost fixing shrinks the problem the cuts then work on
+	var startObj float64
+	var startX, startAct, startRC, startPrice []float64
+	haveStart := false
+	if len(m.MIPStart) == len(m.P.Cols) && len(m.P.SOSs) == 0 {
+		if status, st, _ := m.LP.ColdSolve(); status == simplex.Optimal {
+			rx, _, rrc, _ := m.LP.Solution(st)
+			robj := m.LP.InternalObjective(st)
+			if obj, x, act, rc, price, ok := m.completePoint(&node{brCol: -1}, m.MIPStart); ok {
+				startObj, startX, startAct, startRC, startPrice = obj, x, act, rc, price
+				haveStart = true
+				debugf("mipstart: pre-cut incumbent obj=%g", obj)
+				m.reducedCostFix(rx, rrc, robj, obj)
+			}
+			for _, ov := range m.live {
+				m.LP.SetBound(ov.idx, m.P.Cols[ov.idx].LB, m.P.Cols[ov.idx].UB)
+			}
+			m.live = nil
+		}
+	}
+
 	// GMI cut rounds tighten the root while its bound still moves; capped
 	// at a fifth of the budget so the tree always gets its time
 	origRows := len(m.P.Rows)
@@ -261,6 +283,11 @@ func (m *Model) Solve() Result {
 			rcFixed = true
 			m.reducedCostFix(rootX, rootRC, rootObj, bestInternal)
 		}
+	}
+
+	if haveStart {
+		rcFixed = true // already applied against the true root bound
+		newIncumbent(startObj, startX, startAct, startRC, startPrice)
 	}
 
 	for pq.Len() > 0 {
