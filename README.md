@@ -54,32 +54,43 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 - **Basis factorization**: singleton triangularization with a sparse-LU
   kernel and product-form (eta) updates — O(nnz) pivots, periodic
   refactorization. No dense inverse.
-- **Presolve**: iterated activity-based bound tightening and big-M
-  coefficient tightening for binaries.
+- **Presolve**: iterated activity-based bound tightening, big-M
+  coefficient tightening for binaries, and CglProbing-style binary probing
+  (infeasibility fixing plus integer-only merged implied bounds).
 - **Cuts**: Gomory mixed-integer cuts at the root, with support/dynamism
   hygiene, bound-driven round control, and retraction of batches that
   degrade the LP numerically.
 - **Branch and bound**: best-first with depth-first plunging, warm-started
-  child bases, monotone bound propagation, bound-based optimality proof at
-  exit, root reduced-cost fixing, SOS1/SOS2 via Beale–Tomlin splitting.
-- **Branching**: strong branching at shallow depths seeding pseudocosts;
-  pseudocost selection deeper (reliability-branching shape).
+  child bases, node-level bound propagation on branching, monotone bound
+  propagation, bound-based optimality proof at exit, reduced-cost fixing
+  re-run on every improving incumbent, SOS1/SOS2 via Beale–Tomlin
+  splitting.
+- **Branching**: strong branching at shallow depths (size-scaled: big
+  problems probe less) seeding pseudocosts; pseudocost selection deeper
+  (reliability-branching shape).
 - **Heuristics**: caller-provided MIP start (`mip.Model.MIPStart`,
-  completed before the cut loop so reduced-cost fixing bites), feasibility
-  pump, two-sided rounding dive, RINS-lite improvement.
+  completed before the cut loop so reduced-cost fixing bites), 1-opt
+  incumbent polish (CbcHeuristicLocal-style binary flips via warm dual
+  re-solves), face walk (least-degradation dive along the LP-optimal
+  face — proves optimality outright on degenerate alternate-optima
+  instances), RENS, feasibility pump, batch rounding dive, RINS-lite;
+  heuristic bursts are time-boxed so the tree keeps its budget.
+- **Anti-stalling**: full Bland's rule (entering and leaving) after a
+  degenerate streak, plus Clp-style bound perturbation in cold solves
+  with clean-bound restoration.
 - **CLI**: honors the flags PuLP sends (`-max`, `-sec`, `-ratio`,
   `-allow`, `-maxNodes`, `-solve`, `-initialSolve`, `-solution`);
   unrecognized flags are consumed tolerantly.
 
 ## Missing vs. real CBC
 
-- **Cut families beyond GMI**: no knapsack cover, probing, clique, MIR, or
-  lift-and-project cuts; no cuts below the root.
+- **Cut families beyond GMI**: no knapsack cover, clique, MIR, flow-cover,
+  or lift-and-project cuts; no cuts below the root.
 - **`-mips <file>` warm start is parsed but not wired** to
   `Model.MIPStart`, so `warmStart=True` in PuLP buys nothing yet.
 - **No multi-threaded search.** `-threads N` is accepted, ignored.
-- **Limited anti-cycling**: Bland's rule engages after a degenerate-pivot
-  streak, but there is no Harris ratio test or perturbation.
+- **No Harris ratio test / EXPAND**: degenerate stalling is handled by
+  Bland's rule and bound perturbation instead.
 - **Format gaps**: free-format MPS only; no `OBJSENSE` section (sense
   comes from `-max`, as PuLP conveys it); the negative-`UP`-bound MPS
   convention is not implemented. PuLP never exercises any of these.
