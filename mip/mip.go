@@ -1,5 +1,5 @@
-// Package mip implements branch-and-bound over an internal/simplex LP,
-// using the integrality and SOS metadata from an internal/problem.Problem.
+// Package mip implements branch-and-bound over a simplex LP,
+// using the integrality and SOS metadata from a problem.Problem.
 package mip
 
 import (
