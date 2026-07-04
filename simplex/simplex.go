@@ -75,7 +75,42 @@ type State struct {
 	status  []varStat
 	basicOf []int // row -> basic variable index
 	value   []float64
-	binv    []float64 // flat m*m, row-major: binv[i*m+k]
+	f       *factor // basis factorization, shared between clones
+	etas    []*eta  // product-form updates since f was built
+}
+
+// ftranVec computes Binv*v in place (v by row in, by basis position out).
+func (st *State) ftranVec(v []float64) {
+	st.f.ftran(v)
+	applyEtas(st.etas, v)
+}
+
+// btranVec computes Binv^T*w in place (w by basis position in, by row out).
+func (st *State) btranVec(w []float64) {
+	applyEtasT(st.etas, w)
+	st.f.btran(w)
+}
+
+// refactorize rebuilds st's basis factorization and clears its eta file;
+// on (numerical) failure the existing factor+etas stay valid.
+func (lp *LP) refactorize(st *State) bool {
+	colRow := make([][]int32, lp.m)
+	colVal := make([][]float64, lp.m)
+	for pos, j := range st.basicOf {
+		rows, vals := lp.column(j)
+		cr := make([]int32, len(rows))
+		for k, r := range rows {
+			cr[k] = int32(r)
+		}
+		colRow[pos], colVal[pos] = cr, vals
+	}
+	f := factorize(lp.m, colRow, colVal)
+	if f == nil {
+		return false
+	}
+	st.f = f
+	st.etas = nil
+	return true
 }
 
 func Build(p *problem.Problem) *LP {
@@ -134,13 +169,12 @@ func (lp *LP) initState() *State {
 		status:  make([]varStat, nt),
 		basicOf: make([]int, m),
 		value:   make([]float64, nt),
-		binv:    make([]float64, m*m),
 	}
 	for i := 0; i < m; i++ {
-		st.binv[i*m+i] = -1
 		st.basicOf[i] = lp.n + i
 		st.status[lp.n+i] = basic
 	}
+	lp.refactorize(st)
 	for j := 0; j < lp.n; j++ {
 		lp.resetNonbasic(st, j)
 	}
@@ -171,7 +205,8 @@ func (st *State) Clone() *State {
 		status:  append([]varStat(nil), st.status...),
 		basicOf: append([]int(nil), st.basicOf...),
 		value:   append([]float64(nil), st.value...),
-		binv:    append([]float64(nil), st.binv...),
+		f:       st.f, // immutable, shared
+		etas:    append([]*eta(nil), st.etas...),
 	}
 }
 
@@ -200,6 +235,7 @@ func (lp *LP) dualRun(st *State) {
 	m, nt := lp.m, lp.nTotal()
 	a := make([]float64, m)
 	y := make([]float64, m)
+	rowBuf := make([]float64, m)
 	alphaRow := make([]float64, nt)
 
 	// reduced costs computed once, then updated incrementally per pivot
@@ -237,7 +273,10 @@ func (lp *LP) dualRun(st *State) {
 			needSign = -1
 		}
 		// pivot row r: alphaRow[j] = binv_r . col_j for all nonbasic j
-		rowR := st.binv[r*m : r*m+m]
+		clear(rowBuf)
+		rowBuf[r] = 1
+		st.btranVec(rowBuf)
+		rowR := rowBuf
 		q, qdir, bestRatio := -1, 0.0, math.Inf(1)
 		for j := 0; j < nt; j++ {
 			if st.status[j] == basic {
@@ -328,40 +367,30 @@ func (lp *LP) recomputeBasics(st *State) {
 		}
 	}
 	for i := 0; i < m; i++ {
-		var s float64
-		row := st.binv[i*m : i*m+m]
-		for k := 0; k < m; k++ {
-			s += row[k] * (-residual[k])
-		}
-		st.value[st.basicOf[i]] = s
+		residual[i] = -residual[i]
+	}
+	st.ftranVec(residual)
+	for pos := 0; pos < m; pos++ {
+		st.value[st.basicOf[pos]] = residual[pos]
 	}
 }
 
 // alpha fills dst (length lp.m, assumed zeroed) with column j's entries
 // against the current basis: Binv * column(j).
 func (lp *LP) alpha(st *State, j int, dst []float64) {
-	m := lp.m
 	rows, vals := lp.column(j)
 	for k, r := range rows {
-		c := vals[k]
-		if c == 0 {
-			continue
-		}
-		for i := 0; i < m; i++ {
-			dst[i] += st.binv[i*m+r] * c
-		}
+		dst[r] += vals[k]
 	}
+	st.ftranVec(dst)
 }
 
 // duals fills dst (length m, assumed zeroed) with y = cost_B^T * Binv.
 func duals(st *State, cost []float64, m int, dst []float64) {
-	for i := 0; i < m; i++ {
-		cb := cost[st.basicOf[i]]
-		if cb == 0 {
-			continue
-		}
-		axpy(dst, st.binv[i*m:i*m+m], cb)
+	for pos := 0; pos < m; pos++ {
+		dst[pos] = cost[st.basicOf[pos]]
 	}
+	st.btranVec(dst)
 }
 
 func (lp *LP) reducedCost(y []float64, cost []float64, j int) float64 {
@@ -649,20 +678,21 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 		st.value[leaving] = ub
 	}
 
-	m := lp.m
-	pivotVal := a[leaveRow]
-	rowR := st.binv[leaveRow*m : leaveRow*m+m]
-	for k := 0; k < m; k++ {
-		rowR[k] /= pivotVal
-	}
-	for i := 0; i < m; i++ {
-		if i == leaveRow || a[i] == 0 {
-			continue
+	// product-form update: alpha is exactly the eta for this basis change
+	var idx []int32
+	var val []float64
+	for i, v := range a {
+		if math.Abs(v) > etaDropTol {
+			idx = append(idx, int32(i))
+			val = append(val, v)
 		}
-		axpy(st.binv[i*m:i*m+m], rowR, -a[i])
 	}
+	st.etas = append(st.etas, &eta{r: leaveRow, idx: idx, val: val, ar: a[leaveRow]})
 	st.basicOf[leaveRow] = q
 	st.status[q] = basic
+	if len(st.etas) > maxEtas {
+		lp.refactorize(st)
+	}
 }
 
 // Solution extracts primal values, row activity, reduced costs and row

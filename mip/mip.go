@@ -7,6 +7,9 @@ import (
 	"math"
 	"time"
 
+	"fmt"
+	"os"
+
 	"cbcgo/problem"
 	"cbcgo/simplex"
 )
@@ -21,6 +24,13 @@ const (
 )
 
 const intTol = 1e-6
+
+// debugf prints heuristic diagnostics when SOLVER_DEBUG is set.
+func debugf(format string, args ...any) {
+	if os.Getenv("SOLVER_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "debug: "+format+"\n", args...)
+	}
+}
 
 type boundOverride struct {
 	idx    int
@@ -49,10 +59,10 @@ func (h *nodeHeap) Pop() any {
 }
 
 type Limits struct {
-	MaxSeconds float64 // <=0 means unlimited
-	MaxNodes   int     // <=0 means unlimited
-	GapRel     float64 // relative MIP gap, e.g. 0.0001; <=0 means 0 (prove optimal)
-	GapAbs     float64 // absolute MIP gap; <=0 means 0
+	MaxTime  time.Duration // <=0 means unlimited
+	MaxNodes int           // <=0 means unlimited
+	GapRel   float64       // relative MIP gap, e.g. 0.0001; <=0 means 0 (prove optimal)
+	GapAbs   float64       // absolute MIP gap; <=0 means 0
 }
 
 type Result struct {
@@ -69,6 +79,7 @@ type Model struct {
 	P         *problem.Problem
 	LP        *simplex.LP
 	Limits    Limits
+	MIPStart  []float64       // optional structural start point; ints get fixed
 	live      []boundOverride // bounds currently applied to LP; see solveNode
 	rcTouched []int           // columns tightened by reducedCostFix
 }
@@ -102,8 +113,8 @@ func SolveRelaxation(p *problem.Problem) Result {
 func (m *Model) Solve() Result {
 	m.live = nil
 	deadline := time.Time{}
-	if m.Limits.MaxSeconds > 0 {
-		deadline = time.Now().Add(time.Duration(m.Limits.MaxSeconds * float64(time.Second)))
+	if m.Limits.MaxTime > 0 {
+		deadline = time.Now().Add(m.Limits.MaxTime)
 		m.LP.Deadline = deadline // abort long LP solves at the deadline too
 	}
 
@@ -219,8 +230,16 @@ func (m *Model) Solve() Result {
 				near = childNodeMulti(nd, endState, loOv, obj)
 				far = childNodeMulti(nd, endState, hiOv, obj)
 			}
-			// no incumbent yet: try to manufacture one by diving (children
-			// above already captured their bounds, so the LP may move on)
+			// no incumbent yet: caller's MIP start first, then heuristics
+			// (children above already captured their bounds)
+			if !hasIncumbent && nodeCount == 1 && len(m.MIPStart) == len(m.P.Cols) {
+				if hObj, hx, hAct, hRC, hPrice, ok := m.completePoint(nd, m.MIPStart); ok {
+					debugf("mipstart: accepted obj=%g", hObj)
+					newIncumbent(hObj, hx, hAct, hRC, hPrice)
+				} else {
+					debugf("mipstart: rejected")
+				}
+			}
 			if !hasIncumbent && diveTries < 8 && branchCol >= 0 && (nodeCount == 1 || nodeCount%256 == 0) {
 				diveTries++
 				hObj, hx, hAct, hRC, hPrice, ok := m.feasibilityPump(nd, x, endState)
@@ -393,32 +412,20 @@ func (m *Model) feasibilityPump(nd *node, x []float64, endState *simplex.State) 
 			rounded = append(rounded, v)
 		}
 		if integral {
+			debugf("fp: integral at iter %d", iter)
 			// polish: real objective, all integers fixed at their values
 			m.LP.SwapCost(orig)
-			ovs := make([]boundOverride, len(nd.overrides), len(nd.overrides)+len(rounded))
-			copy(ovs, nd.overrides)
-			k := 0
-			for j, c := range m.P.Cols {
-				if !c.Integer {
-					continue
-				}
-				ovs = append(ovs, boundOverride{j, rounded[k], rounded[k]})
-				k++
-			}
-			child := &node{overrides: ovs, parentState: st, bound: nd.bound, depth: nd.depth + 1}
-			status, px, pAct, pRC, pPrice, pObj, _ := m.solveNode(child)
-			if status != simplex.Optimal {
-				return fail()
-			}
-			return pObj, px, pAct, pRC, pPrice, true
+			return m.completePoint(nd, curX)
 		}
 		if prev != nil && slicesEqual(prev, rounded) {
+			debugf("fp: cycle at iter %d", iter)
 			return fail() // cycling
 		}
 		prev = rounded
 
 		status, nst, _ := m.LP.WarmSolve(st, nil)
 		if status != simplex.Optimal {
+			debugf("fp: projection LP status=%d at iter %d", status, iter)
 			return fail()
 		}
 		st = nst
@@ -437,6 +444,27 @@ func slicesEqual(a, b []float64) bool {
 		}
 	}
 	return true
+}
+
+// completePoint fixes every integer column at its rounded value from point
+// (a structural vector) and LP-solves the continuous completion.
+func (m *Model) completePoint(nd *node, point []float64) (obj float64, x, rowAct, rc, price []float64, ok bool) {
+	ovs := make([]boundOverride, len(nd.overrides), len(nd.overrides)+len(m.P.Cols))
+	copy(ovs, nd.overrides)
+	for j, c := range m.P.Cols {
+		if !c.Integer {
+			continue
+		}
+		lb, ub := m.LP.Bound(j)
+		v := math.Max(lb, math.Min(ub, math.Round(point[j])))
+		ovs = append(ovs, boundOverride{j, v, v})
+	}
+	child := &node{overrides: ovs, bound: nd.bound, depth: nd.depth + 1}
+	status, cx, cAct, cRC, cPrice, cObj, _ := m.solveNode(child)
+	if status != simplex.Optimal {
+		return 0, nil, nil, nil, nil, false
+	}
+	return cObj, cx, cAct, cRC, cPrice, true
 }
 
 // diveForIncumbent fixes the least-fractional column at its nearest integer
@@ -476,6 +504,7 @@ func (m *Model) diveForIncumbent(nd *node, x []float64, endState *simplex.State)
 				break
 			}
 			if !hasAlt {
+				debugf("dive: dead end at depth %d col %d", len(cur.overrides)-len(nd.overrides), col)
 				return 0, nil, nil, nil, nil, false
 			}
 			v, hasAlt = alt, false
