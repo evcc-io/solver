@@ -69,6 +69,7 @@ type Model struct {
 	P      *problem.Problem
 	LP     *simplex.LP
 	Limits Limits
+	live   []boundOverride // bounds currently applied to LP; see solveNode
 }
 
 func New(p *problem.Problem) *Model {
@@ -98,6 +99,7 @@ func SolveRelaxation(p *problem.Problem) Result {
 }
 
 func (m *Model) Solve() Result {
+	m.live = nil
 	deadline := time.Time{}
 	if m.Limits.MaxSeconds > 0 {
 		deadline = time.Now().Add(time.Duration(m.Limits.MaxSeconds * float64(time.Second)))
@@ -207,6 +209,10 @@ func (m *Model) Solve() Result {
 			break
 		}
 	}
+	for _, ov := range m.live {
+		m.LP.SetBound(ov.idx, m.P.Cols[ov.idx].LB, m.P.Cols[ov.idx].UB)
+	}
+	m.live = nil
 
 	res := Result{HasIncumbent: hasIncumbent, NodeCount: nodeCount}
 	switch {
@@ -254,20 +260,26 @@ func childNodeMulti(parent *node, parentState *simplex.State, extra []boundOverr
 	return &node{overrides: ovs, parentState: parentState, bound: bound, depth: parent.depth + 1}
 }
 
-// solveNode applies nd's overrides, solves (warm from nd.parentState if
-// set, else cold), reverts the shared bounds, and returns the end state.
+// solveNode diffs m.live against nd.overrides (touching only changed
+// columns), solves, and leaves bounds live as nd.overrides for next time.
 func (m *Model) solveNode(nd *node) (status simplex.Status, x, rowAct, rc, price []float64, internalObj float64, endState *simplex.State) {
-	type saved struct{ lb, ub float64 }
-	touched := map[int]saved{}
-	var touchedIdx []int
-	for _, ov := range nd.overrides {
-		if _, seen := touched[ov.idx]; !seen {
-			lb, ub := m.LP.Bound(ov.idx)
-			touched[ov.idx] = saved{lb, ub}
-			touchedIdx = append(touchedIdx, ov.idx)
-		}
-		m.LP.SetBound(ov.idx, ov.lb, ov.ub)
+	common := 0
+	for common < len(m.live) && common < len(nd.overrides) && m.live[common] == nd.overrides[common] {
+		common++
 	}
+	var touchedIdx []int
+	for i := len(m.live) - 1; i >= common; i-- {
+		idx := m.live[i].idx
+		m.LP.SetBound(idx, m.P.Cols[idx].LB, m.P.Cols[idx].UB)
+		touchedIdx = append(touchedIdx, idx)
+	}
+	for i := common; i < len(nd.overrides); i++ {
+		ov := nd.overrides[i]
+		m.LP.SetBound(ov.idx, ov.lb, ov.ub)
+		touchedIdx = append(touchedIdx, ov.idx)
+	}
+	m.live = nd.overrides
+
 	if nd.parentState != nil {
 		status, endState, _ = m.LP.WarmSolve(nd.parentState.Clone(), touchedIdx)
 		// a degenerate warm start can stall at the iteration cap; a fresh
@@ -281,9 +293,6 @@ func (m *Model) solveNode(nd *node) (status simplex.Status, x, rowAct, rc, price
 	if status == simplex.Optimal {
 		x, rowAct, rc, price = m.LP.Solution(endState)
 		internalObj = m.LP.InternalObjective(endState)
-	}
-	for idx, s := range touched {
-		m.LP.SetBound(idx, s.lb, s.ub)
 	}
 	return status, x, rowAct, rc, price, internalObj, endState
 }
