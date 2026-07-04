@@ -225,7 +225,8 @@ func (m *Model) Solve() Result {
 	// GMI cut rounds tighten the root while its bound still moves; capped
 	// at a fifth of the budget so the tree always gets its time
 	origRows := len(m.P.Rows)
-	if len(m.P.SOSs) == 0 {
+	// restart passes inherit the first pass's cuts: go straight to the tree
+	if len(m.P.SOSs) == 0 && !m.SkipProbing {
 		cutDeadline := deadline
 		if m.Limits.MaxTime > 0 {
 			cutDeadline = time.Now().Add(m.Limits.MaxTime / 5)
@@ -234,6 +235,7 @@ func (m *Model) Solve() Result {
 		prevObj := math.Inf(1)
 		flat := 0       // bound improvement can pause a round and resume
 		lastBatch := -1 // first row index of the previous round's cuts
+		poisoned := 0
 		for round := range maxCutRound {
 			if !cutDeadline.IsZero() && time.Now().After(cutDeadline) {
 				break
@@ -245,9 +247,14 @@ func (m *Model) Solve() Result {
 				if lastBatch >= 0 {
 					truncateRows(m.P, lastBatch)
 					m.LP = simplex.Build(m.P)
-					m.LP.Deadline = deadline
+					m.LP.Deadline = cutDeadline
 					debugf("cuts: retracted poison batch, back to %d rows", lastBatch)
+					lastBatch = -1
+					if poisoned++; poisoned <= 2 {
+						continue // retry from the last good relaxation
+					}
 				}
+				m.LP.Deadline = deadline
 				break
 			}
 			obj := m.LP.InternalObjective(st)
@@ -265,8 +272,15 @@ func (m *Model) Solve() Result {
 				break // root already integral
 			}
 			lastBatch = len(m.P.Rows)
-			added := m.gomoryCuts(st)
-			debugf("cuts: round %d added %d rows (bound %g)", round, added, obj)
+			gmi := m.gomoryCuts(st)
+			// probing cuts pay off on big fixed-charge instances; on small
+			// ones they poison node re-solves that branching closes anyway
+			prb := 0
+			if m.LP.NumRows() > 1500 {
+				prb = m.probingCuts(x, cutDeadline)
+			}
+			added := gmi + prb
+			debugf("cuts: round %d added %d rows (gmi %d, probing %d, bound %g)", round, added, gmi, prb, obj)
 			if added == 0 {
 				break
 			}
@@ -276,6 +290,20 @@ func (m *Model) Solve() Result {
 			m.LP.Deadline = cutDeadline
 		}
 		m.LP.Deadline = deadline
+	}
+
+	// keep only cuts tight at the root: slack rows bloat every node re-solve
+	if len(m.P.Rows) > origRows {
+		if status, st, _ := m.LP.ColdSolve(); status == simplex.Optimal {
+			_, rowAct, _, _ := m.LP.Solution(st)
+			if dropped := dropSlackCuts(m.P, origRows, rowAct); dropped > 0 {
+				stats := m.LP.Stats
+				m.LP = simplex.Build(m.P)
+				m.LP.Stats = stats
+				m.LP.Deadline = deadline
+				debugf("cuts: dropped %d slack rows, kept %d", dropped, len(m.P.Rows)-origRows)
+			}
+		}
 	}
 
 	pq := &nodeHeap{{bound: math.Inf(-1), brCol: -1}}
