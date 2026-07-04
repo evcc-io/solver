@@ -262,14 +262,16 @@ func childNode(parent *node, parentState *simplex.State, ov boundOverride, bound
 	ovs := make([]boundOverride, len(parent.overrides), len(parent.overrides)+1)
 	copy(ovs, parent.overrides)
 	ovs = append(ovs, ov)
-	return &node{overrides: ovs, parentState: parentState, bound: bound, depth: parent.depth + 1}
+	// bounds only tighten down a branch; max() stops numerical drift from
+	// chained warm starts leaking below the true LP bound over deep dives
+	return &node{overrides: ovs, parentState: parentState, bound: math.Max(parent.bound, bound), depth: parent.depth + 1}
 }
 
 func childNodeMulti(parent *node, parentState *simplex.State, extra []boundOverride, bound float64) *node {
 	ovs := make([]boundOverride, len(parent.overrides), len(parent.overrides)+len(extra))
 	copy(ovs, parent.overrides)
 	ovs = append(ovs, extra...)
-	return &node{overrides: ovs, parentState: parentState, bound: bound, depth: parent.depth + 1}
+	return &node{overrides: ovs, parentState: parentState, bound: math.Max(parent.bound, bound), depth: parent.depth + 1}
 }
 
 // solveNode diffs m.live against nd.overrides (touching only changed
