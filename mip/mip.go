@@ -92,6 +92,9 @@ type Model struct {
 	rcTouched     []int           // columns tightened by reducedCostFix
 	bestXSnapshot []float64       // incumbent X for the RINS neighborhood
 
+	// scratch for node-level bound propagation (propagatedChild)
+	propLB, propUB, propL0, propU0 []float64
+
 	// per-column pseudocosts: observed bound gain per unit fraction
 	psUp, psDn   []float64
 	psUpN, psDnN []int
@@ -203,6 +206,10 @@ func (m *Model) Solve() Result {
 			rx, _, rrc, _ := m.LP.Solution(st)
 			robj := m.LP.InternalObjective(st)
 			if obj, x, act, rc, price, ok := m.completePoint(&node{brCol: -1}, m.MIPStart); ok {
+				if pObj, px, pAct, pRC, pPrice, better := m.polishIncumbent(&node{brCol: -1}, obj, x, deadline); better {
+					debugf("polish: mipstart %g -> %g", obj, pObj)
+					obj, x, act, rc, price = pObj, px, pAct, pRC, pPrice
+				}
 				startObj, startX, startAct, startRC, startPrice = obj, x, act, rc, price
 				haveStart = true
 				debugf("mipstart: pre-cut incumbent obj=%g", obj)
@@ -387,15 +394,22 @@ func (m *Model) Solve() Result {
 				lb, ub := m.nodeBound(nd, branchCol)
 				floorV := math.Floor(x[branchCol] + 1e-7)
 				ceilV := math.Ceil(x[branchCol] - 1e-7)
-				floorChild := childNode(nd, endState, boundOverride{branchCol, lb, floorV}, obj)
-				ceilChild := childNode(nd, endState, boundOverride{branchCol, ceilV, ub}, obj)
+				floorChild := m.propagatedChild(nd, endState, boundOverride{branchCol, lb, floorV}, obj)
+				ceilChild := m.propagatedChild(nd, endState, boundOverride{branchCol, ceilV, ub}, obj)
 				frac := x[branchCol] - floorV
-				floorChild.brCol, floorChild.brUp, floorChild.brFrac = branchCol, false, frac
-				ceilChild.brCol, ceilChild.brUp, ceilChild.brFrac = branchCol, true, frac
+				if floorChild != nil {
+					floorChild.brCol, floorChild.brUp, floorChild.brFrac = branchCol, false, frac
+				}
+				if ceilChild != nil {
+					ceilChild.brCol, ceilChild.brUp, ceilChild.brFrac = branchCol, true, frac
+				}
 				if x[branchCol]-floorV >= 0.5 {
 					near, far = ceilChild, floorChild
 				} else {
 					near, far = floorChild, ceilChild
+				}
+				if near == nil {
+					near, far = far, nil
 				}
 			} else {
 				members := m.P.SOSs[sosIdx].Idx
@@ -421,13 +435,25 @@ func (m *Model) Solve() Result {
 					debugf("mipstart: rejected")
 				}
 			}
-			if !hasIncumbent && diveTries < 8 && branchCol >= 0 && (nodeCount == 1 || nodeCount%256 == 0) {
+			if diveTries < 8 && branchCol >= 0 && (nodeCount == 1 || nodeCount%256 == 0) {
 				diveTries++
-				hObj, hx, hAct, hRC, hPrice, ok := m.feasibilityPump(nd, x, endState)
-				if !ok {
-					hObj, hx, hAct, hRC, hPrice, ok = m.diveForIncumbent(nd, x, endState)
+				// box the heuristic burst: dives must never eat the tree's time
+				savedDL := m.LP.Deadline
+				if m.Limits.MaxTime > 0 {
+					if hb := time.Now().Add(m.Limits.MaxTime / 8); savedDL.IsZero() || hb.Before(savedDL) {
+						m.LP.Deadline = hb
+					}
 				}
-				if ok {
+				hObj, hx, hAct, hRC, hPrice, ok := m.rensImprove(nd, x)
+				if !ok {
+					hObj, hx, hAct, hRC, hPrice, ok = m.feasibilityPump(nd, x, endState)
+					if !ok {
+						hObj, hx, hAct, hRC, hPrice, ok = m.diveForIncumbent(nd, x, endState)
+					}
+				}
+				m.LP.Deadline = savedDL
+				if ok && (!hasIncumbent || m.improves(hObj, bestInternal)) {
+					debugf("dive: incumbent %g -> %g", bestInternal, hObj)
 					newIncumbent(hObj, hx, hAct, hRC, hPrice)
 				}
 			}
@@ -436,6 +462,10 @@ func (m *Model) Solve() Result {
 			if hasIncumbent && nodeCount%64 == 0 {
 				if hObj, hx, hAct, hRC, hPrice, ok := m.rinsImprove(nd, x); ok && m.improves(hObj, bestInternal) {
 					debugf("rins: improved %g -> %g", bestInternal, hObj)
+					if pObj, px, pAct, pRC, pPrice, better := m.polishIncumbent(nd, hObj, hx, deadline); better {
+						debugf("polish: rins %g -> %g", hObj, pObj)
+						hObj, hx, hAct, hRC, hPrice = pObj, px, pAct, pRC, pPrice
+					}
 					newIncumbent(hObj, hx, hAct, hRC, hPrice)
 				}
 			}
@@ -459,6 +489,8 @@ func (m *Model) Solve() Result {
 		remaining = math.Min(remaining, (*pq)[0].bound)
 	}
 	proven := hasIncumbent && !m.improves(remaining, bestInternal)
+	debugf("mip exit: nodes=%d best=%g remaining=%g proven=%v stopped=%v proofLost=%v heap=%d",
+		nodeCount, bestInternal, remaining, proven, stopped, proofLost, pq.Len())
 
 	res := Result{HasIncumbent: hasIncumbent, NodeCount: nodeCount}
 	switch {
@@ -510,6 +542,41 @@ func childNode(parent *node, parentState *simplex.State, ov boundOverride, bound
 	// bounds only tighten down a branch; max() stops numerical drift from
 	// chained warm starts leaking below the true LP bound over deep dives
 	return &node{overrides: ovs, parentState: parentState, bound: math.Max(parent.bound, bound), depth: parent.depth + 1, brCol: -1}
+}
+
+// propagatedChild builds a branch child, propagating the branch bound through
+// the rows: nil = pruned infeasible; implied integer fixings become overrides
+func (m *Model) propagatedChild(nd *node, st *simplex.State, ov boundOverride, bound float64) *node {
+	n := len(m.P.Cols)
+	if cap(m.propLB) < n {
+		m.propLB, m.propUB = make([]float64, n), make([]float64, n)
+		m.propL0, m.propU0 = make([]float64, n), make([]float64, n)
+	}
+	lb, ub := m.propLB[:n], m.propUB[:n]
+	for j := range n {
+		lb[j], ub[j] = m.P.Cols[j].LB, m.P.Cols[j].UB
+	}
+	for _, o := range nd.overrides {
+		lb[o.idx], ub[o.idx] = o.lb, o.ub
+	}
+	lb[ov.idx], ub[ov.idx] = ov.lb, ov.ub
+	l0, u0 := m.propL0[:n], m.propU0[:n]
+	copy(l0, lb)
+	copy(u0, ub)
+	if !propagate(m.P, lb, ub) {
+		return nil
+	}
+	extra := make([]boundOverride, 0, 8)
+	extra = append(extra, ov)
+	for j := range n {
+		if !m.P.Cols[j].Integer || j == ov.idx {
+			continue
+		}
+		if lb[j] > l0[j]+1e-9 || ub[j] < u0[j]-1e-9 {
+			extra = append(extra, boundOverride{j, lb[j], ub[j]})
+		}
+	}
+	return childNodeMulti(nd, st, extra, bound)
 }
 
 func childNodeMulti(parent *node, parentState *simplex.State, extra []boundOverride, bound float64) *node {
@@ -674,6 +741,98 @@ func (m *Model) rinsImprove(nd *node, x []float64) (obj float64, dx, rowAct, rc,
 	return m.diveForIncumbent(child, cx, cState)
 }
 
+// rensImprove (CBC RENS) fixes integers already integral in the node LP and
+// dives the rest — incumbent-independent, so it can escape a poisoned start
+func (m *Model) rensImprove(nd *node, x []float64) (obj float64, dx, rowAct, rc, price []float64, ok bool) {
+	ovs := make([]boundOverride, len(nd.overrides), len(nd.overrides)+len(m.P.Cols))
+	copy(ovs, nd.overrides)
+	for j, c := range m.P.Cols {
+		if !c.Integer {
+			continue
+		}
+		v := math.Round(x[j])
+		if math.Abs(x[j]-v) > intTol {
+			continue // fractional: leave free for the dive
+		}
+		lb, ub := m.LP.Bound(j)
+		v = math.Max(lb, math.Min(ub, v))
+		ovs = append(ovs, boundOverride{j, v, v})
+	}
+	child := &node{overrides: ovs, bound: nd.bound, depth: nd.depth + 1}
+	status, cx, _, _, _, _, cState := m.solveNode(child)
+	if status != simplex.Optimal {
+		return 0, nil, nil, nil, nil, false
+	}
+	// single-shot rounding first: one warm LP when the vertex is near-integral
+	round := append([]boundOverride(nil), child.overrides...)
+	for j, c := range m.P.Cols {
+		if v := math.Round(cx[j]); c.Integer && math.Abs(cx[j]-v) > intTol {
+			lb, ub := m.nodeBound(child, j)
+			round = append(round, boundOverride{j, math.Max(lb, math.Min(ub, v)), math.Max(lb, math.Min(ub, v))})
+		}
+	}
+	rchild := &node{overrides: round, parentState: cState, bound: child.bound, depth: child.depth + 1}
+	if rStatus, rx, rAct, rRC, rPrice, rObj, _ := m.solveNode(rchild); rStatus == simplex.Optimal {
+		return rObj, rx, rAct, rRC, rPrice, true
+	}
+	return m.diveForIncumbent(child, cx, cState)
+}
+
+// polishIncumbent 1-opt flips each binary and LP-completes the rest
+// (CBC CbcHeuristicLocal style), keeping strict improvements; time-boxed
+func (m *Model) polishIncumbent(nd *node, obj float64, x []float64, deadline time.Time) (float64, []float64, []float64, []float64, []float64, bool) {
+	box := time.Now().Add(m.Limits.MaxTime / 8)
+	if m.Limits.MaxTime <= 0 || (!deadline.IsZero() && deadline.Before(box)) {
+		box = deadline
+	}
+	// base child: every integer fixed at the incumbent's (rounded) value
+	base := append(make([]boundOverride, 0, len(nd.overrides)+len(m.P.Cols)), nd.overrides...)
+	pos := make([]int, len(m.P.Cols))
+	flippable := make([]bool, len(m.P.Cols))
+	for j, c := range m.P.Cols {
+		if !c.Integer {
+			continue
+		}
+		lb, ub := m.nodeBound(nd, j)
+		v := math.Max(lb, math.Min(ub, math.Round(x[j])))
+		pos[j] = len(base)
+		flippable[j] = c.UB-c.LB == 1 && ub-lb == 1
+		base = append(base, boundOverride{j, v, v})
+	}
+	status, cx, act, rc, price, curObj, st := m.solveNode(&node{overrides: base, parentState: nd.parentState, bound: nd.bound, depth: nd.depth + 1})
+	if status != simplex.Optimal {
+		return obj, x, nil, nil, nil, false
+	}
+	cur := append([]float64(nil), cx...)
+	improved := false
+	saved := m.LP.Deadline
+	defer func() { m.LP.Deadline = saved }()
+	for j, c := range m.P.Cols {
+		if !flippable[j] {
+			continue
+		}
+		if !box.IsZero() && time.Now().After(box) {
+			break
+		}
+		flip := c.LB + c.UB - base[pos[j]].lb
+		cand := append([]boundOverride(nil), base...)
+		cand[pos[j]] = boundOverride{j, flip, flip}
+		probe := time.Now().Add(50 * time.Millisecond)
+		if saved.IsZero() || probe.Before(saved) {
+			m.LP.Deadline = probe
+		}
+		fStatus, fx, fAct, fRC, fPrice, fObj, fEnd := m.solveNode(&node{overrides: cand, parentState: st, bound: nd.bound, depth: nd.depth + 1})
+		m.LP.Deadline = saved
+		if fStatus == simplex.Optimal && m.improves(fObj, curObj) {
+			curObj, act, rc, price = fObj, fAct, fRC, fPrice
+			copy(cur, fx)
+			base, st = cand, fEnd
+			improved = true
+		}
+	}
+	return curObj, cur, act, rc, price, improved
+}
+
 // completePoint fixes every integer column at its rounded value from point
 // (a structural vector) and LP-solves the continuous completion.
 func (m *Model) completePoint(nd *node, point []float64) (obj float64, x, rowAct, rc, price []float64, ok bool) {
@@ -699,6 +858,12 @@ func (m *Model) completePoint(nd *node, point []float64) (obj float64, x, rowAct
 // and re-solves warm until integral (CBC diving); gives up when infeasible.
 func (m *Model) diveForIncumbent(nd *node, x []float64, endState *simplex.State) (obj float64, dx, rowAct, rc, price []float64, ok bool) {
 	cur, curX, curState := nd, x, endState
+	fixed := make([]bool, len(m.P.Cols))
+	for _, ov := range cur.overrides {
+		if ov.lb == ov.ub {
+			fixed[ov.idx] = true
+		}
+	}
 	for {
 		if !m.LP.Deadline.IsZero() && time.Now().After(m.LP.Deadline) {
 			return 0, nil, nil, nil, nil, false
@@ -711,7 +876,20 @@ func (m *Model) diveForIncumbent(nd *node, x []float64, endState *simplex.State)
 			dx, rowAct, rc, price = m.LP.Solution(curState)
 			return m.LP.InternalObjective(curState), dx, rowAct, rc, price, true
 		}
-		lb, ub := m.LP.Bound(col)
+		// batch-fix every near-integral int (CBC dives fix many per re-solve)
+		var batch []boundOverride
+		for j, c := range m.P.Cols {
+			if !c.Integer || fixed[j] || j == col {
+				continue
+			}
+			v := math.Round(curX[j])
+			if math.Abs(curX[j]-v) > 0.01 {
+				continue
+			}
+			lb, ub := m.nodeBound(cur, j)
+			batch = append(batch, boundOverride{j, math.Max(lb, math.Min(ub, v)), math.Max(lb, math.Min(ub, v))})
+		}
+		lb, ub := m.nodeBound(cur, col)
 		v := math.Max(lb, math.Min(ub, math.Round(curX[col])))
 		// nearest rounding first; if that goes infeasible, the other side
 		alt, hasAlt := 2*math.Floor(curX[col])+1-v, true
@@ -722,20 +900,24 @@ func (m *Model) diveForIncumbent(nd *node, x []float64, endState *simplex.State)
 		var cx []float64
 		var cState *simplex.State
 		for {
-			ovs := make([]boundOverride, len(cur.overrides)+1)
-			copy(ovs, cur.overrides)
-			ovs[len(ovs)-1] = boundOverride{col, v, v}
-			child = &node{overrides: ovs, parentState: curState, bound: cur.bound, depth: cur.depth + 1}
-			status, x, _, _, _, _, cs := m.solveNode(child)
+			child = childNodeMulti(cur, curState, append(batch, boundOverride{col, v, v}), cur.bound)
+			status, x2, _, _, _, _, cs := m.solveNode(child)
 			if status == simplex.Optimal {
-				cx, cState = x, cs
+				cx, cState = x2, cs
 				break
 			}
+			if len(batch) > 0 {
+				batch = nil // batch too greedy: retry this level single-col
+				continue
+			}
 			if !hasAlt {
-				debugf("dive: dead end at depth %d col %d", len(cur.overrides)-len(nd.overrides), col)
+				debugf("dive: dead end at depth %d col %d status=%d", child.depth-nd.depth, col, status)
 				return 0, nil, nil, nil, nil, false
 			}
 			v, hasAlt = alt, false
+		}
+		for _, ov := range child.overrides[len(cur.overrides):] {
+			fixed[ov.idx] = true
 		}
 		cur, curX, curState = child, cx, cState
 	}

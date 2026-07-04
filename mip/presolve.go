@@ -179,7 +179,7 @@ func setCoef(p *problem.Problem, ri, k int, v float64) {
 // iterating to a fixpoint; reports false when some row proves infeasible.
 func propagate(p *problem.Problem, lb, ub []float64) bool {
 	inf := problem.Inf
-	for pass := 0; pass < 4; pass++ {
+	for range 4 {
 		changed := false
 		for ri := range p.Rows {
 			r := &p.Rows[ri]
