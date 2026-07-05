@@ -411,7 +411,15 @@ func (m *Model) Solve() Result {
 					if hasIncumbent {
 						sbCut = bestInternal
 					}
-					if sb := m.strongBranch(nd, x, endState, obj, sbCut); sb >= 0 {
+					sb, fixed := m.strongBranch(nd, x, endState, obj, sbCut)
+					if len(fixed) > 0 {
+						// probes fathomed sides: fix here and re-solve the
+						// node with the survivors forced (no branch spent)
+						debugf("sbfix: %d vars fixed at depth %d", len(fixed), nd.depth)
+						nd = childNodeMulti(nd, endState, fixed, obj)
+						continue
+					}
+					if sb >= 0 {
 						branchCol = sb
 					}
 				} else if ps := m.psSelect(x); ps >= 0 {
@@ -1082,7 +1090,11 @@ func (m *Model) nodeBound(nd *node, j int) (float64, float64) {
 
 // strongBranch (CBC-style) probes both children of the top candidates and
 // returns the column whose worse child moves the bound most; -1 if none do.
-func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj, cutoff float64) int {
+// strongBranch probes both sides of the most fractional candidates. A side
+// fathomed by the cutoff (or infeasible) fixes the variable the other way at
+// this node (CBC strong-branch fixing); fixings are returned for the caller
+// to apply without consuming a branch. Otherwise the best column is returned.
+func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj, cutoff float64) (int, []boundOverride) {
 	type cand struct {
 		j    int
 		dist float64
@@ -1098,11 +1110,11 @@ func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj
 		}
 	}
 	if len(cands) < 2 {
-		return -1
+		return -1, nil
 	}
 	sort.Slice(cands, func(a, b int) bool { return cands[a].dist > cands[b].dist })
-	if len(cands) > 8 {
-		cands = cands[:8]
+	if len(cands) > 6 {
+		cands = cands[:6]
 	}
 
 	// short per-probe deadline: strong branching must never eat the budget
@@ -1110,16 +1122,19 @@ func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj
 	defer func() { m.LP.Deadline = saved }()
 
 	bestCol, bestScore := -1, math.Inf(-1)
+	var fixed []boundOverride
 	for _, cd := range cands {
 		lb, ub := m.nodeBound(nd, cd.j)
 		floorV := math.Floor(x[cd.j])
 		score := math.Inf(1)
-		for _, b := range [2][2]float64{{lb, floorV}, {floorV + 1, ub}} {
+		dead := [2]bool{}
+		sides := [2][2]float64{{lb, floorV}, {floorV + 1, ub}}
+		for s, b := range sides {
 			ovs := make([]boundOverride, len(nd.overrides)+1)
 			copy(ovs, nd.overrides)
 			ovs[len(ovs)-1] = boundOverride{cd.j, b[0], b[1]}
 			child := &node{overrides: ovs, parentState: endState, bound: nd.bound, depth: nd.depth + 1}
-			probeDeadline := time.Now().Add(20 * time.Millisecond)
+			probeDeadline := time.Now().Add(80 * time.Millisecond)
 			if saved.IsZero() || probeDeadline.Before(saved) {
 				m.LP.Deadline = probeDeadline
 			}
@@ -1129,23 +1144,36 @@ func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj
 			case simplex.Optimal:
 				m.psRecord(cd.j, b[0] == floorV+1, x[cd.j]-floorV, cObj-obj)
 				if !m.improves(cObj, cutoff) {
-					break // side is fathomed by the cutoff: as good as pruned
+					dead[s] = true // fathomed by the cutoff: as good as pruned
+					break
 				}
 				score = math.Min(score, cObj-obj) // bound gain of this side
 			case simplex.Infeasible:
-				// side prunes outright: keep score as-is (excellent)
+				dead[s] = true // side prunes outright
 			default:
 				score = math.Min(score, 0) // probe unresolved: no credit
 			}
+		}
+		if dead[0] != dead[1] {
+			// one side dies: the variable is fixed to the survivor here
+			surv := sides[0]
+			if dead[0] {
+				surv = sides[1]
+			}
+			fixed = append(fixed, boundOverride{cd.j, surv[0], surv[1]})
+			continue
 		}
 		if score > bestScore {
 			bestScore, bestCol = score, cd.j
 		}
 	}
-	if bestScore <= 1e-12 {
-		return -1 // nothing moves the bound; fall back to least-fractional
+	if len(fixed) > 0 {
+		return -1, fixed
 	}
-	return bestCol
+	if bestScore <= 1e-12 {
+		return -1, nil // nothing moves the bound; fall back to least-fractional
+	}
+	return bestCol, nil
 }
 
 // findBranch picks the least-fractional integer column (cheap dives: rounding
