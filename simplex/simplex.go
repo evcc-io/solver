@@ -64,6 +64,10 @@ type LP struct {
 	// immutable int32 mirror of every column (incl. logicals), shared by
 	// all factorizations instead of being converted per refactorize
 	colRow32 [][]int32
+	// row-wise mirror of A incl. logical columns: the dual pivot row only
+	// touches columns intersecting the BTRAN row's support
+	rowCol [][]int32
+	rowVal [][]float64
 	colVal32 [][]float64
 
 	lb, ub  []float64 // length n+m
@@ -172,6 +176,28 @@ func Build(p *problem.Problem) *LP {
 		}
 		lp.colRow32[j], lp.colVal32[j] = cr, vals
 	}
+	lp.rowCol = make([][]int32, m)
+	lp.rowVal = make([][]float64, m)
+	cnt := make([]int, m)
+	for j := range n {
+		for _, r := range lp.colRow[j] {
+			cnt[r]++
+		}
+	}
+	for r := range m {
+		lp.rowCol[r] = make([]int32, 0, cnt[r]+1)
+		lp.rowVal[r] = make([]float64, 0, cnt[r]+1)
+	}
+	for j := range n {
+		for k, r := range lp.colRow[j] {
+			lp.rowCol[r] = append(lp.rowCol[r], int32(j))
+			lp.rowVal[r] = append(lp.rowVal[r], lp.colVal[j][k])
+		}
+	}
+	for r := range m {
+		lp.rowCol[r] = append(lp.rowCol[r], int32(n+r))
+		lp.rowVal[r] = append(lp.rowVal[r], -1)
+	}
 	// partial pricing disabled: extra pivots from window-local entering
 	// choices dominate scan savings when each pivot is O(m^2) on dense binv
 	return lp
@@ -258,7 +284,7 @@ func (lp *LP) WarmSolve(st *State, touched []int) (Status, *State, float64) {
 
 // dualPivotCap bounds dual pivots per re-solve; a degenerate dual bails to
 // the primal run instead of grinding forever.
-const dualPivotCap = 512
+const dualPivotCap = 1024
 
 // blandAfter switches entering selection to Bland's rule once this many
 // consecutive degenerate (zero-step) pivots occur.
@@ -284,6 +310,8 @@ func (lp *LP) dualRun(st *State) {
 	}
 
 	var skip map[int]bool // rows whose violation the dual cannot fix
+	touched := make([]int, 0, 256)
+	seen := make([]bool, nt)
 	for iter := range dualPivotCap + 1 {
 		if !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
 			return
@@ -320,18 +348,32 @@ func (lp *LP) dualRun(st *State) {
 		rowBuf[r] = 1
 		st.btranVec(rowBuf)
 		rowR := rowBuf
-		var cands []dualCand
-		for j := range nt {
-			if st.status[j] == basic {
-				alphaRow[j] = 0
+		for _, j := range touched {
+			alphaRow[j] = 0
+		}
+		touched = touched[:0]
+		for r := range m {
+			v := rowR[r]
+			if math.Abs(v) < 1e-12 {
 				continue
 			}
-			rows, vals := lp.column(j)
-			var alphaJ float64
-			for k, row := range rows {
-				alphaJ += rowR[row] * vals[k]
+			cols, vals := lp.rowCol[r], lp.rowVal[r]
+			for k, j32 := range cols {
+				j := int(j32)
+				if !seen[j] {
+					seen[j] = true
+					touched = append(touched, j)
+				}
+				alphaRow[j] += v * vals[k]
 			}
-			alphaRow[j] = alphaJ
+		}
+		var cands []dualCand
+		for _, j := range touched {
+			seen[j] = false
+			if st.status[j] == basic {
+				continue
+			}
+			alphaJ := alphaRow[j]
 			if math.Abs(alphaJ) < 1e-7 {
 				continue
 			}
@@ -415,7 +457,7 @@ func (lp *LP) dualRun(st *State) {
 		lp.pivot(st, q, qdir, a, t, r, false)
 		// incremental reduced-cost update from the pivot row
 		step := d[q] / alphaRow[q]
-		for j := range nt {
+		for _, j := range touched {
 			if st.status[j] == basic {
 				d[j] = 0
 			} else if alphaRow[j] != 0 {
