@@ -51,7 +51,14 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   simplex for warm re-solves after bound changes — sparse pivot row via
   a row-wise mirror of A, incrementally maintained duals with lazily
   materialized reduced costs, long-step bound flips; wall-clock
-  deadline checked inside the pivot loop.
+  deadline checked inside the pivot loop. Warm starts keep each touched
+  nonbasic on its current bound side (Clp semantics) instead of
+  re-snapping to the lower bound. A second, fuller dual engine
+  (`simplex/dual2.go`: dual steepest edge, Harris two-pass ratio test,
+  status-favoring cost perturbation, run to optimality) is
+  property-tested but gated off behind `CBC_DUAL2=1`: measured on the
+  target instances it trades the tuned root trajectory for no bound
+  gain.
 - **Basis factorization**: singleton triangularization with a sparse-LU
   kernel and product-form (eta) updates — O(nnz) pivots, periodic
   refactorization. No dense inverse.
