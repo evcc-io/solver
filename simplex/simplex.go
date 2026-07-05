@@ -85,11 +85,15 @@ type LP struct {
 	pricingCursor int // scan position for partial pricing
 
 	fws *factorWS // reusable factorization workspace
+	dws *dualWS   // reusable dualRun workspace
 
 	// Stats accumulates pivot counts across solves (diagnostics only).
 	Stats struct {
 		Solves, Phase1, Phase2, Dual               int64
 		DualStallQ, DualStallA, DualCap, DualFlips int64
+		Dual2Runs, Dual2, Dual2Flips               int64
+		Dual2Inf, Dual2Cap, Dual2Opt               int64
+		Dual2P0, Dual2Guard, Dual2TNeg             int64
 		KernelMax, Bland                           int64
 	}
 }
@@ -267,18 +271,38 @@ func (st *State) Clone() *State {
 	}
 }
 
-// WarmSolve resolves from st after bound changes on touched, instead of
-// resetting to the trivial all-slack basis.
+// WarmSolve resolves from st after bound changes on touched. A touched
+// nonbasic keeps its side when still valid (snap-to-lower mangles the basis).
 func (lp *LP) WarmSolve(st *State, touched []int) (Status, *State, float64) {
+	return lp.warmSolve(st, touched, true)
+}
+
+func (lp *LP) warmSolve(st *State, touched []int, preserve bool) (Status, *State, float64) {
 	for _, j := range touched {
-		if st.status[j] != basic {
+		switch {
+		case st.status[j] == basic:
+		case !preserve:
+			lp.resetNonbasic(st, j)
+		case st.status[j] == atLower && lp.lb[j] > -inf:
+			st.value[j] = lp.lb[j]
+		case st.status[j] == atUpper && lp.ub[j] < inf:
+			st.value[j] = lp.ub[j]
+		case st.status[j] == free &&
+			st.value[j] >= lp.lb[j] && st.value[j] <= lp.ub[j]:
+		default:
 			lp.resetNonbasic(st, j)
 		}
 	}
 	lp.recomputeBasics(st)
 	// after a bound change the basis stays (near) dual feasible: a few dual
 	// pivots restore primal feasibility far cheaper than a primal Phase 1
-	lp.dualRun(st)
+	if dual2Enabled {
+		if lp.dual2Run(st) == dual2Infeasible {
+			return Infeasible, st, 0
+		}
+	} else if !noDualRepair {
+		lp.dualRun(st)
+	}
 	return lp.solveFrom(st)
 }
 
@@ -294,22 +318,27 @@ const blandAfter = 384
 // Clp's dual): it bails on any stall and leaves the rest to the primal run.
 func (lp *LP) dualRun(st *State) {
 	m, nt := lp.m, lp.nTotal()
-	a := make([]float64, m)
-	y := make([]float64, m)
-	rowBuf := make([]float64, m)
-	alphaRow := make([]float64, nt)
+	if lp.dws == nil {
+		lp.dws = &dualWS{
+			a: make([]float64, m), y: make([]float64, m),
+			rowBuf: make([]float64, m), alphaRow: make([]float64, nt),
+			d: make([]float64, nt), dSeen: make([]bool, nt),
+			seen: make([]bool, nt), touched: make([]int, 0, 256),
+		}
+	}
+	ws := lp.dws
+	a, y, rowBuf, alphaRow, d := ws.a, ws.y, ws.rowBuf, ws.alphaRow, ws.d
+	dSeen, seen, touched := ws.dSeen, ws.seen, ws.touched[:0]
+	clear(alphaRow)
+	clear(dSeen)
+	clear(seen)
 
 	// duals maintained incrementally per pivot (y += step*rowR); reduced
-	// costs materialize lazily on first touch, then update incrementally —
-	// no per-call full d[] initialization
+	// costs materialize lazily on first touch, then update incrementally
 	clear(y)
 	duals(st, lp.cost, m, y)
-	d := make([]float64, nt)
-	dSeen := make([]bool, nt)
 
 	var skip []bool // rows whose violation the dual cannot fix
-	touched := make([]int, 0, 256)
-	seen := make([]bool, nt)
 	for iter := range dualPivotCap + 1 {
 		if !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
 			return
@@ -365,7 +394,7 @@ func (lp *LP) dualRun(st *State) {
 				alphaRow[j] += v * vals[k]
 			}
 		}
-		var cands []dualCand
+		cands := ws.cands[:0]
 		for _, j := range touched {
 			seen[j] = false
 			if st.status[j] == basic {
@@ -386,6 +415,7 @@ func (lp *LP) dualRun(st *State) {
 				cands = append(cands, dualCand{j, dir, math.Abs(d[j]) / math.Abs(alphaJ)})
 			}
 		}
+		ws.cands = cands
 		sort.Slice(cands, func(a, b int) bool { return cands[a].ratio < cands[b].ratio })
 
 		// dual long step (Clp "dual with flips"): boxed candidates that
@@ -471,6 +501,14 @@ func (lp *LP) dualRun(st *State) {
 		d[leaving], dSeen[leaving] = -step, true
 		d[q], dSeen[q] = 0, true
 	}
+}
+
+// dualWS holds dualRun's per-call vectors, reused across warm solves.
+type dualWS struct {
+	a, y, rowBuf, alphaRow, d []float64
+	dSeen, seen               []bool
+	touched                   []int
+	cands                     []dualCand
 }
 
 // dualCand is one eligible entering candidate in the dual ratio test.
@@ -586,7 +624,9 @@ func (lp *LP) ColdSolve() (Status, *State, float64) {
 		st = lp.initState()
 		return lp.solveFrom(st)
 	}
-	return lp.WarmSolve(st, touched)
+	// historical snap-to-bound cleanup: the vertex it selects anchors the
+	// root trajectory that downstream heuristics (face walk) depend on
+	return lp.warmSolve(st, touched, false)
 }
 
 const perturbEps = 1e-7
