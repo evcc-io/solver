@@ -322,6 +322,7 @@ func (m *Model) Solve() Result {
 	var rootObj float64 // root LP data for reduced-cost fixing
 	var rootX, rootRC []float64
 	diveTries := 0
+	rinsFails := 0
 	newIncumbent := func(obj float64, x, rowAct, rc, price []float64) {
 		bestInternal = obj
 		bestX, bestRowAct, bestRC, bestPrice = x, rowAct, rc, price
@@ -473,7 +474,8 @@ func (m *Model) Solve() Result {
 					debugf("mipstart: rejected")
 				}
 			}
-			if diveTries < 8 && branchCol >= 0 && (nodeCount == 1 || nodeCount%256 == 0) {
+			closeGap := hasIncumbent && bestInternal-obj < 0.1*math.Max(1, math.Abs(bestInternal))
+			if diveTries < 8 && branchCol >= 0 && !(nodeCount == 1 && closeGap) && (nodeCount == 1 || nodeCount%256 == 0) {
 				diveTries++
 				// box the heuristic burst: dives must never eat the tree's time.
 				// The root burst gets more — success there ends the whole solve
@@ -510,15 +512,19 @@ func (m *Model) Solve() Result {
 				}
 			}
 			// RINS-lite: fix integers where incumbent and node LP agree,
-			// LP-complete the rest; accept only strict improvements
-			if hasIncumbent && nodeCount%64 == 0 {
+			// LP-complete the rest; accept only strict improvements.
+			// Failures back the frequency off (CBC adaptive frequency)
+			if hasIncumbent && nodeCount%(64<<min(rinsFails, 3)) == 0 {
 				if hObj, hx, hAct, hRC, hPrice, ok := m.rinsImprove(nd, x); ok && m.improves(hObj, bestInternal) {
+					rinsFails = 0
 					debugf("rins: improved %g -> %g", bestInternal, hObj)
 					if pObj, px, pAct, pRC, pPrice, better := m.polishIncumbent(nd, hObj, hx, deadline); better {
 						debugf("polish: rins %g -> %g", hObj, pObj)
 						hObj, hx, hAct, hRC, hPrice = pObj, px, pAct, pRC, pPrice
 					}
 					newIncumbent(hObj, hx, hAct, hRC, hPrice)
+				} else {
+					rinsFails++
 				}
 			}
 			nd, backtrack = near, far
@@ -796,7 +802,9 @@ func (m *Model) rinsImprove(nd *node, x []float64) (obj float64, dx, rowAct, rc,
 // faceWalk dives by fixing fractional ints, preferring fixes that keep the LP
 // on its optimal face and lifting the face minimally when neither side fits
 func (m *Model) faceWalk(nd *node, x []float64, st *simplex.State, faceObj, cutoff float64) (obj float64, dx, rowAct, rc, price []float64, ok bool) {
-	tol := math.Max(m.Limits.GapAbs, 1e-7)
+	// LP-noise tolerance, deliberately independent of the proof gap: a wide
+	// gap lets per-step drift compound over long walks and miss the vertex
+	const tol = 1e-6
 	cur, curX, curState := nd, x, st
 	face := faceObj
 	for {
