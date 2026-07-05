@@ -407,7 +407,11 @@ func (m *Model) Solve() Result {
 			}
 			if branchCol >= 0 {
 				if nd.depth < sbDepth {
-					if sb := m.strongBranch(nd, x, endState, obj); sb >= 0 {
+					sbCut := math.Inf(1)
+					if hasIncumbent {
+						sbCut = bestInternal
+					}
+					if sb := m.strongBranch(nd, x, endState, obj, sbCut); sb >= 0 {
 						branchCol = sb
 					}
 				} else if ps := m.psSelect(x); ps >= 0 {
@@ -1078,7 +1082,7 @@ func (m *Model) nodeBound(nd *node, j int) (float64, float64) {
 
 // strongBranch (CBC-style) probes both children of the top candidates and
 // returns the column whose worse child moves the bound most; -1 if none do.
-func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj float64) int {
+func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj, cutoff float64) int {
 	type cand struct {
 		j    int
 		dist float64
@@ -1123,8 +1127,11 @@ func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj
 			m.LP.Deadline = saved
 			switch status {
 			case simplex.Optimal:
-				score = math.Min(score, cObj-obj) // bound gain of this side
 				m.psRecord(cd.j, b[0] == floorV+1, x[cd.j]-floorV, cObj-obj)
+				if !m.improves(cObj, cutoff) {
+					break // side is fathomed by the cutoff: as good as pruned
+				}
+				score = math.Min(score, cObj-obj) // bound gain of this side
 			case simplex.Infeasible:
 				// side prunes outright: keep score as-is (excellent)
 			default:
