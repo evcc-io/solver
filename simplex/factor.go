@@ -29,15 +29,17 @@ type eta struct {
 // factor is an immutable factorization of a basis matrix; shared between
 // cloned states (etas live on the State, not here).
 type factor struct {
-	m       int
-	colRow  [][]int32   // basis column sparsity, by basis position
-	colVal  [][]float64 //
-	fwd     []triPivot  // row-singleton pivots, forward order
-	bwd     []triPivot  // col-singleton pivots, applied in reverse
-	kRows   []int       // kernel rows (original indices)
-	kPos    []int       // kernel basis positions
-	klu     *sparseLU   // sparse LU of the kernel
-	rowKIdx []int       // row -> kernel row index, -1 otherwise
+	m    int
+	cols []int32 // basis variable per position, indexes tblRow/tblVal
+	// shared immutable column tables (owned by the LP, indexed by variable)
+	tblRow  [][]int32
+	tblVal  [][]float64
+	fwd     []triPivot // row-singleton pivots, forward order
+	bwd     []triPivot // col-singleton pivots, applied in reverse
+	kRows   []int      // kernel rows (original indices)
+	kPos    []int      // kernel basis positions
+	klu     *sparseLU  // sparse LU of the kernel
+	rowKIdx []int      // row -> kernel row index, -1 otherwise
 
 	// solve scratch, reused across calls (solver is single-threaded);
 	// per-call make() showed up as ~8% madvise in profiles
@@ -62,9 +64,13 @@ func newFactorWS(m int) *factorWS {
 }
 
 // factorize builds a factorization of the basis whose pos-th column is
-// (colRow[pos], colVal[pos]); returns nil if the kernel is singular.
-func factorize(m int, colRow [][]int32, colVal [][]float64, ws *factorWS) *factor {
-	f := &factor{m: m, colRow: colRow, colVal: colVal}
+// (tblRow[cols[pos]], tblVal[cols[pos]]); returns nil if the kernel is
+// singular. cols is retained by the factor; the tables are shared.
+func factorize(m int, cols []int32, tblRow [][]int32, tblVal [][]float64, ws *factorWS) *factor {
+	f := &factor{m: m, cols: cols, tblRow: tblRow, tblVal: tblVal}
+	// one triPivot arena: fwd fills from the front, bwd continues after it
+	tri := make([]triPivot, 0, m)
+	f.fwd = tri
 
 	if ws == nil {
 		ws = newFactorWS(m)
@@ -79,8 +85,9 @@ func factorize(m int, colRow [][]int32, colVal [][]float64, ws *factorWS) *facto
 		rowCols[i] = rowCols[i][:0]
 	}
 	for pos := range m {
-		for k, r := range colRow[pos] {
-			if math.Abs(colVal[pos][k]) < pivotTol {
+		colRow, colVal := tblRow[cols[pos]], tblVal[cols[pos]]
+		for k, r := range colRow {
+			if math.Abs(colVal[k]) < pivotTol {
 				continue
 			}
 			rowCount[r]++
@@ -89,9 +96,10 @@ func factorize(m int, colRow [][]int32, colVal [][]float64, ws *factorWS) *facto
 		}
 	}
 	colEntry := func(pos int, row int) float64 {
-		for k, r := range f.colRow[pos] {
+		colRow, colVal := tblRow[cols[pos]], tblVal[cols[pos]]
+		for k, r := range colRow {
 			if int(r) == row {
-				return f.colVal[pos][k]
+				return colVal[k]
 			}
 		}
 		return 0
@@ -127,8 +135,9 @@ func factorize(m int, colRow [][]int32, colVal [][]float64, ws *factorWS) *facto
 		}
 		f.fwd = append(f.fwd, triPivot{pos, r, a})
 		rowActive[r], colActive[pos] = false, false
-		for k, rr := range f.colRow[pos] {
-			if rowActive[rr] && math.Abs(f.colVal[pos][k]) >= pivotTol {
+		colRow, colVal := tblRow[cols[pos]], tblVal[cols[pos]]
+		for k, rr := range colRow {
+			if rowActive[rr] && math.Abs(colVal[k]) >= pivotTol {
 				rowCount[rr]--
 				if rowCount[rr] == 1 {
 					queue = append(queue, int(rr))
@@ -137,14 +146,18 @@ func factorize(m int, colRow [][]int32, colVal [][]float64, ws *factorWS) *facto
 		}
 	}
 
+	// bwd continues in the tri arena right after fwd's final extent
+	f.bwd = f.fwd[len(f.fwd):len(f.fwd):cap(f.fwd)]
+
 	// recount active cols, then phase 2: column singletons resolve backward
 	for pos := range m {
 		if !colActive[pos] {
 			continue
 		}
 		n := 0
-		for k, r := range f.colRow[pos] {
-			if rowActive[r] && math.Abs(f.colVal[pos][k]) >= pivotTol {
+		colRow, colVal := tblRow[cols[pos]], tblVal[cols[pos]]
+		for k, r := range colRow {
+			if rowActive[r] && math.Abs(colVal[k]) >= pivotTol {
 				n++
 			}
 		}
@@ -160,9 +173,10 @@ func factorize(m int, colRow [][]int32, colVal [][]float64, ws *factorWS) *facto
 			continue
 		}
 		row, a := -1, 0.0
-		for k, r := range f.colRow[pos] {
-			if rowActive[r] && math.Abs(f.colVal[pos][k]) >= pivotTol {
-				row, a = int(r), f.colVal[pos][k]
+		colRow, colVal := tblRow[cols[pos]], tblVal[cols[pos]]
+		for k, r := range colRow {
+			if rowActive[r] && math.Abs(colVal[k]) >= pivotTol {
+				row, a = int(r), colVal[k]
 				break
 			}
 		}
@@ -202,31 +216,43 @@ func factorize(m int, colRow [][]int32, colVal [][]float64, ws *factorWS) *facto
 		return nil // structurally singular
 	}
 	if k > 0 {
+		nnz := 0
+		for _, pos := range f.kPos {
+			for _, r := range tblRow[cols[pos]] {
+				if f.rowKIdx[r] >= 0 {
+					nnz++
+				}
+			}
+		}
+		idxArena := make([]int32, 0, nnz)
+		valArena := make([]float64, 0, nnz)
 		colIdx := make([][]int32, k)
 		colVal := make([][]float64, k)
 		for kc, pos := range f.kPos {
-			for kk, r := range f.colRow[pos] {
+			lo := len(idxArena)
+			cr, cv := tblRow[cols[pos]], tblVal[cols[pos]]
+			for kk, r := range cr {
 				if ki := f.rowKIdx[r]; ki >= 0 {
-					colIdx[kc] = append(colIdx[kc], int32(ki))
-					colVal[kc] = append(colVal[kc], f.colVal[pos][kk])
+					idxArena = append(idxArena, int32(ki))
+					valArena = append(valArena, cv[kk])
 				}
 			}
+			colIdx[kc] = idxArena[lo:len(idxArena):len(idxArena)]
+			colVal[kc] = valArena[lo:len(valArena):len(valArena)]
 		}
 		f.klu = luFactorize(k, colIdx, colVal)
 		if f.klu == nil {
 			return nil
 		}
 	}
+	buf := make([]float64, m+k)
+	f.xScratch, f.kScratch = buf[:m], buf[m:]
 	return f
 }
 
 // ftranFactor solves B*x = v in place: v becomes x indexed by basis
 // position (x[pos] = multiplier of basic column pos).
 func (f *factor) ftran(v []float64) {
-	if f.xScratch == nil {
-		f.xScratch = make([]float64, f.m)
-		f.kScratch = make([]float64, len(f.kRows))
-	}
 	x := f.xScratch // by basis position
 	clear(x)
 	// forward: row singletons
@@ -234,8 +260,9 @@ func (f *factor) ftran(v []float64) {
 		xc := v[tp.row] / tp.a
 		x[tp.pos] = xc
 		if xc != 0 {
-			for k, r := range f.colRow[tp.pos] {
-				v[r] -= f.colVal[tp.pos][k] * xc
+			cr, cv := f.tblRow[f.cols[tp.pos]], f.tblVal[f.cols[tp.pos]]
+			for k, r := range cr {
+				v[r] -= cv[k] * xc
 			}
 			v[tp.row] = 0 // exactly resolved
 		}
@@ -253,8 +280,9 @@ func (f *factor) ftran(v []float64) {
 			pos := f.kPos[ki]
 			x[pos] = s
 			if s != 0 {
-				for kk, r := range f.colRow[pos] {
-					v[r] -= f.colVal[pos][kk] * s
+				cr, cv := f.tblRow[f.cols[pos]], f.tblVal[f.cols[pos]]
+				for kk, r := range cr {
+					v[r] -= cv[kk] * s
 				}
 			}
 		}
@@ -265,8 +293,9 @@ func (f *factor) ftran(v []float64) {
 		xc := v[tp.row] / tp.a
 		x[tp.pos] = xc
 		if xc != 0 {
-			for k, r := range f.colRow[tp.pos] {
-				v[r] -= f.colVal[tp.pos][k] * xc
+			cr, cv := f.tblRow[f.cols[tp.pos]], f.tblVal[f.cols[tp.pos]]
+			for k, r := range cr {
+				v[r] -= cv[k] * xc
 			}
 		}
 	}
@@ -276,18 +305,15 @@ func (f *factor) ftran(v []float64) {
 // btran solves B^T*y = w in place: w is indexed by basis position on entry,
 // y by row on exit. Ops are the adjoints of ftran's, in reverse order.
 func (f *factor) btran(w []float64) {
-	if f.xScratch == nil {
-		f.xScratch = make([]float64, f.m)
-		f.kScratch = make([]float64, len(f.kRows))
-	}
 	y := f.xScratch // by row
 	clear(y)
 	// adjoint of backward pass, in forward order
 	for _, tp := range f.bwd {
 		s := w[tp.pos]
-		for k, r := range f.colRow[tp.pos] {
+		cr, cv := f.tblRow[f.cols[tp.pos]], f.tblVal[f.cols[tp.pos]]
+		for k, r := range cr {
 			if int(r) != tp.row {
-				s -= f.colVal[tp.pos][k] * y[r]
+				s -= cv[k] * y[r]
 			}
 		}
 		y[tp.row] = s / tp.a
@@ -298,9 +324,10 @@ func (f *factor) btran(w []float64) {
 		kw := f.kScratch
 		for ki, pos := range f.kPos {
 			s := w[pos]
-			for kk, r := range f.colRow[pos] {
+			cr, cv := f.tblRow[f.cols[pos]], f.tblVal[f.cols[pos]]
+			for kk, r := range cr {
 				if f.rowKIdx[r] < 0 {
-					s -= f.colVal[pos][kk] * y[r]
+					s -= cv[kk] * y[r]
 				}
 			}
 			kw[ki] = s
@@ -314,9 +341,10 @@ func (f *factor) btran(w []float64) {
 	for i := len(f.fwd) - 1; i >= 0; i-- {
 		tp := f.fwd[i]
 		s := w[tp.pos]
-		for k, r := range f.colRow[tp.pos] {
+		cr, cv := f.tblRow[f.cols[tp.pos]], f.tblVal[f.cols[tp.pos]]
+		for k, r := range cr {
 			if int(r) != tp.row {
-				s -= f.colVal[tp.pos][k] * y[r]
+				s -= cv[k] * y[r]
 			}
 		}
 		y[tp.row] = s / tp.a

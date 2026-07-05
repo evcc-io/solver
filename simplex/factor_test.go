@@ -31,6 +31,16 @@ func randomBasis(rng *rand.Rand, m int) ([][]int32, [][]float64) {
 	return colRow, colVal
 }
 
+// identCols maps basis position pos to table entry pos (tests build the
+// basis tables directly, so the indirection is the identity).
+func identCols(m int) []int32 {
+	cols := make([]int32, m)
+	for i := range cols {
+		cols[i] = int32(i)
+	}
+	return cols
+}
+
 func multiply(colRow [][]int32, colVal [][]float64, m int, x []float64) []float64 {
 	v := make([]float64, m)
 	for pos := range m {
@@ -49,7 +59,7 @@ func TestFactorFtranBtran(t *testing.T) {
 	for trial := range 50 {
 		m := 5 + rng.Intn(60)
 		colRow, colVal := randomBasis(rng, m)
-		f := factorize(m, colRow, colVal, nil)
+		f := factorize(m, identCols(m), colRow, colVal, nil)
 		if f == nil {
 			continue // singular draw: skip
 		}
@@ -94,7 +104,7 @@ func TestFactorEtaUpdate(t *testing.T) {
 	for trial := range 30 {
 		m := 5 + rng.Intn(40)
 		colRow, colVal := randomBasis(rng, m)
-		f := factorize(m, colRow, colVal, nil)
+		f := factorize(m, identCols(m), colRow, colVal, nil)
 		if f == nil {
 			continue
 		}

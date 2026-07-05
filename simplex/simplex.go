@@ -87,6 +87,9 @@ type LP struct {
 	fws *factorWS // reusable factorization workspace
 	dws *dualWS   // reusable dualRun workspace
 
+	// run/recomputeBasics per-call vectors, reused (single-threaded)
+	runCost, runY, runA, residual []float64
+
 	// Stats accumulates pivot counts across solves (diagnostics only).
 	Stats struct {
 		Solves, Phase1, Phase2, Dual               int64
@@ -122,15 +125,14 @@ func (st *State) btranVec(w []float64) {
 // refactorize rebuilds st's basis factorization and clears its eta file;
 // on (numerical) failure the existing factor+etas stay valid.
 func (lp *LP) refactorize(st *State) bool {
-	colRow := make([][]int32, lp.m)
-	colVal := make([][]float64, lp.m)
+	cols := make([]int32, lp.m)
 	for pos, j := range st.basicOf {
-		colRow[pos], colVal[pos] = lp.colRow32[j], lp.colVal32[j]
+		cols[pos] = int32(j)
 	}
 	if lp.fws == nil {
 		lp.fws = newFactorWS(lp.m)
 	}
-	f := factorize(lp.m, colRow, colVal, lp.fws)
+	f := factorize(lp.m, cols, lp.colRow32, lp.colVal32, lp.fws)
 	if f == nil {
 		return false
 	}
@@ -334,6 +336,9 @@ func (lp *LP) dualRun(st *State) {
 	stamp := lp.dws.stamp
 	clear(stamp)
 	ws := lp.dws
+	if ws.delta == nil {
+		ws.delta = make([]float64, m)
+	}
 	a, y, rowBuf, alphaRow, d := ws.a, ws.y, ws.rowBuf, ws.alphaRow, ws.d
 	dSeen, seen, touched := ws.dSeen, ws.seen, ws.touched[:0]
 	clear(alphaRow)
@@ -453,7 +458,8 @@ func (lp *LP) dualRun(st *State) {
 		}
 		if q >= 0 && len(flips) > 0 {
 			// apply flips: one combined column delta, one ftran for basics
-			delta := make([]float64, m)
+			delta := ws.delta
+			clear(delta)
 			for _, j := range flips {
 				jlb, jub := lp.lb[j], lp.ub[j]
 				var dv float64
@@ -524,6 +530,7 @@ func (lp *LP) dualRun(st *State) {
 // dualWS holds dualRun's per-call vectors, reused across warm solves.
 type dualWS struct {
 	a, y, rowBuf, alphaRow, d []float64
+	delta                     []float64
 	dSeen, seen               []bool
 	touched                   []int
 	cands                     []dualCand
@@ -559,7 +566,11 @@ var (
 // values: x_B = -Binv * N * x_N (the system's RHS is always zero).
 func (lp *LP) recomputeBasics(st *State) {
 	m := lp.m
-	residual := make([]float64, m)
+	if lp.residual == nil {
+		lp.residual = make([]float64, m)
+	}
+	residual := lp.residual
+	clear(residual)
 	for j := range lp.nTotal() {
 		if st.status[j] == basic {
 			continue
@@ -756,9 +767,12 @@ func (lp *LP) phaseCost(st *State, dst []float64) bool {
 // run recomputes the active cost vector fresh before every pivot, so a
 // variable that becomes feasible mid-sequence stops influencing pricing.
 func (lp *LP) run(st *State) Status {
-	phase1Cost := make([]float64, lp.nTotal())
-	y := make([]float64, lp.m)
-	a := make([]float64, lp.m)
+	if lp.runCost == nil {
+		lp.runCost = make([]float64, lp.nTotal())
+		lp.runY = make([]float64, lp.m)
+		lp.runA = make([]float64, lp.m)
+	}
+	phase1Cost, y, a := lp.runCost, lp.runY, lp.runA
 	degen := 0 // consecutive zero-step pivots; Bland's rule breaks cycles
 	cleaned := false
 	lp.xtol = xtolInit
@@ -1035,9 +1049,16 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 		st.value[leaving] = ub
 	}
 
-	// product-form update: alpha is exactly the eta for this basis change
-	var idx []int32
-	var val []float64
+	// product-form update: alpha is exactly the eta for this basis change;
+	// counting first sizes the arrays exactly (etas outlive the pivot)
+	nnz := 0
+	for _, v := range a {
+		if math.Abs(v) > etaDropTol {
+			nnz++
+		}
+	}
+	idx := make([]int32, 0, nnz)
+	val := make([]float64, 0, nnz)
 	for i, v := range a {
 		if math.Abs(v) > etaDropTol {
 			idx = append(idx, int32(i))
