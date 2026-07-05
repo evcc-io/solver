@@ -403,7 +403,7 @@ func (m *Model) Solve() Result {
 			// Probes cost ~a node solve each: big problems get few
 			sbDepth := 16
 			if m.LP.NumRows() > 1500 {
-				sbDepth = 2
+				sbDepth = 6
 			}
 			if branchCol >= 0 {
 				if nd.depth < sbDepth {
