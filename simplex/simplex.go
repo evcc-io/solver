@@ -85,11 +85,18 @@ type LP struct {
 	pricingCursor int // scan position for partial pricing
 
 	fws *factorWS // reusable factorization workspace
+	dws *dualWS   // reusable dualRun workspace
+
+	// run/recomputeBasics per-call vectors, reused (single-threaded)
+	runCost, runY, runA, residual []float64
 
 	// Stats accumulates pivot counts across solves (diagnostics only).
 	Stats struct {
 		Solves, Phase1, Phase2, Dual               int64
 		DualStallQ, DualStallA, DualCap, DualFlips int64
+		Dual2Runs, Dual2, Dual2Flips               int64
+		Dual2Inf, Dual2Cap, Dual2Opt               int64
+		Dual2P0, Dual2Guard, Dual2TNeg             int64
 		KernelMax, Bland                           int64
 	}
 }
@@ -118,15 +125,14 @@ func (st *State) btranVec(w []float64) {
 // refactorize rebuilds st's basis factorization and clears its eta file;
 // on (numerical) failure the existing factor+etas stay valid.
 func (lp *LP) refactorize(st *State) bool {
-	colRow := make([][]int32, lp.m)
-	colVal := make([][]float64, lp.m)
+	cols := make([]int32, lp.m)
 	for pos, j := range st.basicOf {
-		colRow[pos], colVal[pos] = lp.colRow32[j], lp.colVal32[j]
+		cols[pos] = int32(j)
 	}
 	if lp.fws == nil {
 		lp.fws = newFactorWS(lp.m)
 	}
-	f := factorize(lp.m, colRow, colVal, lp.fws)
+	f := factorize(lp.m, cols, lp.colRow32, lp.colVal32, lp.fws)
 	if f == nil {
 		return false
 	}
@@ -267,24 +273,48 @@ func (st *State) Clone() *State {
 	}
 }
 
-// WarmSolve resolves from st after bound changes on touched, instead of
-// resetting to the trivial all-slack basis.
+// WarmSolve resolves from st after bound changes on touched. A touched
+// nonbasic keeps its side when still valid (snap-to-lower mangles the basis).
 func (lp *LP) WarmSolve(st *State, touched []int) (Status, *State, float64) {
+	return lp.warmSolve(st, touched, true)
+}
+
+func (lp *LP) warmSolve(st *State, touched []int, preserve bool) (Status, *State, float64) {
 	for _, j := range touched {
-		if st.status[j] != basic {
+		switch {
+		case st.status[j] == basic:
+		case !preserve:
+			lp.resetNonbasic(st, j)
+		case st.status[j] == atLower && lp.lb[j] > -inf:
+			st.value[j] = lp.lb[j]
+		case st.status[j] == atUpper && lp.ub[j] < inf:
+			st.value[j] = lp.ub[j]
+		case st.status[j] == free &&
+			st.value[j] >= lp.lb[j] && st.value[j] <= lp.ub[j]:
+		default:
 			lp.resetNonbasic(st, j)
 		}
 	}
 	lp.recomputeBasics(st)
 	// after a bound change the basis stays (near) dual feasible: a few dual
 	// pivots restore primal feasibility far cheaper than a primal Phase 1
-	lp.dualRun(st)
+	if dual2Enabled {
+		if lp.dual2Run(st) == dual2Infeasible {
+			return Infeasible, st, 0
+		}
+	} else if !noDualRepair {
+		lp.dualRun(st)
+	}
 	return lp.solveFrom(st)
 }
 
 // dualPivotCap bounds dual pivots per re-solve; a degenerate dual bails to
 // the primal run instead of grinding forever.
 const dualPivotCap = 1024
+
+// tabuAge keeps a just-fixed row from being re-picked while any other
+// violated row exists; 95% of dual pivots were last-3-row revisits.
+const tabuAge = 8
 
 // blandAfter switches entering selection to Bland's rule once this many
 // consecutive degenerate (zero-step) pivots occur.
@@ -294,22 +324,33 @@ const blandAfter = 384
 // Clp's dual): it bails on any stall and leaves the rest to the primal run.
 func (lp *LP) dualRun(st *State) {
 	m, nt := lp.m, lp.nTotal()
-	a := make([]float64, m)
-	y := make([]float64, m)
-	rowBuf := make([]float64, m)
-	alphaRow := make([]float64, nt)
+	if lp.dws == nil {
+		lp.dws = &dualWS{
+			a: make([]float64, m), y: make([]float64, m),
+			rowBuf: make([]float64, m), alphaRow: make([]float64, nt),
+			d: make([]float64, nt), dSeen: make([]bool, nt),
+			seen: make([]bool, nt), touched: make([]int, 0, 256),
+			stamp: make([]int32, m),
+		}
+	}
+	stamp := lp.dws.stamp
+	clear(stamp)
+	ws := lp.dws
+	if ws.delta == nil {
+		ws.delta = make([]float64, m)
+	}
+	a, y, rowBuf, alphaRow, d := ws.a, ws.y, ws.rowBuf, ws.alphaRow, ws.d
+	dSeen, seen, touched := ws.dSeen, ws.seen, ws.touched[:0]
+	clear(alphaRow)
+	clear(dSeen)
+	clear(seen)
 
 	// duals maintained incrementally per pivot (y += step*rowR); reduced
-	// costs materialize lazily on first touch, then update incrementally —
-	// no per-call full d[] initialization
+	// costs materialize lazily on first touch, then update incrementally
 	clear(y)
 	duals(st, lp.cost, m, y)
-	d := make([]float64, nt)
-	dSeen := make([]bool, nt)
 
 	var skip []bool // rows whose violation the dual cannot fix
-	touched := make([]int, 0, 256)
-	seen := make([]bool, nt)
 	for iter := range dualPivotCap + 1 {
 		if !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
 			return
@@ -318,20 +359,30 @@ func (lp *LP) dualRun(st *State) {
 			lp.Stats.DualCap++
 			return
 		}
-		// leaving variable: the most primal-infeasible basic
+		// leaving variable: the most primal-infeasible basic; rows fixed
+		// within the last tabuAge pivots yield to others (anti ping-pong)
 		r, bound, worst := -1, 0.0, 100*eps
+		rT, boundT, worstT := -1, 0.0, 100*eps
 		for i := range m {
 			if skip != nil && skip[i] {
 				continue
 			}
 			bv := st.basicOf[i]
 			v := st.value[bv]
-			if viol := lp.lb[bv] - v; viol > worst {
-				worst, r, bound = viol, i, lp.lb[bv]
+			viol, b := lp.lb[bv]-v, lp.lb[bv]
+			if w := v - lp.ub[bv]; w > viol {
+				viol, b = w, lp.ub[bv]
 			}
-			if viol := v - lp.ub[bv]; viol > worst {
-				worst, r, bound = viol, i, lp.ub[bv]
+			if stamp[i] > 0 && int32(iter)-stamp[i] < tabuAge {
+				if viol > worstT {
+					worstT, rT, boundT = viol, i, b
+				}
+			} else if viol > worst {
+				worst, r, bound = viol, i, b
 			}
+		}
+		if r < 0 {
+			r, bound = rT, boundT
 		}
 		if r < 0 {
 			return // primal feasible (or only unfixable rows left): done
@@ -365,7 +416,7 @@ func (lp *LP) dualRun(st *State) {
 				alphaRow[j] += v * vals[k]
 			}
 		}
-		var cands []dualCand
+		cands := ws.cands[:0]
 		for _, j := range touched {
 			seen[j] = false
 			if st.status[j] == basic {
@@ -386,6 +437,7 @@ func (lp *LP) dualRun(st *State) {
 				cands = append(cands, dualCand{j, dir, math.Abs(d[j]) / math.Abs(alphaJ)})
 			}
 		}
+		ws.cands = cands
 		sort.Slice(cands, func(a, b int) bool { return cands[a].ratio < cands[b].ratio })
 
 		// dual long step (Clp "dual with flips"): boxed candidates that
@@ -406,7 +458,8 @@ func (lp *LP) dualRun(st *State) {
 		}
 		if q >= 0 && len(flips) > 0 {
 			// apply flips: one combined column delta, one ftran for basics
-			delta := make([]float64, m)
+			delta := ws.delta
+			clear(delta)
 			for _, j := range flips {
 				jlb, jub := lp.lb[j], lp.ub[j]
 				var dv float64
@@ -456,6 +509,7 @@ func (lp *LP) dualRun(st *State) {
 			return
 		}
 		lp.Stats.Dual++
+		stamp[r] = int32(iter) + 1
 		lp.pivot(st, q, qdir, a, t, r, false)
 		// dual update: y absorbs the pivot row; materialized reduced costs
 		// follow incrementally, unmaterialized ones from y on first touch
@@ -471,6 +525,16 @@ func (lp *LP) dualRun(st *State) {
 		d[leaving], dSeen[leaving] = -step, true
 		d[q], dSeen[q] = 0, true
 	}
+}
+
+// dualWS holds dualRun's per-call vectors, reused across warm solves.
+type dualWS struct {
+	a, y, rowBuf, alphaRow, d []float64
+	delta                     []float64
+	dSeen, seen               []bool
+	touched                   []int
+	cands                     []dualCand
+	stamp                     []int32 // pivot index when row was last fixed
 }
 
 // dualCand is one eligible entering candidate in the dual ratio test.
@@ -502,7 +566,11 @@ var (
 // values: x_B = -Binv * N * x_N (the system's RHS is always zero).
 func (lp *LP) recomputeBasics(st *State) {
 	m := lp.m
-	residual := make([]float64, m)
+	if lp.residual == nil {
+		lp.residual = make([]float64, m)
+	}
+	residual := lp.residual
+	clear(residual)
 	for j := range lp.nTotal() {
 		if st.status[j] == basic {
 			continue
@@ -586,7 +654,9 @@ func (lp *LP) ColdSolve() (Status, *State, float64) {
 		st = lp.initState()
 		return lp.solveFrom(st)
 	}
-	return lp.WarmSolve(st, touched)
+	// historical snap-to-bound cleanup: the vertex it selects anchors the
+	// root trajectory that downstream heuristics (face walk) depend on
+	return lp.warmSolve(st, touched, false)
 }
 
 const perturbEps = 1e-7
@@ -697,9 +767,12 @@ func (lp *LP) phaseCost(st *State, dst []float64) bool {
 // run recomputes the active cost vector fresh before every pivot, so a
 // variable that becomes feasible mid-sequence stops influencing pricing.
 func (lp *LP) run(st *State) Status {
-	phase1Cost := make([]float64, lp.nTotal())
-	y := make([]float64, lp.m)
-	a := make([]float64, lp.m)
+	if lp.runCost == nil {
+		lp.runCost = make([]float64, lp.nTotal())
+		lp.runY = make([]float64, lp.m)
+		lp.runA = make([]float64, lp.m)
+	}
+	phase1Cost, y, a := lp.runCost, lp.runY, lp.runA
 	degen := 0 // consecutive zero-step pivots; Bland's rule breaks cycles
 	cleaned := false
 	lp.xtol = xtolInit
@@ -976,9 +1049,16 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 		st.value[leaving] = ub
 	}
 
-	// product-form update: alpha is exactly the eta for this basis change
-	var idx []int32
-	var val []float64
+	// product-form update: alpha is exactly the eta for this basis change;
+	// counting first sizes the arrays exactly (etas outlive the pivot)
+	nnz := 0
+	for _, v := range a {
+		if math.Abs(v) > etaDropTol {
+			nnz++
+		}
+	}
+	idx := make([]int32, 0, nnz)
+	val := make([]float64, 0, nnz)
 	for i, v := range a {
 		if math.Abs(v) > etaDropTol {
 			idx = append(idx, int32(i))
