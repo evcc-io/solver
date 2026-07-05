@@ -113,6 +113,14 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   exists in `mip/cmir.go` but stays unwired: measured on the target
   instances it separates nothing that GMI + probing have not already
   found.
+- **Simpler dual pricing than Clp**: the production dual picks the most
+  violated row (plus the revisit tabu) instead of dual steepest edge,
+  and runs unperturbed. The Clp-style engine (DSE, Harris ratio test,
+  cost perturbation — `simplex/dual2.go`) is property-tested but gated
+  off as measured-negative on the target instances. FTRAN/BTRAN are
+  always dense-vector solves; Clp's hypersparse triangular solves are
+  not implemented (measured ~20% result density here, so the payoff is
+  bounded).
 - **No CglPreProcess-style reductions**: presolve tightens bounds and
   coefficients but never eliminates rows/columns, so node LPs stay large
   (real CBC works on a ~4x smaller reduced model for these instances).
