@@ -50,8 +50,10 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 - **LP**: bounded-variable primal simplex with composite Phase 1; dual
   simplex for warm re-solves after bound changes — sparse pivot row via
   a row-wise mirror of A, incrementally maintained duals with lazily
-  materialized reduced costs, long-step bound flips; wall-clock
-  deadline checked inside the pivot loop. Warm starts keep each touched
+  materialized reduced costs, long-step bound flips, and a short tabu
+  on just-fixed rows (on degenerate cut faces 95% of dual pivots were
+  re-fixes of the last three rows; the tabu breaks the ping-pong);
+  wall-clock deadline checked inside the pivot loop. Warm starts keep each touched
   nonbasic on its current bound side (Clp semantics) instead of
   re-snapping to the lower bound. A second, fuller dual engine
   (`simplex/dual2.go`: dual steepest edge, Harris two-pass ratio test,

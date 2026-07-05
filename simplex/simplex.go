@@ -310,6 +310,10 @@ func (lp *LP) warmSolve(st *State, touched []int, preserve bool) (Status, *State
 // the primal run instead of grinding forever.
 const dualPivotCap = 1024
 
+// tabuAge keeps a just-fixed row from being re-picked while any other
+// violated row exists; 95% of dual pivots were last-3-row revisits.
+const tabuAge = 8
+
 // blandAfter switches entering selection to Bland's rule once this many
 // consecutive degenerate (zero-step) pivots occur.
 const blandAfter = 384
@@ -324,8 +328,11 @@ func (lp *LP) dualRun(st *State) {
 			rowBuf: make([]float64, m), alphaRow: make([]float64, nt),
 			d: make([]float64, nt), dSeen: make([]bool, nt),
 			seen: make([]bool, nt), touched: make([]int, 0, 256),
+			stamp: make([]int32, m),
 		}
 	}
+	stamp := lp.dws.stamp
+	clear(stamp)
 	ws := lp.dws
 	a, y, rowBuf, alphaRow, d := ws.a, ws.y, ws.rowBuf, ws.alphaRow, ws.d
 	dSeen, seen, touched := ws.dSeen, ws.seen, ws.touched[:0]
@@ -347,20 +354,30 @@ func (lp *LP) dualRun(st *State) {
 			lp.Stats.DualCap++
 			return
 		}
-		// leaving variable: the most primal-infeasible basic
+		// leaving variable: the most primal-infeasible basic; rows fixed
+		// within the last tabuAge pivots yield to others (anti ping-pong)
 		r, bound, worst := -1, 0.0, 100*eps
+		rT, boundT, worstT := -1, 0.0, 100*eps
 		for i := range m {
 			if skip != nil && skip[i] {
 				continue
 			}
 			bv := st.basicOf[i]
 			v := st.value[bv]
-			if viol := lp.lb[bv] - v; viol > worst {
-				worst, r, bound = viol, i, lp.lb[bv]
+			viol, b := lp.lb[bv]-v, lp.lb[bv]
+			if w := v - lp.ub[bv]; w > viol {
+				viol, b = w, lp.ub[bv]
 			}
-			if viol := v - lp.ub[bv]; viol > worst {
-				worst, r, bound = viol, i, lp.ub[bv]
+			if stamp[i] > 0 && int32(iter)-stamp[i] < tabuAge {
+				if viol > worstT {
+					worstT, rT, boundT = viol, i, b
+				}
+			} else if viol > worst {
+				worst, r, bound = viol, i, b
 			}
+		}
+		if r < 0 {
+			r, bound = rT, boundT
 		}
 		if r < 0 {
 			return // primal feasible (or only unfixable rows left): done
@@ -486,6 +503,7 @@ func (lp *LP) dualRun(st *State) {
 			return
 		}
 		lp.Stats.Dual++
+		stamp[r] = int32(iter) + 1
 		lp.pivot(st, q, qdir, a, t, r, false)
 		// dual update: y absorbs the pivot row; materialized reduced costs
 		// follow incrementally, unmaterialized ones from y on first touch
@@ -509,6 +527,7 @@ type dualWS struct {
 	dSeen, seen               []bool
 	touched                   []int
 	cands                     []dualCand
+	stamp                     []int32 // pivot index when row was last fixed
 }
 
 // dualCand is one eligible entering candidate in the dual ratio test.
