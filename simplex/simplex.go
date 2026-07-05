@@ -18,6 +18,12 @@ const (
 	optEps  = 1e-7
 	maxIter = 200000
 
+	// EXPAND (Gill et al.): working bounds widen by xtolStep per pivot up
+	// to feasTol, then snap back; degenerate pivots keep a minimum step
+	feasTol  = 1e-6
+	xtolInit = 2.5e-7
+	xtolStep = 1e-8
+
 	// partial pricing kicks in only above this many total variables, and
 	// then scans nt/partialPricingDivisor columns per window.
 	partialPricingThreshold = 4000
@@ -47,6 +53,8 @@ const (
 // logical (row-slack) variables, one per row, with column n+i equal to -e_i.
 type LP struct {
 	n, m int // structural columns, rows (== logical variables)
+
+	xtol float64 // current EXPAND working-bound expansion (run resets it)
 
 	// sparse column data, index by variable (0..n+m-1); logical columns are
 	// synthesized on the fly rather than stored (single -1 entry).
@@ -629,10 +637,10 @@ func (lp *LP) phaseCost(st *State, dst []float64) bool {
 		bv := st.basicOf[i]
 		v := st.value[bv]
 		switch {
-		case v < lp.lb[bv]-eps:
+		case v < lp.lb[bv]-feasTol:
 			dst[bv] = -1
 			inPhase1 = true
-		case v > lp.ub[bv]+eps:
+		case v > lp.ub[bv]+feasTol:
 			dst[bv] = 1
 			inPhase1 = true
 		}
@@ -647,12 +655,20 @@ func (lp *LP) run(st *State) Status {
 	y := make([]float64, lp.m)
 	a := make([]float64, lp.m)
 	degen := 0 // consecutive zero-step pivots; Bland's rule breaks cycles
+	cleaned := false
+	lp.xtol = xtolInit
 	for iter := 0; ; iter++ {
 		if iter > maxIter {
 			return IterLimit
 		}
 		if iter%1024 == 0 && !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
 			return IterLimit
+		}
+		// EXPAND reset: snap the expansion back and restore exact values
+		if lp.xtol += xtolStep; lp.xtol > feasTol {
+			lp.refactorize(st)
+			lp.recomputeBasics(st)
+			lp.xtol = xtolInit
 		}
 		clear(phase1Cost)
 		inPhase1 := lp.phaseCost(st, phase1Cost)
@@ -670,6 +686,15 @@ func (lp *LP) run(st *State) Status {
 			q, dir = lp.chooseEntering(st, y, cost)
 		}
 		if q < 0 {
+			// EXPAND cleanup: restore exact values and re-price before
+			// concluding, so the expansion never leaks into the answer
+			if !cleaned {
+				cleaned = true
+				lp.refactorize(st)
+				lp.recomputeBasics(st)
+				lp.xtol = xtolInit
+				continue
+			}
 			if inPhase1 {
 				return Infeasible
 			}
@@ -695,6 +720,7 @@ func (lp *LP) run(st *State) Status {
 			degen = 0
 		}
 		lp.pivot(st, q, dir, a, t, row, isFlip)
+		cleaned = false
 	}
 }
 
@@ -801,36 +827,37 @@ func (lp *LP) ratioTest(st *State, a []float64, q int, dir float64, phase1, blan
 		delta := -a[i] * dir // rate of change of basic var i per unit t
 		v := st.value[bv]
 		lb, ub := lp.lb[bv], lp.ub[bv]
+		wlb, wub := lb-lp.xtol, ub+lp.xtol // EXPAND working bounds
 
 		var limit float64
 		ok := false
 		if phase1 {
 			switch {
-			case v < lb-eps: // infeasible low: only care about moving up to lb
+			case v < lb-feasTol: // infeasible low: only care about moving up to lb
 				if delta > eps {
 					limit = (lb - v) / delta
 					ok = true
 				}
-			case v > ub+eps: // infeasible high: only care about moving down to ub
+			case v > ub+feasTol: // infeasible high: only care about moving down to ub
 				if delta < -eps {
 					limit = (ub - v) / delta
 					ok = true
 				}
 			default: // feasible: normal both-direction limits
 				if delta > eps && ub < inf {
-					limit = (ub - v) / delta
+					limit = (wub - v) / delta
 					ok = true
 				} else if delta < -eps && lb > -inf {
-					limit = (lb - v) / delta
+					limit = (wlb - v) / delta
 					ok = true
 				}
 			}
 		} else {
 			if delta > eps && ub < inf {
-				limit = (ub - v) / delta
+				limit = (wub - v) / delta
 				ok = true
 			} else if delta < -eps && lb > -inf {
-				limit = (lb - v) / delta
+				limit = (wlb - v) / delta
 				ok = true
 			}
 		}
@@ -854,6 +881,13 @@ func (lp *LP) ratioTest(st *State, a []float64, q int, dir float64, phase1, blan
 	}
 	if leaveRow < 0 && !isFlip {
 		return t, -1, false
+	}
+	// EXPAND minimum step: the overshoot stays inside the next iteration's
+	// working bounds (xtol grows by xtolStep), so no seesaw re-flagging
+	if leaveRow >= 0 && !isFlip {
+		if minT := xtolStep / math.Abs(a[leaveRow]); t < minT {
+			t = minT
+		}
 	}
 	return t, leaveRow, isFlip
 }
@@ -909,6 +943,7 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 	st.status[q] = basic
 	if len(st.etas) > maxEtas {
 		lp.refactorize(st)
+		lp.recomputeBasics(st)
 	}
 }
 

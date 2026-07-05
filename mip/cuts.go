@@ -180,14 +180,9 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 		cands = cands[:maxCutsPer]
 	}
 
-	tab := make([]float64, nt)
-	added := 0
-	for _, cd := range cands {
-		_, v := st.BasicVar(cd.r)
-		f0 := v - math.Floor(v)
-		clear(tab)
-		m.LP.TableauRow(st, cd.r, tab)
-
+	// derive builds one GMI/MIR cut from a tableau-space equality with
+	// integer LHS and fractional rhs f0; reports whether a row was added
+	derive := func(tab []float64, f0 float64, maxSup int) bool {
 		// build the cut Σ γ_j s_j >= f0 over shifted nonbasics, then
 		// unshift into original variables: coef·x >= rhs
 		coef := make([]float64, n)
@@ -258,7 +253,7 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 			}
 		}
 		if !ok {
-			continue
+			return false
 		}
 		var idx []int
 		var vals []float64
@@ -273,14 +268,63 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 		}
 		// CBC-style hygiene: reject dense or ill-conditioned cuts, which
 		// send the simplex into degenerate grinding; normalize the rest
-		if len(idx) == 0 || len(idx) > max(200, n/3) || maxAbs/minAbs > 1e8 {
-			continue
+		if len(idx) == 0 || len(idx) > maxSup || maxAbs/minAbs > 1e8 {
+			return false
 		}
 		for k := range vals {
 			vals[k] /= maxAbs
 		}
 		m.P.AddRow("", idx, vals, problem.GE, rhs/maxAbs)
-		added++
+		return true
+	}
+
+	tab := make([]float64, nt)
+	added := 0
+	for _, cd := range cands {
+		_, v := st.BasicVar(cd.r)
+		f0 := v - math.Floor(v)
+		clear(tab)
+		m.LP.TableauRow(st, cd.r, tab)
+		if derive(tab, f0, max(200, n/3)) {
+			added++
+		}
+	}
+
+	// TwoMIR-lite (CglTwomir): pairwise +/- aggregations of the most
+	// fractional tableau rows; the aggregate LHS stays integer, so the
+	// same MIR derivation applies. Big instances only (cf. probing cuts).
+	if m.LP.NumRows() > 1500 {
+		topN := len(cands)
+		if topN > 8 {
+			topN = 8
+		}
+		tabs := make([][]float64, topN)
+		bval := make([]float64, topN)
+		for i := range topN {
+			tabs[i] = make([]float64, nt)
+			m.LP.TableauRow(st, cands[i].r, tabs[i])
+			_, bval[i] = st.BasicVar(cands[i].r)
+		}
+		agg := make([]float64, nt)
+		pairAdded := 0
+		for a := 0; a < topN && pairAdded < 8; a++ {
+			for b := a + 1; b < topN && pairAdded < 8; b++ {
+				for _, sgn := range [2]float64{1, -1} {
+					for j := range nt {
+						agg[j] = tabs[a][j] + sgn*tabs[b][j]
+					}
+					v := bval[a] + sgn*bval[b]
+					f0 := v - math.Floor(v)
+					if f0 < cutFracMin || f0 > 1-cutFracMin {
+						continue
+					}
+					if derive(agg, f0, 64) {
+						pairAdded++
+					}
+				}
+			}
+		}
+		added += pairAdded
 	}
 	return added
 }
