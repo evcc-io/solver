@@ -299,17 +299,15 @@ func (lp *LP) dualRun(st *State) {
 	rowBuf := make([]float64, m)
 	alphaRow := make([]float64, nt)
 
-	// reduced costs computed once, then updated incrementally per pivot
+	// duals maintained incrementally per pivot (y += step*rowR); reduced
+	// costs materialize lazily on first touch, then update incrementally —
+	// no per-call full d[] initialization
 	clear(y)
 	duals(st, lp.cost, m, y)
 	d := make([]float64, nt)
-	for j := range nt {
-		if st.status[j] != basic {
-			d[j] = lp.reducedCost(y, lp.cost, j)
-		}
-	}
+	dSeen := make([]bool, nt)
 
-	var skip map[int]bool // rows whose violation the dual cannot fix
+	var skip []bool // rows whose violation the dual cannot fix
 	touched := make([]int, 0, 256)
 	seen := make([]bool, nt)
 	for iter := range dualPivotCap + 1 {
@@ -323,7 +321,7 @@ func (lp *LP) dualRun(st *State) {
 		// leaving variable: the most primal-infeasible basic
 		r, bound, worst := -1, 0.0, 100*eps
 		for i := range m {
-			if skip[i] {
+			if skip != nil && skip[i] {
 				continue
 			}
 			bv := st.basicOf[i]
@@ -376,6 +374,10 @@ func (lp *LP) dualRun(st *State) {
 			alphaJ := alphaRow[j]
 			if math.Abs(alphaJ) < 1e-7 {
 				continue
+			}
+			if !dSeen[j] {
+				d[j] = lp.reducedCost(y, lp.cost, j)
+				dSeen[j] = true
 			}
 			for _, dir := range enterDirs(st.status[j]) {
 				if alphaJ*dir*needSign < eps {
@@ -433,7 +435,7 @@ func (lp *LP) dualRun(st *State) {
 			// primal run, but keep repairing the other rows
 			lp.Stats.DualStallQ++
 			if skip == nil {
-				skip = make(map[int]bool)
+				skip = make([]bool, m)
 			}
 			skip[r] = true
 			continue
@@ -443,7 +445,7 @@ func (lp *LP) dualRun(st *State) {
 		if math.Abs(a[r]) < 1e-7 {
 			lp.Stats.DualStallA++
 			if skip == nil {
-				skip = make(map[int]bool)
+				skip = make([]bool, m)
 			}
 			skip[r] = true
 			continue
@@ -455,17 +457,19 @@ func (lp *LP) dualRun(st *State) {
 		}
 		lp.Stats.Dual++
 		lp.pivot(st, q, qdir, a, t, r, false)
-		// incremental reduced-cost update from the pivot row
+		// dual update: y absorbs the pivot row; materialized reduced costs
+		// follow incrementally, unmaterialized ones from y on first touch
 		step := d[q] / alphaRow[q]
+		for i := range m {
+			y[i] += step * rowR[i]
+		}
 		for _, j := range touched {
-			if st.status[j] == basic {
-				d[j] = 0
-			} else if alphaRow[j] != 0 {
+			if dSeen[j] && alphaRow[j] != 0 {
 				d[j] -= step * alphaRow[j]
 			}
 		}
-		d[leaving] = -step
-		d[q] = 0
+		d[leaving], dSeen[leaving] = -step, true
+		d[q], dSeen[q] = 0, true
 	}
 }
 
@@ -706,7 +710,8 @@ func (lp *LP) run(st *State) Status {
 		if iter%1024 == 0 && !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
 			return IterLimit
 		}
-		// EXPAND reset: snap the expansion back and restore exact values
+		// EXPAND reset: snap the expansion back and restore exact values;
+		// the refactorization doubles as periodic numerical hygiene
 		if lp.xtol += xtolStep; lp.xtol > feasTol {
 			lp.refactorize(st)
 			lp.recomputeBasics(st)
