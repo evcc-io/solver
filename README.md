@@ -62,8 +62,9 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   batches that degrade the LP numerically; probing implication cuts
   (CglProbing as a cut generator) on large instances, with slackened
   implied bounds so propagation drift can never cut off the optimum;
-  slack cuts are dropped before the tree so only root-active rows ride
-  into node re-solves.
+  TwoMIR-lite cuts (sparse pairwise tableau-row aggregations through the
+  MIR derivation) on large instances; slack cuts are dropped before the
+  tree so only root-active rows ride into node re-solves.
 - **Branch and bound**: best-first with depth-first plunging, warm-started
   child bases, node-level bound propagation on branching, monotone bound
   propagation, bound-based optimality proof at exit, reduced-cost fixing
@@ -80,27 +81,26 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   face — proves optimality outright on degenerate alternate-optima
   instances), RENS, feasibility pump, batch rounding dive, RINS-lite;
   heuristic bursts are time-boxed so the tree keeps its budget.
-- **Anti-stalling**: full Bland's rule (entering and leaving) after a
-  degenerate streak, plus Clp-style bound perturbation in cold solves
-  with clean-bound restoration.
+- **Anti-degeneracy**: EXPAND (Gill et al.) on the primal ratio test —
+  expanding working bounds with a guaranteed minimum step, exact
+  snap-back at refactorization and a cleanup re-price before concluding;
+  full Bland's rule (entering and leaving) after a degenerate streak;
+  Clp-style bound perturbation in cold solves with clean-bound restore.
 - **CLI**: honors the flags PuLP sends (`-max`, `-sec`, `-ratio`,
   `-allow`, `-maxNodes`, `-solve`, `-initialSolve`, `-solution`);
   unrecognized flags are consumed tolerantly.
 
 ## Missing vs. real CBC
 
-- **Cut families beyond GMI and probing**: no knapsack cover, clique,
-  flow-cover, or lift-and-project cuts; no cuts below the root. Aggregated
-  MIR/TwoMir was prototyped but shelved: valid violated aggregates grind
-  the current simplex (needs the Harris/EXPAND work below first).
+- **Cut families beyond GMI, probing and pairwise TwoMIR**: no knapsack
+  cover, clique, flow-cover, or lift-and-project cuts; no multi-row
+  aggregation beyond pairs; no cuts below the root.
 - **No CglPreProcess-style reductions**: presolve tightens bounds and
   coefficients but never eliminates rows/columns, so node LPs stay large
   (real CBC works on a ~4x smaller reduced model for these instances).
 - **`-mips <file>` warm start is parsed but not wired** to
   `Model.MIPStart`, so `warmStart=True` in PuLP buys nothing yet.
 - **No multi-threaded search.** `-threads N` is accepted, ignored.
-- **No Harris ratio test / EXPAND**: degenerate stalling is handled by
-  Bland's rule and bound perturbation instead.
 - **Format gaps**: free-format MPS only; no `OBJSENSE` section (sense
   comes from `-max`, as PuLP conveys it); the negative-`UP`-bound MPS
   convention is not implemented. PuLP never exercises any of these.
