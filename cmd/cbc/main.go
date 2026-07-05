@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"cbcgo/mip"
 	"cbcgo/mps"
@@ -62,7 +63,7 @@ func run(args []string) error {
 			mipsFile = next()
 		case "sec":
 			if v, err := strconv.ParseFloat(next(), 64); err == nil {
-				limits.MaxSeconds = v
+				limits.MaxTime = time.Duration(v * float64(time.Second))
 			}
 		case "ratio":
 			if v, err := strconv.ParseFloat(next(), 64); err == nil {
