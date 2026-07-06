@@ -135,6 +135,38 @@ func linkVar(p *problem.Problem, r1, r2 int) int {
 // divisor/complement search, and adds violated cuts. Returns rows added.
 var cmirDbg struct{ windows, bails, derives, noBin, f0rej, violrej int }
 
+// rowMIRCuts derives single-row MIR cuts (CglMixedIntegerRounding2-style)
+// from the first nRows original rows: no aggregation, just VUB/bound
+// substitution and the divisor search on each row in both directions.
+func (mo *Model) rowMIRCuts(x []float64, nRows int) int {
+	p := mo.P
+	vubs := mo.detectVUBs()
+	cmirDbg = struct{ windows, bails, derives, noBin, f0rej, violrej int }{}
+	added := 0
+	agg := map[int]float64{}
+	for ri := 0; ri < nRows && added < maxCutsPer; ri++ {
+		r := &p.Rows[ri]
+		clear(agg)
+		for pos, j := range r.Idx {
+			agg[j] += r.Coef[pos]
+		}
+		rl, ru := r.Bounds()
+		if ru < problem.Inf {
+			if mo.cmirDerive(agg, ru, 1, vubs, x) {
+				added++
+			}
+		}
+		if rl > -problem.Inf {
+			if mo.cmirDerive(agg, rl, -1, vubs, x) {
+				added++
+			}
+		}
+	}
+	debugf("rowmir: vubs=%d derives=%d noBin=%d f0rej=%d violrej=%d added=%d",
+		len(vubs), cmirDbg.derives, cmirDbg.noBin, cmirDbg.f0rej, cmirDbg.violrej, added)
+	return added
+}
+
 func (mo *Model) cmirCuts(x []float64) int {
 	vubs := mo.detectVUBs()
 	if len(vubs) == 0 {
