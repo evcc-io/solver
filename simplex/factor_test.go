@@ -173,3 +173,72 @@ func TestFactorEtaUpdate(t *testing.T) {
 		}
 	}
 }
+
+// TestBtranSparseMatchesDense checks the activation-guarded btran against
+// the dense path bitwise on sparse right-hand sides (unit vectors included).
+func TestBtranSparseMatchesDense(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	for trial := range 40 {
+		m := 150 + rng.Intn(150)
+		colRow, colVal := randomBasis(rng, m)
+		f := factorize(m, identCols(m), colRow, colVal, nil)
+		if f == nil {
+			continue
+		}
+		for sub := range 20 {
+			w := make([]float64, m)
+			nnz := 1 + rng.Intn(m/12) // always below the m/10 cutover
+			for range nnz {
+				w[rng.Intn(m)] = rng.NormFloat64()
+			}
+			dense := append([]float64(nil), w...)
+			f.btranSparse(w)
+			got := append([]float64(nil), w...)
+			// dense reference: run the tail of btran directly
+			y := make([]float64, m)
+			for _, tp := range f.bwd {
+				s := dense[tp.pos]
+				cr, cv := f.tblRow[f.cols[tp.pos]], f.tblVal[f.cols[tp.pos]]
+				for k, r := range cr {
+					if r != tp.row {
+						s -= cv[k] * y[r]
+					}
+				}
+				y[tp.row] = s / tp.a
+			}
+			if k := len(f.kRows); k > 0 {
+				kw := make([]float64, k)
+				for ki, pos := range f.kPos {
+					s := dense[pos]
+					cr, cv := f.tblRow[f.cols[pos]], f.tblVal[f.cols[pos]]
+					for kk, r := range cr {
+						if f.rowKIdx[r] < 0 {
+							s -= cv[kk] * y[r]
+						}
+					}
+					kw[ki] = s
+				}
+				f.klu.solveT(kw)
+				for ki, r := range f.kRows {
+					y[r] = kw[ki]
+				}
+			}
+			for i := len(f.fwd) - 1; i >= 0; i-- {
+				tp := f.fwd[i]
+				s := dense[tp.pos]
+				cr, cv := f.tblRow[f.cols[tp.pos]], f.tblVal[f.cols[tp.pos]]
+				for k, r := range cr {
+					if r != tp.row {
+						s -= cv[k] * y[r]
+					}
+				}
+				y[tp.row] = s / tp.a
+			}
+			for i := range m {
+				if got[i] != y[i] && !(got[i] == 0 && y[i] == 0) {
+					t.Fatalf("trial %d/%d m=%d row %d: sparse %v dense %v", trial, sub, m, i, got[i], y[i])
+				}
+			}
+		}
+	}
+}

@@ -89,6 +89,9 @@ type LP struct {
 
 	// run/recomputeBasics per-call vectors, reused (single-threaded)
 	runCost, runY, runA, residual []float64
+	// pivot's eta staging, copied into exact-size arrays per eta
+	etaIdxWS []int32
+	etaValWS []float64
 
 	// Stats accumulates pivot counts across solves (diagnostics only).
 	Stats struct {
@@ -1016,17 +1019,13 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 	if t < 0 {
 		t = 0
 	}
-	// update all basic values
-	for i := range lp.m {
-		if a[i] == 0 {
-			continue
-		}
-		st.value[st.basicOf[i]] -= a[i] * dir * t
-	}
-	oldVal := st.value[q]
-	st.value[q] = oldVal + dir*t
-
 	if isFlip {
+		for i := range lp.m {
+			if a[i] == 0 {
+				continue
+			}
+			st.value[st.basicOf[i]] -= a[i] * dir * t
+		}
 		if dir > 0 {
 			st.status[q] = atUpper
 			st.value[q] = lp.ub[q]
@@ -1036,6 +1035,25 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 		}
 		return
 	}
+
+	// one pass over alpha updates basic values and stages the eta support;
+	// exact-size copies follow (etas outlive the pivot, scratch does not)
+	if cap(lp.etaIdxWS) < lp.m {
+		lp.etaIdxWS = make([]int32, 0, lp.m)
+		lp.etaValWS = make([]float64, 0, lp.m)
+	}
+	wsIdx, wsVal := lp.etaIdxWS[:0], lp.etaValWS[:0]
+	for i, v := range a[:lp.m] {
+		if v == 0 {
+			continue
+		}
+		st.value[st.basicOf[i]] -= v * dir * t
+		if math.Abs(v) > etaDropTol {
+			wsIdx = append(wsIdx, int32(i))
+			wsVal = append(wsVal, v)
+		}
+	}
+	st.value[q] += dir * t
 
 	leaving := st.basicOf[leaveRow]
 	// snap the leaving variable exactly onto the bound it reached to avoid
@@ -1049,22 +1067,10 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 		st.value[leaving] = ub
 	}
 
-	// product-form update: alpha is exactly the eta for this basis change;
-	// counting first sizes the arrays exactly (etas outlive the pivot)
-	nnz := 0
-	for _, v := range a {
-		if math.Abs(v) > etaDropTol {
-			nnz++
-		}
-	}
-	idx := make([]int32, 0, nnz)
-	val := make([]float64, 0, nnz)
-	for i, v := range a {
-		if math.Abs(v) > etaDropTol {
-			idx = append(idx, int32(i))
-			val = append(val, v)
-		}
-	}
+	idx := make([]int32, len(wsIdx))
+	val := make([]float64, len(wsVal))
+	copy(idx, wsIdx)
+	copy(val, wsVal)
 	st.etas = append(st.etas, &eta{r: leaveRow, idx: idx, val: val, ar: a[leaveRow]})
 	st.basicOf[leaveRow] = q
 	st.status[q] = basic

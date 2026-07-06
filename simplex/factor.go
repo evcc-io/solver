@@ -13,7 +13,7 @@ const (
 // triPivot resolves one variable by substitution: basis position pos pivots
 // on row row with diagonal a.
 type triPivot struct {
-	pos, row int
+	pos, row int32
 	a        float64
 }
 
@@ -39,27 +39,44 @@ type factor struct {
 	kRows   []int      // kernel rows (original indices)
 	kPos    []int      // kernel basis positions
 	klu     *sparseLU  // sparse LU of the kernel
-	rowKIdx []int      // row -> kernel row index, -1 otherwise
+	rowKIdx []int32    // row -> kernel row index, -1 otherwise
 
-	// solve scratch, reused across calls (solver is single-threaded);
-	// per-call make() showed up as ~8% madvise in profiles
-	xScratch, kScratch []float64
+	// btran activation graph in solve order (bwd, kernel, reversed fwd):
+	// a pivot runs only when its w entry or an earlier written row feeds it
+	posSeq  []int32 // basis position -> pivot seq
+	rdrHead []int32 // row -> [rdrHead[r], rdrHead[r+1]) into rdrList
+	rdrList []int32 // pivot seqs whose column reads that row
+
+	ws *factorWS // shared per-LP solve scratch (solver is single-threaded)
 }
 
-// factorWS holds factorize's reusable working arrays; nil means allocate
-// fresh (the solver is single-threaded, so one per LP suffices).
+// factorWS holds factorize's reusable working arrays plus the solve-time
+// scratch shared by every factor of one LP; nil means allocate fresh (the
+// solver is single-threaded, so one per LP suffices).
 type factorWS struct {
 	rowCount, colCount   []int
 	rowActive, colActive []bool
 	rowCols              [][]int32
 	queue                []int
+
+	// solve scratch: xScratch/kScratch are per-call temporaries; ySolve
+	// stays all-zero between btranSparse calls (written-rows restore);
+	// actGen+gen are the epoch-stamped activation flags
+	xScratch, kScratch, ySolve []float64
+	actGen                     []int32
+	written                    []int32
+	gen                        int32
 }
 
 func newFactorWS(m int) *factorWS {
+	fbuf := make([]float64, 3*m)
+	ibuf := make([]int32, 2*m+1)
 	return &factorWS{
 		rowCount: make([]int, m), colCount: make([]int, m),
 		rowActive: make([]bool, m), colActive: make([]bool, m),
 		rowCols: make([][]int32, m), queue: make([]int, 0, m),
+		xScratch: fbuf[:m], kScratch: fbuf[m : 2*m], ySolve: fbuf[2*m:],
+		actGen: ibuf[: m+1 : m+1], written: ibuf[m+1:][:0],
 	}
 }
 
@@ -133,7 +150,7 @@ func factorize(m int, cols []int32, tblRow [][]int32, tblVal [][]float64, ws *fa
 		if math.Abs(a) < pivotTol {
 			continue // leave to the kernel
 		}
-		f.fwd = append(f.fwd, triPivot{pos, r, a})
+		f.fwd = append(f.fwd, triPivot{int32(pos), int32(r), a})
 		rowActive[r], colActive[pos] = false, false
 		colRow, colVal := tblRow[cols[pos]], tblVal[cols[pos]]
 		for k, rr := range colRow {
@@ -183,7 +200,7 @@ func factorize(m int, cols []int32, tblRow [][]int32, tblVal [][]float64, ws *fa
 		if row < 0 {
 			continue
 		}
-		f.bwd = append(f.bwd, triPivot{pos, row, a})
+		f.bwd = append(f.bwd, triPivot{int32(pos), int32(row), a})
 		rowActive[row], colActive[pos] = false, false
 		for _, p := range rowCols[row] {
 			if colActive[p] {
@@ -196,13 +213,13 @@ func factorize(m int, cols []int32, tblRow [][]int32, tblVal [][]float64, ws *fa
 	}
 
 	// kernel: whatever remains, inverted densely
-	f.rowKIdx = make([]int, m)
+	f.rowKIdx = make([]int32, m)
 	for i := range f.rowKIdx {
 		f.rowKIdx[i] = -1
 	}
 	for r := range m {
 		if rowActive[r] {
-			f.rowKIdx[r] = len(f.kRows)
+			f.rowKIdx[r] = int32(len(f.kRows))
 			f.kRows = append(f.kRows, r)
 		}
 	}
@@ -245,15 +262,86 @@ func factorize(m int, cols []int32, tblRow [][]int32, tblVal [][]float64, ws *fa
 			return nil
 		}
 	}
-	buf := make([]float64, m+k)
-	f.xScratch, f.kScratch = buf[:m], buf[m:]
+	f.ws = ws
+	f.buildBtranGraph()
 	return f
+}
+
+// buildBtranGraph assigns each pivot its btran solve-order seq and builds
+// the row -> reader-pivots CSR used to activate only reachable pivots.
+func (f *factor) buildBtranGraph() {
+	m, nb, nf := f.m, len(f.bwd), len(f.fwd)
+	kernelSeq := int32(nb)
+	// one arena for the graph's fixed-size int32 arrays
+	arena := make([]int32, m+(m+1))
+	f.posSeq = arena[:m:m]
+	head := arena[m:]
+
+	for i, tp := range f.bwd {
+		f.posSeq[tp.pos] = int32(i)
+	}
+	for _, pos := range f.kPos {
+		f.posSeq[pos] = kernelSeq
+	}
+	for i, tp := range f.fwd {
+		f.posSeq[tp.pos] = int32(nb + 1 + (nf - 1 - i))
+	}
+
+	countTri := func(tri []triPivot) {
+		for _, tp := range tri {
+			for _, r := range f.tblRow[f.cols[tp.pos]] {
+				if r != tp.row {
+					head[r+1]++
+				}
+			}
+		}
+	}
+	countTri(f.fwd)
+	countTri(f.bwd)
+	for _, pos := range f.kPos {
+		for _, r := range f.tblRow[f.cols[pos]] {
+			if f.rowKIdx[r] < 0 {
+				head[r+1]++
+			}
+		}
+	}
+	for r := range m {
+		head[r+1] += head[r]
+	}
+	// cursorless CSR fill: advance head[r] itself, then shift it back
+	list := make([]int32, head[m])
+	fillTri := func(tri []triPivot, seqOf func(i int) int32) {
+		for i, tp := range tri {
+			s := seqOf(i)
+			for _, r := range f.tblRow[f.cols[tp.pos]] {
+				if r != tp.row {
+					list[head[r]] = s
+					head[r]++
+				}
+			}
+		}
+	}
+	fillTri(f.bwd, func(i int) int32 { return int32(i) })
+	fillTri(f.fwd, func(i int) int32 { return int32(nb + 1 + (nf - 1 - i)) })
+	for _, pos := range f.kPos {
+		for _, r := range f.tblRow[f.cols[pos]] {
+			if f.rowKIdx[r] < 0 {
+				list[head[r]] = kernelSeq
+				head[r]++
+			}
+		}
+	}
+	for r := m; r > 0; r-- {
+		head[r] = head[r-1]
+	}
+	head[0] = 0
+	f.rdrHead, f.rdrList = head, list
 }
 
 // ftranFactor solves B*x = v in place: v becomes x indexed by basis
 // position (x[pos] = multiplier of basic column pos).
 func (f *factor) ftran(v []float64) {
-	x := f.xScratch // by basis position
+	x := f.ws.xScratch // by basis position
 	clear(x)
 	// forward: row singletons
 	for _, tp := range f.fwd {
@@ -270,7 +358,7 @@ func (f *factor) ftran(v []float64) {
 	// kernel
 	k := len(f.kRows)
 	if k > 0 {
-		kv := f.kScratch
+		kv := f.ws.kScratch[:k]
 		for ki, r := range f.kRows {
 			kv[ki] = v[r]
 		}
@@ -305,14 +393,26 @@ func (f *factor) ftran(v []float64) {
 // btran solves B^T*y = w in place: w is indexed by basis position on entry,
 // y by row on exit. Ops are the adjoints of ftran's, in reverse order.
 func (f *factor) btran(w []float64) {
-	y := f.xScratch // by row
+	nnz := 0
+	for _, v := range w[:f.m] {
+		if v != 0 {
+			nnz++
+		}
+	}
+	// hypersparse pay-off needs a mostly-zero rhs; activation bookkeeping
+	// costs about one extra column pass per active pivot
+	if nnz*10 <= f.m {
+		f.btranSparse(w)
+		return
+	}
+	y := f.ws.xScratch // by row
 	clear(y)
 	// adjoint of backward pass, in forward order
 	for _, tp := range f.bwd {
 		s := w[tp.pos]
 		cr, cv := f.tblRow[f.cols[tp.pos]], f.tblVal[f.cols[tp.pos]]
 		for k, r := range cr {
-			if int(r) != tp.row {
+			if r != tp.row {
 				s -= cv[k] * y[r]
 			}
 		}
@@ -321,7 +421,7 @@ func (f *factor) btran(w []float64) {
 	// adjoint of kernel: solve K^T y_K = (w_K - cols^T y_known)
 	k := len(f.kRows)
 	if k > 0 {
-		kw := f.kScratch
+		kw := f.ws.kScratch[:k]
 		for ki, pos := range f.kPos {
 			s := w[pos]
 			cr, cv := f.tblRow[f.cols[pos]], f.tblVal[f.cols[pos]]
@@ -343,13 +443,96 @@ func (f *factor) btran(w []float64) {
 		s := w[tp.pos]
 		cr, cv := f.tblRow[f.cols[tp.pos]], f.tblVal[f.cols[tp.pos]]
 		for k, r := range cr {
-			if int(r) != tp.row {
+			if r != tp.row {
 				s -= cv[k] * y[r]
 			}
 		}
 		y[tp.row] = s / tp.a
 	}
 	copy(w, y)
+}
+
+// btranSparse is btran gathering only activation-reachable pivots; skipped
+// pivots would compute exactly 0, so results match the dense path bitwise.
+func (f *factor) btranSparse(w []float64) {
+	y := f.ws.ySolve // by row, all-zero on entry (restored at exit)
+	f.ws.gen++
+	gen := f.ws.gen
+	act := f.ws.actGen
+	written := f.ws.written[:0]
+	for pos := range f.m {
+		if w[pos] != 0 {
+			act[f.posSeq[pos]] = gen
+		}
+	}
+	mark := func(row int32) {
+		for _, t := range f.rdrList[f.rdrHead[row]:f.rdrHead[row+1]] {
+			act[t] = gen
+		}
+	}
+	for i, tp := range f.bwd {
+		if act[i] != gen {
+			continue
+		}
+		s := w[tp.pos]
+		cr, cv := f.tblRow[f.cols[tp.pos]], f.tblVal[f.cols[tp.pos]]
+		for k, r := range cr {
+			if r != tp.row {
+				s -= cv[k] * y[r]
+			}
+		}
+		if yr := s / tp.a; yr != 0 {
+			y[tp.row] = yr
+			written = append(written, tp.row)
+			mark(tp.row)
+		}
+	}
+	nb := len(f.bwd)
+	if k := len(f.kRows); k > 0 && act[nb] == gen {
+		kw := f.ws.kScratch[:k]
+		for ki, pos := range f.kPos {
+			s := w[pos]
+			cr, cv := f.tblRow[f.cols[pos]], f.tblVal[f.cols[pos]]
+			for kk, r := range cr {
+				if f.rowKIdx[r] < 0 {
+					s -= cv[kk] * y[r]
+				}
+			}
+			kw[ki] = s
+		}
+		f.klu.solveT(kw)
+		for ki, r := range f.kRows {
+			if yr := kw[ki]; yr != 0 {
+				y[r] = yr
+				written = append(written, int32(r))
+				mark(int32(r))
+			}
+		}
+	}
+	nf := len(f.fwd)
+	for si := range nf {
+		if act[nb+1+si] != gen {
+			continue
+		}
+		tp := f.fwd[nf-1-si]
+		s := w[tp.pos]
+		cr, cv := f.tblRow[f.cols[tp.pos]], f.tblVal[f.cols[tp.pos]]
+		for k, r := range cr {
+			if r != tp.row {
+				s -= cv[k] * y[r]
+			}
+		}
+		if yr := s / tp.a; yr != 0 {
+			y[tp.row] = yr
+			written = append(written, tp.row)
+			mark(tp.row)
+		}
+	}
+	copy(w, y)
+	for _, r := range written {
+		y[r] = 0
+	}
+	f.ws.written = written
 }
 
 // applyEtas maps x = Binv_factor*v to Binv_current*v (FTRAN direction).
