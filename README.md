@@ -67,9 +67,12 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   refactorization. No dense inverse. Per-factor data is int32-compacted
   and arena-consolidated, and all solve scratch is shared per LP, so a
   refactorization costs a handful of allocations instead of a dozen.
-- **Presolve**: iterated activity-based bound tightening, big-M
-  coefficient tightening for binaries, and CglProbing-style binary probing
-  (infeasibility fixing plus integer-only merged implied bounds).
+- **Presolve**: activity-based bound tightening run to fixpoint via a
+  row worklist, big-M coefficient tightening for binaries,
+  CglProbing-style binary probing (infeasibility fixing plus
+  integer-only merged implied bounds), and singleton-column elimination
+  (costed continuous singletons that pin their row or sit at a bound
+  are substituted out and reconstructed exactly at postsolve).
 - **Cuts**: Gomory mixed-integer cuts at the root, with support/dynamism
   hygiene, and retraction (with retries) of batches that degrade the LP
   numerically; rounds are budgeted in pivots (speed-invariant work
@@ -134,9 +137,11 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   mostly-zero right-hand sides and FTRAN skips zero pivots naturally,
   but there is no Clp-style hypersparse bookkeeping across the eta file
   (measured ~20% result density bounds the further payoff).
-- **No CglPreProcess-style reductions**: presolve tightens bounds and
-  coefficients but never eliminates rows/columns, so node LPs stay large
-  (real CBC works on a ~4x smaller reduced model for these instances).
+- **Partial CglPreProcess-style reductions**: singleton columns are
+  eliminated, but rows never are, and the evcc instances' singletons are
+  penalty slacks (cost fights the row — a `max(0, ·)` term no linear
+  presolve can remove), so node LPs stay large on them (real CBC works
+  on a ~4x smaller reduced model via row aggregation).
 - **`-mips <file>` warm start is parsed but not wired** to
   `Model.MIPStart`, so `warmStart=True` in PuLP buys nothing yet.
 - **No multi-threaded search.** `-threads N` is accepted, ignored.
