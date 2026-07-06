@@ -62,18 +62,28 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   target instances it trades the tuned root trajectory for no bound
   gain.
 - **Basis factorization**: singleton triangularization with a sparse-LU
-  kernel and product-form (eta) updates — O(nnz) pivots, periodic
-  refactorization. No dense inverse.
+  kernel (in-place row elimination, counted arenas — allocation-free on
+  the hot path) and product-form (eta) updates — O(nnz) pivots, periodic
+  refactorization. No dense inverse. Per-factor data is int32-compacted
+  and arena-consolidated, and all solve scratch is shared per LP, so a
+  refactorization costs a handful of allocations instead of a dozen.
 - **Presolve**: iterated activity-based bound tightening, big-M
   coefficient tightening for binaries, and CglProbing-style binary probing
   (infeasibility fixing plus integer-only merged implied bounds).
 - **Cuts**: Gomory mixed-integer cuts at the root, with support/dynamism
-  hygiene, bound-driven round control, and retraction (with retries) of
-  batches that degrade the LP numerically; probing implication cuts
+  hygiene, and retraction (with retries) of batches that degrade the LP
+  numerically; rounds are budgeted in pivots (speed-invariant work
+  units), so the cut set is a deterministic function of the problem and
+  survives engine speed changes — wall clock only remains as a safety
+  cap; probing implication cuts
   (CglProbing as a cut generator) on large instances, with slackened
   implied bounds so propagation drift can never cut off the optimum;
   TwoMIR-lite cuts (sparse pairwise tableau-row aggregations through the
-  MIR derivation) on large instances; slack cuts are dropped before the
+  MIR derivation) on large instances; single-row MIR cuts
+  (CglMixedIntegerRounding2-style, VUB/bound substitution with a divisor
+  search) seed the first two rounds on large instances — later MIR
+  rounds are measured-negative (row bloat, face drift); slack cuts are
+  dropped before the
   tree so only root-active rows ride into node re-solves.
 - **Branch and bound**: best-first with depth-first plunging, warm-started
   child bases, node-level bound propagation on branching, monotone bound
@@ -87,12 +97,14 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   the incumbent fixes the variable at the node without spending a
   branch; pseudocost selection deeper (reliability-branching shape).
 - **Heuristics**: caller-provided MIP start (`mip.Model.MIPStart`,
-  completed before the cut loop so reduced-cost fixing bites), 1-opt
-  incumbent polish (CbcHeuristicLocal-style binary flips via warm dual
-  re-solves), face walk (least-degradation dive along the LP-optimal
+  completed via a warm child solve before the cut loop so reduced-cost
+  fixing bites; the trivial start is deliberately not polished — measured
+  as pure pivot burn), 1-opt incumbent polish on real tree incumbents
+  (CbcHeuristicLocal-style binary flips via warm dual re-solves), face walk (least-degradation dive along the LP-optimal
   face — proves optimality outright on degenerate alternate-optima
   instances), RENS, feasibility pump, batch rounding dive, RINS-lite
-  with exponential failure backoff; heuristic bursts are time-boxed
+  warm-started from the node's own basis, with exponential failure
+  backoff; heuristic bursts are time-boxed
   (root MaxTime/3, deeper MaxTime/8) and skipped once the incumbent
   sits near the node bound, so the tree keeps its budget.
 - **Anti-degeneracy**: EXPAND (Gill et al.) on the primal ratio test —
@@ -106,9 +118,9 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 
 ## Missing vs. real CBC
 
-- **Cut families beyond GMI, probing and pairwise TwoMIR**: no knapsack
-  cover, clique, flow-cover, or lift-and-project cuts; no cuts below
-  the root. A sound multi-row c-MIR generator (equality-chain
+- **Cut families beyond GMI, probing, single-row MIR and pairwise
+  TwoMIR**: no knapsack cover, clique, flow-cover, or lift-and-project
+  cuts; no cuts below the root. A sound multi-row c-MIR generator (equality-chain
   aggregation with exact variable-bound substitution, property-tested)
   exists in `mip/cmir.go` but stays unwired: measured on the target
   instances it separates nothing that GMI + probing have not already
@@ -117,10 +129,11 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   violated row (plus the revisit tabu) instead of dual steepest edge,
   and runs unperturbed. The Clp-style engine (DSE, Harris ratio test,
   cost perturbation — `simplex/dual2.go`) is property-tested but gated
-  off as measured-negative on the target instances. FTRAN/BTRAN are
-  always dense-vector solves; Clp's hypersparse triangular solves are
-  not implemented (measured ~20% result density here, so the payoff is
-  bounded).
+  off as measured-negative on the target instances. BTRAN is hypersparse
+  (activation-graph guarded, bitwise-identical to the dense path) for
+  mostly-zero right-hand sides and FTRAN skips zero pivots naturally,
+  but there is no Clp-style hypersparse bookkeeping across the eta file
+  (measured ~20% result density bounds the further payoff).
 - **No CglPreProcess-style reductions**: presolve tightens bounds and
   coefficients but never eliminates rows/columns, so node LPs stay large
   (real CBC works on a ~4x smaller reduced model for these instances).
