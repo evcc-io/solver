@@ -24,6 +24,16 @@ type sparseLU struct {
 func luFactorize(k int, colIdx [][]int32, colVal [][]float64) *sparseLU {
 	rowIdx := make([][]int32, k)
 	rowVal := make([][]float64, k)
+	cnt := make([]int, k)
+	for c := range k {
+		for _, r := range colIdx[c] {
+			cnt[r]++
+		}
+	}
+	for r := range k {
+		rowIdx[r] = make([]int32, 0, cnt[r])
+		rowVal[r] = make([]float64, 0, cnt[r])
+	}
 	for c := range k {
 		for t, r := range colIdx[c] {
 			rowIdx[r] = append(rowIdx[r], int32(c))
@@ -48,6 +58,7 @@ func luFactorize(k int, colIdx [][]int32, colVal [][]float64) *sparseLU {
 	}
 
 	acc := make([]float64, k)
+	mark := make([]bool, k) // pivot-row cols seen in the current row's scan
 	touched := make([]int32, 0, k)
 
 	for step := range k {
@@ -120,40 +131,36 @@ func luFactorize(k int, colIdx [][]int32, colVal [][]float64) *sparseLU {
 			lu.lIdx[step] = append(lu.lIdx[step], int32(rr))
 			lu.lVal[step] = append(lu.lVal[step], mult)
 
-			nIdx := make([]int32, 0, len(rowIdx[rr])+len(touched))
-			nVal := make([]float64, 0, len(rowIdx[rr])+len(touched))
-			for t, c := range rowIdx[rr] {
+			// rewrite the row in place: the write index never passes the
+			// read index, and fill-in only appends after the scan
+			row, val := rowIdx[rr], rowVal[rr]
+			w := 0
+			for t, c := range row {
 				if c == pc || colUsed[c] {
 					continue
 				}
-				v := rowVal[rr][t]
+				v := val[t]
 				if a := acc[c]; a != 0 {
 					v -= mult * a
+					mark[c] = true
 				}
 				if math.Abs(v) > etaDropTol {
-					nIdx = append(nIdx, c)
-					nVal = append(nVal, v)
+					row[w], val[w] = c, v
+					w++
 				}
 			}
-			// fill-in: pivot-row cols absent from row rr
+			row, val = row[:w], val[:w]
+			// fill-in: pivot-row cols absent from the original row rr
 			for _, c := range touched {
-				if a := acc[c]; a != 0 {
-					found := false
-					for _, cc := range rowIdx[rr] {
-						if cc == c {
-							found = true
-							break
-						}
-					}
-					if !found {
-						if v := -mult * a; math.Abs(v) > etaDropTol {
-							nIdx = append(nIdx, c)
-							nVal = append(nVal, v)
-						}
+				if a := acc[c]; a != 0 && !mark[c] {
+					if v := -mult * a; math.Abs(v) > etaDropTol {
+						row = append(row, c)
+						val = append(val, v)
 					}
 				}
+				mark[c] = false
 			}
-			rowIdx[rr], rowVal[rr] = nIdx, nVal
+			rowIdx[rr], rowVal[rr] = row, val
 		}
 		for _, c := range touched {
 			acc[c] = 0

@@ -289,6 +289,11 @@ func propagate(p *problem.Problem, lb, ub []float64) bool {
 // infeasible side fixes the binary; otherwise merged implied bounds apply.
 // Effort is time-boxed: partial results are valid tightenings.
 func probe(p *problem.Problem, deadline time.Time) {
+	nFix, nTight, nProbed := 0, 0, 0
+	t0 := time.Now()
+	defer func() {
+		debugf("probe: %d binaries probed, %d fixed, %d bounds tightened in %v", nProbed, nFix, nTight, time.Since(t0))
+	}()
 	n := len(p.Cols)
 	base := make([]float64, 2*n)
 	lb0, ub0 := make([]float64, n), make([]float64, n)
@@ -303,6 +308,7 @@ func probe(p *problem.Problem, deadline time.Time) {
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			return
 		}
+		nProbed++
 		copy(lb0, base[:n])
 		copy(ub0, base[n:])
 		copy(lb1, base[:n])
@@ -317,9 +323,11 @@ func probe(p *problem.Problem, deadline time.Time) {
 		case !feas0:
 			p.Cols[j].LB = 1
 			base[j] = 1
+			nFix++
 		case !feas1:
 			p.Cols[j].UB = 0
 			base[n+j] = 0
+			nFix++
 		default:
 			// merged implied bounds only for integer columns: continuous
 			// merges compound propagation drift into a collapse cascade
@@ -330,10 +338,12 @@ func probe(p *problem.Problem, deadline time.Time) {
 				if l := math.Min(lb0[i], lb1[i]); l > base[i]+1e-9 {
 					p.Cols[i].LB = l
 					base[i] = l
+					nTight++
 				}
 				if u := math.Max(ub0[i], ub1[i]); u < base[n+i]-1e-9 {
 					p.Cols[i].UB = u
 					base[n+i] = u
+					nTight++
 				}
 			}
 		}
