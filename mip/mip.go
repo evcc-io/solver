@@ -88,6 +88,7 @@ type Model struct {
 	Limits        Limits
 	MIPStart      []float64       // optional structural start point; ints get fixed
 	SkipProbing   bool            // restart passes re-derive identical probe facts
+	red           *reduction      // singleton elimination; nil when none applied
 	live          []boundOverride // bounds currently applied to LP; see solveNode
 	rcTouched     []int           // columns tightened by reducedCostFix
 	bestXSnapshot []float64       // incumbent X for the RINS neighborhood
@@ -180,6 +181,10 @@ func SolveRelaxation(p *problem.Problem) Result {
 
 func (m *Model) Solve() Result {
 	t0 := time.Now()
+	// restart calls pass an original-space MIP start; map it down
+	if m.red != nil && len(m.MIPStart) == len(m.red.orig.Cols) {
+		m.MIPStart = m.red.shrinkX(m.MIPStart)
+	}
 	mark := func(phase string) {
 		st := m.LP.Stats
 		debugf("phase: %s at %v (solves %d, pivots %d)", phase, time.Since(t0).Round(time.Millisecond), st.Solves, st.Phase1+st.Phase2+st.Dual)
@@ -200,6 +205,12 @@ func (m *Model) Solve() Result {
 		}
 		probe(m.P, probeDeadline)
 		presolve(m.P)
+		if q, red := eliminateSingletons(m.P); red != nil {
+			m.P, m.red = q, red
+			if len(m.MIPStart) == len(red.orig.Cols) {
+				m.MIPStart = red.shrinkX(m.MIPStart)
+			}
+		}
 		m.LP = simplex.Build(m.P)
 		m.LP.Deadline = deadline
 	}
@@ -653,6 +664,9 @@ func (m *Model) Solve() Result {
 			res.RowPrice = res.RowPrice[:origRows]
 		}
 		res.Obj = bestInternal * m.P.ObjSense
+	}
+	if m.red != nil {
+		m.red.expand(&res)
 	}
 	return res
 }
