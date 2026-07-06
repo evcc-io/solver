@@ -175,111 +175,122 @@ func setCoef(p *problem.Problem, ri, k int, v float64) {
 	}
 }
 
-// propagate tightens the working bound slices from row activity ranges,
-// iterating to a fixpoint; reports false when some row proves infeasible.
+// propagate tightens the working bounds via a row worklist run to fixpoint
+// (order-independent: bounds only shrink); false when a row is infeasible.
 func propagate(p *problem.Problem, lb, ub []float64) bool {
 	inf := problem.Inf
-	for range 4 {
-		changed := false
-		for ri := range p.Rows {
-			r := &p.Rows[ri]
-			rlb, rub := r.Bounds()
-			var minSum, maxSum float64
-			var minInf, maxInf int
-			for k, j := range r.Idx {
-				a := r.Coef[k]
-				l, u := lb[j], ub[j]
-				if l <= -inf {
-					l = math.Inf(-1)
-				}
-				if u >= inf {
-					u = math.Inf(1)
-				}
-				lo, hi := a*l, a*u
-				if a < 0 {
-					lo, hi = hi, lo
-				}
-				if math.IsInf(lo, -1) {
-					minInf++
-				} else {
-					minSum += lo
-				}
-				if math.IsInf(hi, 1) {
-					maxInf++
-				} else {
-					maxSum += hi
-				}
+	nr := len(p.Rows)
+	inQ := make([]bool, nr)
+	queue := make([]int, nr)
+	for ri := range queue {
+		queue[ri] = ri
+		inQ[ri] = true
+	}
+	// the 1e-9 improvement floor guarantees termination; the cap only
+	// guards zeno chains, and a capped exit is still a valid tightening
+	for done := 0; len(queue) > 0 && done < 64*nr; done++ {
+		ri := queue[0]
+		queue = queue[1:]
+		inQ[ri] = false
+		r := &p.Rows[ri]
+		rlb, rub := r.Bounds()
+		var minSum, maxSum float64
+		var minInf, maxInf int
+		for k, j := range r.Idx {
+			a := r.Coef[k]
+			l, u := lb[j], ub[j]
+			if l <= -inf {
+				l = math.Inf(-1)
 			}
-			// row-level infeasibility against the activity range
-			scale := math.Max(1, math.Max(math.Abs(minSum), math.Abs(maxSum)))
-			if minInf == 0 && rub < inf && minSum > rub+1e-7*scale {
-				return false
+			if u >= inf {
+				u = math.Inf(1)
 			}
-			if maxInf == 0 && rlb > -inf && maxSum < rlb-1e-7*scale {
-				return false
+			lo, hi := a*l, a*u
+			if a < 0 {
+				lo, hi = hi, lo
 			}
-			for k, j := range r.Idx {
-				a := r.Coef[k]
-				if a == 0 {
-					continue
-				}
-				l, u := lb[j], ub[j]
-				lf, uf := l, u
-				if lf <= -inf {
-					lf = math.Inf(-1)
-				}
-				if uf >= inf {
-					uf = math.Inf(1)
-				}
-				lo, hi := a*lf, a*uf
-				if a < 0 {
-					lo, hi = hi, lo
-				}
-				omin, omax := math.Inf(-1), math.Inf(1)
-				if minInf == 0 {
-					omin = minSum - lo
-				} else if minInf == 1 && math.IsInf(lo, -1) {
-					omin = minSum
-				}
-				if maxInf == 0 {
-					omax = maxSum - hi
-				} else if maxInf == 1 && math.IsInf(hi, 1) {
-					omax = maxSum
-				}
-				// derived bounds are rounded OUTWARD by the row's error
-				// scale: inward drift compounds along equality chains
-				out := 1e-9 * scale / math.Max(math.Abs(a), 1e-12)
-				nl, nu := l, u
-				if rub < inf && !math.IsInf(omin, -1) {
-					if a > 0 {
-						nu = math.Min(nu, (rub-omin)/a+out)
-					} else {
-						nl = math.Max(nl, (rub-omin)/a-out)
-					}
-				}
-				if rlb > -inf && !math.IsInf(omax, 1) {
-					if a > 0 {
-						nl = math.Max(nl, (rlb-omax)/a-out)
-					} else {
-						nu = math.Min(nu, (rlb-omax)/a+out)
-					}
-				}
-				if p.Cols[j].Integer {
-					s := 1e-7 * math.Max(1, math.Max(math.Abs(nl), math.Abs(nu)))
-					nl = math.Ceil(nl - s)
-					nu = math.Floor(nu + s)
-				}
-				if nl > nu+1e-7*math.Max(1, math.Abs(nl)) {
-					return false
-				}
-				if nl > l+1e-9 || nu < u-1e-9 {
-					lb[j], ub[j] = math.Max(l, nl), math.Min(u, nu)
-					changed = true
-				}
+			if math.IsInf(lo, -1) {
+				minInf++
+			} else {
+				minSum += lo
+			}
+			if math.IsInf(hi, 1) {
+				maxInf++
+			} else {
+				maxSum += hi
 			}
 		}
-		if !changed {
-			return true
+		// row-level infeasibility against the activity range
+		scale := math.Max(1, math.Max(math.Abs(minSum), math.Abs(maxSum)))
+		if minInf == 0 && rub < inf && minSum > rub+1e-7*scale {
+			return false
+		}
+		if maxInf == 0 && rlb > -inf && maxSum < rlb-1e-7*scale {
+			return false
+		}
+		for k, j := range r.Idx {
+			a := r.Coef[k]
+			if a == 0 {
+				continue
+			}
+			l, u := lb[j], ub[j]
+			lf, uf := l, u
+			if lf <= -inf {
+				lf = math.Inf(-1)
+			}
+			if uf >= inf {
+				uf = math.Inf(1)
+			}
+			lo, hi := a*lf, a*uf
+			if a < 0 {
+				lo, hi = hi, lo
+			}
+			omin, omax := math.Inf(-1), math.Inf(1)
+			if minInf == 0 {
+				omin = minSum - lo
+			} else if minInf == 1 && math.IsInf(lo, -1) {
+				omin = minSum
+			}
+			if maxInf == 0 {
+				omax = maxSum - hi
+			} else if maxInf == 1 && math.IsInf(hi, 1) {
+				omax = maxSum
+			}
+			// derived bounds are rounded OUTWARD by the row's error
+			// scale: inward drift compounds along equality chains
+			out := 1e-9 * scale / math.Max(math.Abs(a), 1e-12)
+			nl, nu := l, u
+			if rub < inf && !math.IsInf(omin, -1) {
+				if a > 0 {
+					nu = math.Min(nu, (rub-omin)/a+out)
+				} else {
+					nl = math.Max(nl, (rub-omin)/a-out)
+				}
+			}
+			if rlb > -inf && !math.IsInf(omax, 1) {
+				if a > 0 {
+					nl = math.Max(nl, (rlb-omax)/a-out)
+				} else {
+					nu = math.Min(nu, (rlb-omax)/a+out)
+				}
+			}
+			if p.Cols[j].Integer {
+				s := 1e-7 * math.Max(1, math.Max(math.Abs(nl), math.Abs(nu)))
+				nl = math.Ceil(nl - s)
+				nu = math.Floor(nu + s)
+			}
+			if nl > nu+1e-7*math.Max(1, math.Abs(nl)) {
+				return false
+			}
+			if nl > l+1e-9 || nu < u-1e-9 {
+				lb[j], ub[j] = math.Max(l, nl), math.Min(u, nu)
+				for _, rr := range p.Cols[j].Idx {
+					if !inQ[rr] {
+						inQ[rr] = true
+						queue = append(queue, rr)
+					}
+				}
+			}
 		}
 	}
 	return true
