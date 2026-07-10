@@ -1241,7 +1241,7 @@ func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj
 	for _, cd := range cands {
 		lb, ub := m.nodeBound(nd, cd.j)
 		floorV := math.Floor(x[cd.j])
-		score := math.Inf(1)
+		gain := [2]float64{}
 		dead := [2]bool{}
 		sides := [2][2]float64{{lb, floorV}, {floorV + 1, ub}}
 		for s, b := range sides {
@@ -1262,11 +1262,11 @@ func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj
 					dead[s] = true // fathomed by the cutoff: as good as pruned
 					break
 				}
-				score = math.Min(score, cObj-obj) // bound gain of this side
+				gain[s] = cObj - obj // bound gain of this side
 			case simplex.Infeasible:
 				dead[s] = true // side prunes outright
 			default:
-				score = math.Min(score, 0) // probe unresolved: no credit
+				gain[s] = 0 // probe unresolved: no credit
 			}
 		}
 		if dead[0] != dead[1] {
@@ -1278,6 +1278,9 @@ func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj
 			fixed = append(fixed, boundOverride{cd.j, surv[0], surv[1]})
 			continue
 		}
+		// product rule (Achterberg): reward the variable that moves BOTH
+		// bounds, which shrinks the tree more than the weaker-side min rule
+		score := math.Max(gain[0], 1e-6) * math.Max(gain[1], 1e-6)
 		if score > bestScore {
 			bestScore, bestCol = score, cd.j
 		}
