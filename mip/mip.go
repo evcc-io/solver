@@ -322,7 +322,16 @@ func (m *Model) Solve() Result {
 			}
 			rootSt = st
 			obj := m.LP.InternalObjective(st)
-			if round > 0 && obj-prevObj < math.Max(1e-7, 1e-9*math.Abs(obj)) {
+			// incumbent already proves optimality within the gap: more cuts
+			// only refine a bound the tree closes in a few nodes
+			if haveStart && !m.improves(obj, startObj) {
+				debugf("cuts: root bound %g proves incumbent %g within gap after %d rounds", obj, startObj, round)
+				break
+			}
+			// stall test is relative to the proof gap: a round that raises the
+			// bound by less than the gap we're proving is work the tree absorbs
+			gapTol := math.Max(m.Limits.GapAbs, m.Limits.GapRel*math.Abs(obj))
+			if round > 0 && obj-prevObj < math.Max(1e-7, gapTol) {
 				if flat++; flat >= 2 {
 					debugf("cuts: bound stalled at %g after %d rounds", obj, round)
 					break
