@@ -145,9 +145,12 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 - **Factorization is product-form (eta), not Forrest-Tomlin**: each pivot
   cost is dominated by the dense kernel-LU solve, and sparser pivot orders
   perturb the razor-edge degenerate optima. A Forrest-Tomlin factorization
-  (`simplex/ft.go`, Clp `CoinFactorization` port — LU + solves + the
-  `replaceColumn` column update, property-tested) is the first component of
-  an engine-core rewrite (`docs/rewrite-clp-core.md`); it is not yet wired.
+  (`simplex/ft.go`, Clp `CoinFactorization` port) is the first component of an
+  engine-core rewrite (`docs/rewrite-clp-core.md`): sparse U-row storage,
+  O(nnz) ftran/btran, and an alloc-free `replaceColumn` column update
+  (trailing-block Bartels-Golub with an R-transform file), all property-tested.
+  Still dense-factorize (O(m^3)), so wiring it into the full engine waits on the
+  sparse Markowitz factorize (component 2).
 - **Partial CglPreProcess-style reductions**: singleton columns are
   eliminated, but rows never are, and the evcc instances' singletons are
   penalty slacks (cost fights the row — a `max(0, ·)` term no linear

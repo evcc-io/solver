@@ -37,9 +37,10 @@ real CBC (`cbc_run.py`) before activation.
 
 ## Status
 
-- [x] 1. Forrest-Tomlin factorization — LU + solves + `replaceColumn` (FT column
-      update) + sparse solve kernel, property-tested. Dense-backed storage;
-      fully-sparse update (row+col U structures) still to come. Not yet wired.
+- [x] 1. Forrest-Tomlin factorization — sparse U-row LU + O(nnz) solves +
+      fully-sparse alloc-free `replaceColumn` (trailing-block Bartels-Golub),
+      property-tested. Wiring into the engine waits on (2): `newFTLU` is still
+      dense-factorize (O(m^3)), too slow for the 2666-row basis.
 - [ ] 2. Markowitz LU
 - [ ] 3. CglPreProcess
 - [ ] 4. Cgl suite
