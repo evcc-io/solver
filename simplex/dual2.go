@@ -300,18 +300,24 @@ func (lp *LP) dual2Run(st *State) dual2Result {
 
 		ar := a[r]
 		if !dual2NoDSE {
-			// DSE update needs tau = Binv * rowR on the OLD basis
+			// Clp updateWeights, fresh norm=||beta_r||^2/ar^2 for gamma_r;
+			// gamma_i += alpha_i*(alpha_i*norm - tau_i*2/ar) (canonical sign).
+			norm := 0.0
+			for i := range m {
+				norm += rowR[i] * rowR[i]
+			}
+			norm /= ar * ar
 			copy(tau, rowR)
 			st.ftranVec(tau)
-			wr := w[r]
+			mult := 2.0 / ar
 			for i := range m {
 				if i == r || a[i] == 0 {
 					continue
 				}
-				ratio := a[i] / ar
-				w[i] = max(w[i]-2*ratio*tau[i]+ratio*ratio*wr, 1e-8)
+				theta := a[i]
+				w[i] = max(w[i]+theta*(theta*norm-tau[i]*mult), 1e-8)
 			}
-			w[r] = max(wr/(ar*ar), 1e-8)
+			w[r] = max(norm, 1e-8)
 		}
 
 		t := (st.value[leaving] - bound) / (ar * qdir)
