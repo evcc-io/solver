@@ -149,8 +149,10 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   engine-core rewrite (`docs/rewrite-clp-core.md`): sparse U-row storage,
   O(nnz) ftran/btran, and an alloc-free `replaceColumn` column update
   (trailing-block Bartels-Golub with an R-transform file), all property-tested.
-  Still dense-factorize (O(m^3)), so wiring it into the full engine waits on the
-  sparse Markowitz factorize (component 2).
+  It is wired into the solve path behind `CBC_FT` (clone-safe; refactorizes on
+  an unstable no-pivot update) and solves the golden suite correctly, but is
+  gated off: the sparse factorize still lacks a singleton pre-pass and full
+  Markowitz (component 2), so it is far slower than the eta path.
 - **Partial CglPreProcess-style reductions**: singleton columns are
   eliminated, but rows never are, and the evcc instances' singletons are
   penalty slacks (cost fights the row — a `max(0, ·)` term no linear

@@ -37,10 +37,11 @@ real CBC (`cbc_run.py`) before activation.
 
 ## Status
 
-- [x] 1. Forrest-Tomlin factorization — sparse U-row LU + O(nnz) solves +
+- [x] 1. Forrest-Tomlin factorization — sparse L-col/U-row LU + O(nnz) solves +
       fully-sparse alloc-free `replaceColumn` (trailing-block Bartels-Golub),
-      property-tested. Wiring into the engine waits on (2): `newFTLU` is still
-      dense-factorize (O(m^3)), too slow for the 2666-row basis.
+      property-tested. WIRED into the solve path behind `CBC_FT` (clone-safe deep
+      copy; refactorize on an unstable no-pivot update). Correct end-to-end on
+      the golden suite; default-off because it is slow (see 2).
 - [~] 2. Sparse factorize — shortest-row + largest-entry pivoting, sparse
       L-columns + U-rows, no dense work matrix, property-tested. Not yet fast:
       needs a singleton pre-pass and bucketed pivot search (currently O(m^2)
