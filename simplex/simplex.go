@@ -323,6 +323,39 @@ func (lp *LP) warmSolve(st *State, touched []int, preserve bool) (Status, *State
 	return lp.solveFrom(st)
 }
 
+// WarmSolveExtended re-optimizes after prevM..m rows were appended: old basis
+// kept, new-row slacks enter basic/infeasible, dual simplex repairs (CBC-style).
+func (lp *LP) WarmSolveExtended(prev *State, prevM int) (Status, *State, float64) {
+	nt := lp.nTotal()
+	st := &State{
+		status:  make([]varStat, nt),
+		basicOf: make([]int, lp.m),
+		value:   make([]float64, nt),
+	}
+	// structural + old-logical carry over (prev has lp.n+prevM entries)
+	copy(st.status, prev.status)
+	copy(st.value, prev.value)
+	copy(st.basicOf, prev.basicOf)
+	// each appended row's slack starts basic; B stays nonsingular (block
+	// lower-triangular over the old basis)
+	for i := prevM; i < lp.m; i++ {
+		st.basicOf[i] = lp.n + i
+		st.status[lp.n+i] = basic
+	}
+	if !lp.refactorize(st) {
+		return lp.ColdSolve() // singular extension: fall back to scratch
+	}
+	lp.recomputeBasics(st)
+	if dual2Enabled {
+		if lp.dual2Run(st) == dual2Infeasible {
+			return Infeasible, st, 0
+		}
+	} else if !noDualRepair {
+		lp.dualRun(st)
+	}
+	return lp.solveFrom(st)
+}
+
 // SetProbe enables cheap dual-only strong-branch probing (a valid bound
 // after at most `cap` dual pivots); ClearProbe restores normal solving.
 func (lp *LP) SetProbe(cap int) { lp.probeMode, lp.IterCap = true, cap }
