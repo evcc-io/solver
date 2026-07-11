@@ -41,7 +41,11 @@ real CBC (`cbc_run.py`) before activation.
       fully-sparse alloc-free `replaceColumn` (trailing-block Bartels-Golub),
       property-tested. Wiring into the engine waits on (2): `newFTLU` is still
       dense-factorize (O(m^3)), too slow for the 2666-row basis.
-- [ ] 2. Markowitz LU
-- [ ] 3. CglPreProcess
-- [ ] 4. Cgl suite
-- [ ] 5. Dual loop
+- [~] 2. Sparse factorize — shortest-row + largest-entry pivoting, sparse
+      L-columns + U-rows, no dense work matrix, property-tested. Not yet fast:
+      needs a singleton pre-pass and bucketed pivot search (currently O(m^2)
+      scans), and full Markowitz; not yet faster than the tuned dense path.
+- [ ] 3. CglPreProcess (large subsystem — not started)
+- [ ] 4. Cgl 9-generator suite (large subsystem — not started)
+- [~] 5. Dual loop — `dual2.go` DSE dual is built and active via the mixed
+      engine (shipped); Clp partial-pricing / infeasibility-list not ported.
