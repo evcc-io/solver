@@ -79,6 +79,13 @@ type LP struct {
 	// (checked periodically inside the pivot loop).
 	Deadline time.Time
 
+	// IterCap >0 bounds total pivots per solve; probeMode returns the
+	// dual-feasible bound after dual repair without a primal phase. Together
+	// they make strong-branch probes cheap: a capped dual-only re-solve
+	// yields a valid lower bound (CBC-style limited-iteration strong branching).
+	IterCap   int
+	probeMode bool
+
 	// pricingWindow >0 makes chooseEntering scan a rotating column window
 	// (partial pricing) instead of all n+m every pivot; 0 means full scan.
 	pricingWindow int
@@ -308,8 +315,18 @@ func (lp *LP) warmSolve(st *State, touched []int, preserve bool) (Status, *State
 	} else if !noDualRepair {
 		lp.dualRun(st)
 	}
+	if lp.probeMode {
+		// dual repair leaves a dual-feasible basis: its objective is a valid
+		// lower bound (a conservative strong-branch gain) without a primal solve
+		return Optimal, st, lp.objective(st)
+	}
 	return lp.solveFrom(st)
 }
+
+// SetProbe enables cheap dual-only strong-branch probing (a valid bound
+// after at most `cap` dual pivots); ClearProbe restores normal solving.
+func (lp *LP) SetProbe(cap int) { lp.probeMode, lp.IterCap = true, cap }
+func (lp *LP) ClearProbe()      { lp.probeMode, lp.IterCap = false, 0 }
 
 // dualPivotCap bounds dual pivots per re-solve; a degenerate dual bails to
 // the primal run instead of grinding forever.
@@ -356,6 +373,10 @@ func (lp *LP) dualRun(st *State) {
 	var skip []bool // rows whose violation the dual cannot fix
 	for iter := range dualPivotCap + 1 {
 		if !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
+			return
+		}
+		if lp.IterCap > 0 && iter >= lp.IterCap {
+			lp.Stats.DualCap++
 			return
 		}
 		if iter == dualPivotCap {
