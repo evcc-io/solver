@@ -150,6 +150,13 @@ func New(p *problem.Problem) *Model {
 	return &Model{P: p, LP: simplex.Build(p), Limits: Limits{GapRel: 1e-9, GapAbs: 1e-9}}
 }
 
+// rebuildLP rebuilds the LP with DSE suspended: cuts/root run on the canonical
+// dualRun vertex; DSE is re-enabled only for deep node re-solves.
+func (m *Model) rebuildLP() {
+	m.LP = simplex.Build(m.P)
+	m.LP.SuspendDSE(true)
+}
+
 // SolveRelaxation solves just the LP relaxation, ignoring integrality and
 // SOS constraints entirely (the "-initialSolve" / mip=False CLI contract).
 func SolveRelaxation(p *problem.Problem) Result {
@@ -210,7 +217,7 @@ func (m *Model) Solve() Result {
 				m.MIPStart = red.shrinkX(m.MIPStart)
 			}
 		}
-		m.LP = simplex.Build(m.P)
+		m.rebuildLP()
 		m.LP.Deadline = deadline
 	}
 
@@ -291,7 +298,7 @@ func (m *Model) Solve() Result {
 				if lastBatch >= 0 {
 					truncateRows(m.P, lastBatch)
 					stats := m.LP.Stats
-					m.LP = simplex.Build(m.P)
+					m.rebuildLP()
 					m.LP.Stats = stats
 					rootSt = nil
 				}
@@ -314,7 +321,7 @@ func (m *Model) Solve() Result {
 				if lastBatch >= 0 {
 					truncateRows(m.P, lastBatch)
 					stats := m.LP.Stats
-					m.LP = simplex.Build(m.P)
+					m.rebuildLP()
 					m.LP.Stats = stats // counters survive the retraction rebuild
 					m.LP.Deadline = cutDeadline
 					warmPrev = nil // retracted: cold-solve the last good relaxation
@@ -378,7 +385,7 @@ func (m *Model) Solve() Result {
 				break
 			}
 			stats := m.LP.Stats
-			m.LP = simplex.Build(m.P)
+			m.rebuildLP()
 			m.LP.Stats = stats // carry pivot counters across rebuilds
 			m.LP.Deadline = cutDeadline
 			rootSt = nil
@@ -398,7 +405,7 @@ func (m *Model) Solve() Result {
 			_, rowAct, _, _ := m.LP.Solution(rootSt)
 			if dropped := dropSlackCuts(m.P, origRows, rowAct); dropped > 0 {
 				stats := m.LP.Stats
-				m.LP = simplex.Build(m.P)
+				m.rebuildLP()
 				m.LP.Stats = stats
 				m.LP.Deadline = deadline
 				debugf("cuts: dropped %d slack rows, kept %d", dropped, len(m.P.Rows)-origRows)
@@ -458,7 +465,11 @@ func (m *Model) Solve() Result {
 				remaining = math.Min(remaining, nd.bound)
 				break
 			}
+			// DSE only for deep node re-solves; root stays canonical so the
+			// incumbent heuristics find their target (CBC solves those separately)
+			m.LP.SuspendDSE(nd.depth == 0)
 			status, x, rowAct, rc, price, obj, endState := m.solveNode(nd)
+			m.LP.SuspendDSE(true)
 			nodeCount++
 			if !rootDone {
 				rootDone = true

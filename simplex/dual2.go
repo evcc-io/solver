@@ -9,7 +9,7 @@ import (
 
 // dual2Enabled gates the Clp-faithful dual engine for A/B measurement.
 var (
-	dual2Enabled = os.Getenv("CBC_DUAL2") == "1"
+	dual2Enabled = os.Getenv("CBC_DUAL2") != "0" // Clp DSE dual, on by default
 	dual2NoDSE   = os.Getenv("CBC_DUAL2_NODSE") == "1"
 	dual2Perturb = os.Getenv("CBC_DUAL2_PERTURB") != "0" // Clp always perturbs
 	noDualRepair = os.Getenv("CBC_NODUAL") == "1"

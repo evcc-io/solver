@@ -96,9 +96,9 @@ func luFactorize(k int, colIdx [][]int32, colVal [][]float64, w *luWS) *sparseLU
 		work:      make([]float64, k),
 	}
 
-	acc := w.acc              // zeroed by reset; restored to zero each step
-	mark := w.mark            // pivot-row cols seen in the current row's scan
-	touched := w.touched[:0]  // grows, backing kept across calls
+	acc := w.acc             // zeroed by reset; restored to zero each step
+	mark := w.mark           // pivot-row cols seen in the current row's scan
+	touched := w.touched[:0] // grows, backing kept across calls
 
 	for step := range k {
 		// pivot row: shortest active row that still has a usable entry
