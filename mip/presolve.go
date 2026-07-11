@@ -126,8 +126,12 @@ func presolvePass(p *problem.Problem) (changed bool) {
 			}
 		}
 
-		// coefficient tightening: binaries in pure <= rows
-		if !(rub < inf && rlb == -inf) {
+		// coefficient tightening: binaries in pure one-sided big-M rows.
+		// The >= mirror is gated to large models: on small proof-tree
+		// cases it perturbs the cut set for no gain (see perf notes).
+		pureLE := rub < inf && rlb == -inf
+		pureGE := rlb > -inf && rub == inf && len(p.Rows) > 3000
+		if !pureLE && !pureGE {
 			continue
 		}
 		for k, j := range r.Idx {
@@ -136,24 +140,43 @@ func presolvePass(p *problem.Problem) (changed bool) {
 			if !c.Integer || c.LB != 0 || c.UB != 1 {
 				continue
 			}
-			_, omax := others(k)
-			if math.IsInf(omax, 1) {
-				continue
-			}
-			switch {
-			case a < 0 && omax > rub && omax+a < rub:
-				// y=1 side is slack: shrink |a| so it just reaches
-				setCoef(p, ri, k, rub-omax)
-				changed = true
-				recompute()
-			case a > 0 && omax < rub && omax+a > rub:
-				// y=0 side is slack: shift a and the rhs down together
-				delta := rub - omax
-				setCoef(p, ri, k, a-delta)
-				r.RHS -= delta
-				rub = r.RHS
-				changed = true
-				recompute()
+			omin, omax := others(k)
+			if pureLE {
+				if math.IsInf(omax, 1) {
+					continue
+				}
+				switch {
+				case a < 0 && omax > rub && omax+a < rub:
+					// y=1 side is slack: shrink |a| so it just reaches
+					setCoef(p, ri, k, rub-omax)
+					changed = true
+					recompute()
+				case a > 0 && omax < rub && omax+a > rub:
+					// y=0 side is slack: shift a and the rhs down together
+					delta := rub - omax
+					setCoef(p, ri, k, a-delta)
+					r.RHS -= delta
+					rub = r.RHS
+					changed = true
+					recompute()
+				}
+			} else { // pureGE: mirror of pureLE under negation
+				if math.IsInf(omin, -1) {
+					continue
+				}
+				switch {
+				case a > 0 && omin < rlb && omin+a > rlb:
+					setCoef(p, ri, k, rlb-omin)
+					changed = true
+					recompute()
+				case a < 0 && omin > rlb && omin+a < rlb:
+					delta := omin - rlb
+					setCoef(p, ri, k, a+delta)
+					r.RHS += delta
+					rlb = r.RHS
+					changed = true
+					recompute()
+				}
 			}
 		}
 	}
