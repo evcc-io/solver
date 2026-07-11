@@ -17,6 +17,10 @@ const (
 	cutDropTol  = 1e-11
 	maxCutsPer  = 32 // cuts per round
 	maxCutRound = 30 // hard cap; rounds stop early once the bound stalls
+
+	// cutMarginFrac stops cut rounds once a round's bound gain drops below this
+	// fraction of the cumulative gain (warm-invariant diminishing-returns test)
+	cutMarginFrac = 0.02
 )
 
 // probingCuts probes fractional binaries at x and adds violated implication
@@ -294,9 +298,11 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 	// fractional tableau rows; the aggregate LHS stays integer, so the
 	// same MIR derivation applies. Big instances only (cf. probing cuts).
 	if m.LP.NumRows() > 1500 {
+		// D3: aggregate many tableau pairs toward CBC's TwoMir cut count.
+		topCap, pairCap := 24, 64
 		topN := len(cands)
-		if topN > 8 {
-			topN = 8
+		if topN > topCap {
+			topN = topCap
 		}
 		tabs := make([][]float64, topN)
 		bval := make([]float64, topN)
@@ -307,8 +313,8 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 		}
 		agg := make([]float64, nt)
 		pairAdded := 0
-		for a := 0; a < topN && pairAdded < 8; a++ {
-			for b := a + 1; b < topN && pairAdded < 8; b++ {
+		for a := 0; a < topN && pairAdded < pairCap; a++ {
+			for b := a + 1; b < topN && pairAdded < pairCap; b++ {
 				for _, sgn := range [2]float64{1, -1} {
 					for j := range nt {
 						agg[j] = tabs[a][j] + sgn*tabs[b][j]

@@ -26,7 +26,7 @@ func TestSparseLUSolve(t *testing.T) {
 				}
 			}
 		}
-		lu := luFactorize(k, colIdx, colVal)
+		lu := luFactorize(k, colIdx, colVal, nil)
 		if lu == nil {
 			t.Fatalf("trial %d k=%d: unexpected singular", trial, k)
 		}

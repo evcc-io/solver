@@ -94,6 +94,10 @@ type LP struct {
 	fws *factorWS // reusable factorization workspace
 	dws *dualWS   // reusable dualRun workspace
 
+	// dseOff suspends the DSE dual (dual2) so this solve runs on the
+	// canonical dualRun vertex; DSE is reserved for deep node re-solves.
+	dseOff bool
+
 	// run/recomputeBasics per-call vectors, reused (single-threaded)
 	runCost, runY, runA, residual []float64
 	// pivot's eta staging, copied into exact-size arrays per eta
@@ -117,7 +121,7 @@ type State struct {
 	basicOf []int // row -> basic variable index
 	value   []float64
 	f       *factor // basis factorization, shared between clones
-	etas    []*eta  // product-form updates since f was built
+	etas    []eta   // product-form updates since f was built
 }
 
 // ftranVec computes Binv*v in place (v by row in, by basis position out).
@@ -279,7 +283,7 @@ func (st *State) Clone() *State {
 		basicOf: append([]int(nil), st.basicOf...),
 		value:   append([]float64(nil), st.value...),
 		f:       st.f, // immutable, shared
-		etas:    append([]*eta(nil), st.etas...),
+		etas:    append([]eta(nil), st.etas...),
 	}
 }
 
@@ -308,7 +312,7 @@ func (lp *LP) warmSolve(st *State, touched []int, preserve bool) (Status, *State
 	lp.recomputeBasics(st)
 	// after a bound change the basis stays (near) dual feasible: a few dual
 	// pivots restore primal feasibility far cheaper than a primal Phase 1
-	if dual2Enabled {
+	if dual2Enabled && !lp.dseOff {
 		if lp.dual2Run(st) == dual2Infeasible {
 			return Infeasible, st, 0
 		}
@@ -319,6 +323,43 @@ func (lp *LP) warmSolve(st *State, touched []int, preserve bool) (Status, *State
 		// dual repair leaves a dual-feasible basis: its objective is a valid
 		// lower bound (a conservative strong-branch gain) without a primal solve
 		return Optimal, st, lp.objective(st)
+	}
+	return lp.solveFrom(st)
+}
+
+// SuspendDSE toggles the DSE dual off (canonical dualRun vertex, used for cut
+// generation and heuristic incumbent search) or on (deep node re-solves).
+func (lp *LP) SuspendDSE(off bool) { lp.dseOff = off }
+
+// WarmSolveExtended re-optimizes after prevM..m rows were appended: old basis
+// kept, new-row slacks enter basic/infeasible, dual simplex repairs (CBC-style).
+func (lp *LP) WarmSolveExtended(prev *State, prevM int) (Status, *State, float64) {
+	nt := lp.nTotal()
+	st := &State{
+		status:  make([]varStat, nt),
+		basicOf: make([]int, lp.m),
+		value:   make([]float64, nt),
+	}
+	// structural + old-logical carry over (prev has lp.n+prevM entries)
+	copy(st.status, prev.status)
+	copy(st.value, prev.value)
+	copy(st.basicOf, prev.basicOf)
+	// each appended row's slack starts basic; B stays nonsingular (block
+	// lower-triangular over the old basis)
+	for i := prevM; i < lp.m; i++ {
+		st.basicOf[i] = lp.n + i
+		st.status[lp.n+i] = basic
+	}
+	if !lp.refactorize(st) {
+		return lp.ColdSolve() // singular extension: fall back to scratch
+	}
+	lp.recomputeBasics(st)
+	if dual2Enabled && !lp.dseOff {
+		if lp.dual2Run(st) == dual2Infeasible {
+			return Infeasible, st, 0
+		}
+	} else if !noDualRepair {
+		lp.dualRun(st)
 	}
 	return lp.solveFrom(st)
 }
@@ -1092,7 +1133,7 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 	val := make([]float64, len(wsVal))
 	copy(idx, wsIdx)
 	copy(val, wsVal)
-	st.etas = append(st.etas, &eta{r: leaveRow, idx: idx, val: val, ar: a[leaveRow]})
+	st.etas = append(st.etas, eta{r: leaveRow, idx: idx, val: val, ar: a[leaveRow]})
 	st.basicOf[leaveRow] = q
 	st.status[q] = basic
 	if len(st.etas) > maxEtas {

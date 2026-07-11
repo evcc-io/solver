@@ -19,20 +19,59 @@ type sparseLU struct {
 	work      []float64
 }
 
+// luWS holds luFactorize's transient scratch, reused across kernel
+// refactorizations (one per LP; none of it escapes the call).
+type luWS struct {
+	cnt     []int
+	rowUsed []bool
+	colUsed []bool
+	colPos  []int32
+	acc     []float64
+	mark    []bool
+	touched []int32
+	rowIdx  [][]int32
+	rowVal  [][]float64
+}
+
+func (w *luWS) reset(k int) {
+	if cap(w.cnt) < k {
+		w.cnt = make([]int, k)
+		w.rowUsed = make([]bool, k)
+		w.colUsed = make([]bool, k)
+		w.colPos = make([]int32, k)
+		w.acc = make([]float64, k)
+		w.mark = make([]bool, k)
+		w.touched = make([]int32, 0, k)
+		w.rowIdx = make([][]int32, k)
+		w.rowVal = make([][]float64, k)
+	}
+	w.cnt, w.rowUsed, w.colUsed = w.cnt[:k], w.rowUsed[:k], w.colUsed[:k]
+	w.colPos, w.acc, w.mark = w.colPos[:k], w.acc[:k], w.mark[:k]
+	w.rowIdx, w.rowVal = w.rowIdx[:k], w.rowVal[:k]
+	clear(w.cnt)
+	clear(w.rowUsed)
+	clear(w.colUsed)
+	clear(w.acc)
+	clear(w.mark)
+}
+
 // luFactorize factors the k*k kernel given as sparse columns in
-// kernel-local indices; returns nil when singular.
-func luFactorize(k int, colIdx [][]int32, colVal [][]float64) *sparseLU {
-	rowIdx := make([][]int32, k)
-	rowVal := make([][]float64, k)
-	cnt := make([]int, k)
+// kernel-local indices; returns nil when singular. w reuses scratch across
+// calls (pass nil to allocate fresh).
+func luFactorize(k int, colIdx [][]int32, colVal [][]float64, w *luWS) *sparseLU {
+	if w == nil {
+		w = &luWS{}
+	}
+	w.reset(k)
+	rowIdx, rowVal, cnt := w.rowIdx, w.rowVal, w.cnt
 	for c := range k {
 		for _, r := range colIdx[c] {
 			cnt[r]++
 		}
 	}
 	for r := range k {
-		rowIdx[r] = make([]int32, 0, cnt[r])
-		rowVal[r] = make([]float64, 0, cnt[r])
+		rowIdx[r] = rowIdx[r][:0]
+		rowVal[r] = rowVal[r][:0]
 	}
 	for c := range k {
 		for t, r := range colIdx[c] {
@@ -40,9 +79,9 @@ func luFactorize(k int, colIdx [][]int32, colVal [][]float64) *sparseLU {
 			rowVal[r] = append(rowVal[r], colVal[c][t])
 		}
 	}
-	rowUsed := make([]bool, k)
-	colUsed := make([]bool, k)
-	colPos := make([]int32, k)
+	rowUsed := w.rowUsed
+	colUsed := w.colUsed
+	colPos := w.colPos
 
 	lu := &sparseLU{
 		k:         k,
@@ -57,9 +96,9 @@ func luFactorize(k int, colIdx [][]int32, colVal [][]float64) *sparseLU {
 		work:      make([]float64, k),
 	}
 
-	acc := make([]float64, k)
-	mark := make([]bool, k) // pivot-row cols seen in the current row's scan
-	touched := make([]int32, 0, k)
+	acc := w.acc             // zeroed by reset; restored to zero each step
+	mark := w.mark           // pivot-row cols seen in the current row's scan
+	touched := w.touched[:0] // grows, backing kept across calls
 
 	for step := range k {
 		// pivot row: shortest active row that still has a usable entry

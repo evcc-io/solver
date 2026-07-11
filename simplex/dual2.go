@@ -9,9 +9,9 @@ import (
 
 // dual2Enabled gates the Clp-faithful dual engine for A/B measurement.
 var (
-	dual2Enabled = os.Getenv("CBC_DUAL2") == "1"
+	dual2Enabled = os.Getenv("CBC_DUAL2") != "0" // Clp DSE dual, on by default
 	dual2NoDSE   = os.Getenv("CBC_DUAL2_NODSE") == "1"
-	dual2Perturb = os.Getenv("CBC_DUAL2_PERTURB") == "1"
+	dual2Perturb = os.Getenv("CBC_DUAL2_PERTURB") != "0" // Clp always perturbs
 	noDualRepair = os.Getenv("CBC_NODUAL") == "1"
 )
 
@@ -118,8 +118,8 @@ func (lp *LP) dual2Run(st *State) dual2Result {
 		lp.recomputeBasics(st)
 	}
 
-	// DSE weights per row, reset each solve (re-solves are short; the
-	// reference framework is the start basis with unit weights)
+	// DSE weights reset to 1 each solve: Clp mode-3 fresh reference frame.
+	// (Persisting them across sibling node bases measured worse — stale.)
 	w := make([]float64, m)
 	for i := range w {
 		w[i] = 1
@@ -300,18 +300,24 @@ func (lp *LP) dual2Run(st *State) dual2Result {
 
 		ar := a[r]
 		if !dual2NoDSE {
-			// DSE update needs tau = Binv * rowR on the OLD basis
+			// Clp updateWeights, fresh norm=||beta_r||^2/ar^2 for gamma_r;
+			// gamma_i += alpha_i*(alpha_i*norm - tau_i*2/ar) (canonical sign).
+			norm := 0.0
+			for i := range m {
+				norm += rowR[i] * rowR[i]
+			}
+			norm /= ar * ar
 			copy(tau, rowR)
 			st.ftranVec(tau)
-			wr := w[r]
+			mult := 2.0 / ar
 			for i := range m {
 				if i == r || a[i] == 0 {
 					continue
 				}
-				ratio := a[i] / ar
-				w[i] = max(w[i]-2*ratio*tau[i]+ratio*ratio*wr, 1e-8)
+				theta := a[i]
+				w[i] = max(w[i]+theta*(theta*norm-tau[i]*mult), 1e-8)
 			}
-			w[r] = max(wr/(ar*ar), 1e-8)
+			w[r] = max(norm, 1e-8)
 		}
 
 		t := (st.value[leaving] - bound) / (ar * qdir)

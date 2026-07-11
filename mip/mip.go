@@ -26,6 +26,10 @@ const (
 
 const intTol = 1e-6
 
+// cbcD1 gates CBC-style CglPreProcess model reduction (D1): ungated coefficient
+// strengthening + integer redundant-row removal. Off by default (regresses 020).
+var cbcD1 = os.Getenv("CBC_D1") != ""
+
 // debugf prints heuristic diagnostics when SOLVER_DEBUG is set.
 func debugf(format string, args ...any) {
 	if os.Getenv("SOLVER_DEBUG") != "" {
@@ -129,36 +133,28 @@ func (m *Model) psRecord(j int, up bool, frac, gain float64) {
 	}
 }
 
-// psSelect picks the fractional column with the best pseudocost score
-// (min of both directions' estimated gains); -1 if none is reliable.
-func (m *Model) psSelect(x []float64) int {
-	if m.psUp == nil {
-		return -1
+// cbcScore combines up/down estimated degradations the CBC way: WEIGHT_BEFORE
+// min+max blend before an incumbent, product rule after (higher is better).
+func cbcScore(estUp, estDn float64, hasIncumbent bool) float64 {
+	lo, hi := math.Min(estUp, estDn), math.Max(estUp, estDn)
+	if hasIncumbent {
+		const eps = 1e-6
+		return math.Max(lo, eps) * math.Max(hi, eps)
 	}
-	best, col := 0.0, -1
-	for j, c := range m.P.Cols {
-		if !c.Integer {
-			continue
-		}
-		frac := x[j] - math.Floor(x[j])
-		if math.Min(frac, 1-frac) <= intTol {
-			continue
-		}
-		if m.psUpN[j] == 0 || m.psDnN[j] == 0 {
-			continue
-		}
-		up := m.psUp[j] / float64(m.psUpN[j]) * (1 - frac)
-		dn := m.psDn[j] / float64(m.psDnN[j]) * frac
-		if score := math.Min(up, dn); score > best {
-			best, col = score, j
-		}
-	}
-	return col
+	const weightBefore = 0.8
+	return weightBefore*lo + (1-weightBefore)*hi
 }
 
 func New(p *problem.Problem) *Model {
 	presolve(p)
 	return &Model{P: p, LP: simplex.Build(p), Limits: Limits{GapRel: 1e-9, GapAbs: 1e-9}}
+}
+
+// rebuildLP rebuilds the LP with DSE suspended: cuts/root run on the canonical
+// dualRun vertex; DSE is re-enabled only for deep node re-solves.
+func (m *Model) rebuildLP() {
+	m.LP = simplex.Build(m.P)
+	m.LP.SuspendDSE(true)
 }
 
 // SolveRelaxation solves just the LP relaxation, ignoring integrality and
@@ -209,9 +205,9 @@ func (m *Model) Solve() Result {
 		}
 		probe(m.P, probeDeadline)
 		presolve(m.P)
-		// forcing-row removal: drop redundant continuous rows (inert AND
-		// clear of the integer cut suite). Postsolve rebuilds their outputs.
-		if q, keep := dropRedundantContinuousRows(m.P); q != nil {
+		// CBC CglPreProcess forcing/redundant-row removal (D1): drop all
+		// never-binding rows incl. integer big-M. Postsolve rebuilds outputs.
+		if q, keep := dropRedundantRows(m.P, cbcD1); q != nil {
 			m.rrKeep, m.rrRows = keep, m.P.Rows
 			m.P = q
 		}
@@ -221,7 +217,7 @@ func (m *Model) Solve() Result {
 				m.MIPStart = red.shrinkX(m.MIPStart)
 			}
 		}
-		m.LP = simplex.Build(m.P)
+		m.rebuildLP()
 		m.LP.Deadline = deadline
 	}
 
@@ -275,9 +271,14 @@ func (m *Model) Solve() Result {
 			m.LP.Deadline = cutDeadline
 		}
 		prevObj := math.Inf(1)
+		firstObj := 0.0 // round-0 bound, for the relative diminishing-returns test
 		flat := 0       // bound improvement can pause a round and resume
 		lastBatch := -1 // first row index of the previous round's cuts
 		poisoned := 0
+		// carry the prior round's solved state so the next round warm-starts
+		// the appended cut rows (dual repair) instead of solving from scratch
+		var warmPrev *simplex.State
+		var warmPrevM int
 		// pivots are speed-invariant work units: budgeting rounds by pivots
 		// keeps the cut set deterministic across engine speed changes; the
 		// wall-clock box stays as a safety cap only
@@ -297,7 +298,7 @@ func (m *Model) Solve() Result {
 				if lastBatch >= 0 {
 					truncateRows(m.P, lastBatch)
 					stats := m.LP.Stats
-					m.LP = simplex.Build(m.P)
+					m.rebuildLP()
 					m.LP.Stats = stats
 					rootSt = nil
 				}
@@ -308,6 +309,8 @@ func (m *Model) Solve() Result {
 			var st *simplex.State
 			if round == 0 && preSolved != nil {
 				status, st = simplex.Optimal, preSolved
+			} else if warmPrev != nil {
+				status, st, _ = m.LP.WarmSolveExtended(warmPrev, warmPrevM)
 			} else {
 				status, st, _ = m.LP.ColdSolve()
 			}
@@ -318,9 +321,10 @@ func (m *Model) Solve() Result {
 				if lastBatch >= 0 {
 					truncateRows(m.P, lastBatch)
 					stats := m.LP.Stats
-					m.LP = simplex.Build(m.P)
+					m.rebuildLP()
 					m.LP.Stats = stats // counters survive the retraction rebuild
 					m.LP.Deadline = cutDeadline
+					warmPrev = nil // retracted: cold-solve the last good relaxation
 					debugf("cuts: retracted poison batch, back to %d rows", lastBatch)
 					lastBatch = -1
 					if poisoned++; poisoned <= 2 {
@@ -341,7 +345,14 @@ func (m *Model) Solve() Result {
 			// stall test is relative to the proof gap: a round that raises the
 			// bound by less than the gap we're proving is work the tree absorbs
 			gapTol := math.Max(m.Limits.GapAbs, m.Limits.GapRel*math.Abs(obj))
-			if round > 0 && obj-prevObj < math.Max(1e-7, gapTol) {
+			if round == 0 {
+				firstObj = obj
+			}
+			// diminishing returns vs cumulative gain: warm re-solves are too
+			// cheap for the pivot budget to stop over-cutting (weak late cuts)
+			total := obj - firstObj
+			marginal := round > 0 && total > 0 && obj-prevObj < cutMarginFrac*total
+			if marginal || (round > 0 && obj-prevObj < math.Max(1e-7, gapTol)) {
 				if flat++; flat >= 2 {
 					debugf("cuts: bound stalled at %g after %d rounds", obj, round)
 					break
@@ -374,26 +385,27 @@ func (m *Model) Solve() Result {
 				break
 			}
 			stats := m.LP.Stats
-			m.LP = simplex.Build(m.P)
+			m.rebuildLP()
 			m.LP.Stats = stats // carry pivot counters across rebuilds
 			m.LP.Deadline = cutDeadline
 			rootSt = nil
+			warmPrev, warmPrevM = st, lastBatch // resolve appended rows warm
 		}
 		m.LP.Deadline = deadline
 	}
 
-	// keep only cuts tight at the root: slack rows bloat every node re-solve
+	// keep only cuts tight at the root; drop against the cold canonical vertex
+	// (a warm re-solve lands elsewhere, keeping a different cut set)
 	if len(m.P.Rows) > origRows {
-		if rootSt == nil {
-			if status, st, _ := m.LP.ColdSolve(); status == simplex.Optimal {
-				rootSt = st
-			}
+		rootSt = nil
+		if status, st, _ := m.LP.ColdSolve(); status == simplex.Optimal {
+			rootSt = st
 		}
 		if rootSt != nil {
 			_, rowAct, _, _ := m.LP.Solution(rootSt)
 			if dropped := dropSlackCuts(m.P, origRows, rowAct); dropped > 0 {
 				stats := m.LP.Stats
-				m.LP = simplex.Build(m.P)
+				m.rebuildLP()
 				m.LP.Stats = stats
 				m.LP.Deadline = deadline
 				debugf("cuts: dropped %d slack rows, kept %d", dropped, len(m.P.Rows)-origRows)
@@ -453,7 +465,11 @@ func (m *Model) Solve() Result {
 				remaining = math.Min(remaining, nd.bound)
 				break
 			}
+			// DSE only for deep node re-solves; root stays canonical so the
+			// incumbent heuristics find their target (CBC solves those separately)
+			m.LP.SuspendDSE(nd.depth == 0)
 			status, x, rowAct, rc, price, obj, endState := m.solveNode(nd)
+			m.LP.SuspendDSE(true)
 			nodeCount++
 			if !rootDone {
 				rootDone = true
@@ -495,32 +511,23 @@ func (m *Model) Solve() Result {
 				newIncumbent(obj, x, rowAct, rc, price)
 				break
 			}
-			// shallow nodes pick the branch variable by probing (strong
-			// branching); deeper plunges use pseudocosts once seeded.
-			// Probes cost ~a node solve each: big problems get few
-			sbDepth := 16
-			if m.LP.NumRows() > 1500 {
-				sbDepth = 6
-			}
+			// CBC reliability branching at every depth: it self-limits by
+			// only probing columns whose pseudocosts aren't yet trusted.
 			if branchCol >= 0 {
-				if nd.depth < sbDepth {
-					sbCut := math.Inf(1)
-					if hasIncumbent {
-						sbCut = bestInternal
-					}
-					sb, fixed := m.strongBranch(nd, x, endState, obj, sbCut)
-					if len(fixed) > 0 {
-						// probes fathomed sides: fix here and re-solve the
-						// node with the survivors forced (no branch spent)
-						debugf("sbfix: %d vars fixed at depth %d", len(fixed), nd.depth)
-						nd = childNodeMulti(nd, endState, fixed, obj)
-						continue
-					}
-					if sb >= 0 {
-						branchCol = sb
-					}
-				} else if ps := m.psSelect(x); ps >= 0 {
-					branchCol = ps
+				sbCut := math.Inf(1)
+				if hasIncumbent {
+					sbCut = bestInternal
+				}
+				sb, fixed := m.chooseBranch(nd, x, endState, obj, sbCut, hasIncumbent)
+				if len(fixed) > 0 {
+					// probes fathomed sides: fix here and re-solve the
+					// node with the survivors forced (no branch spent)
+					debugf("sbfix: %d vars fixed at depth %d", len(fixed), nd.depth)
+					nd = childNodeMulti(nd, endState, fixed, obj)
+					continue
+				}
+				if sb >= 0 {
+					branchCol = sb
 				}
 			}
 
@@ -651,8 +658,8 @@ func (m *Model) Solve() Result {
 		remaining = math.Min(remaining, (*pq)[0].bound)
 	}
 	proven := hasIncumbent && !m.improves(remaining, bestInternal)
-	debugf("mip exit: nodes=%d best=%g remaining=%g proven=%v stopped=%v proofLost=%v heap=%d",
-		nodeCount, bestInternal, remaining, proven, stopped, proofLost, pq.Len())
+	debugf("mip exit: nodes=%d pivots=%d best=%g remaining=%g proven=%v stopped=%v proofLost=%v heap=%d",
+		nodeCount, m.LP.Stats.Phase1+m.LP.Stats.Phase2+m.LP.Stats.Dual, bestInternal, remaining, proven, stopped, proofLost, pq.Len())
 	debugf("pivot split: facewalk %d, fpump %d, dive %d, rins %d, coldfallbacks %d", m.dbgFW, m.dbgFP, m.dbgDive, m.dbgRINS, m.dbgNodeCold)
 
 	res := Result{HasIncumbent: hasIncumbent, NodeCount: nodeCount}
@@ -1220,16 +1227,40 @@ func (m *Model) nodeBound(nd *node, j int) (float64, float64) {
 // useful bound, cheap enough that probing all shallow nodes stays affordable.
 const strongProbeCap = 100
 
-// strongBranch (CBC-style) probes both children of the top candidates and
-// returns the column whose worse child moves the bound most; -1 if none do.
-// strongBranch probes both sides of the most fractional candidates. A side
-// fathomed by the cutoff (or infeasible) fixes the variable the other way at
-// this node (CBC strong-branch fixing); fixings are returned for the caller
-// to apply without consuming a branch. Otherwise the best column is returned.
-func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj, cutoff float64) (int, []boundOverride) {
+// CBC reliability-branching knobs (the cbc binary's -trust / -strong defaults):
+// a column's pseudocost is trusted after numberBeforeTrust observed gains, and
+// at most maxStrong untrusted columns are strong-branched per node.
+const (
+	numberBeforeTrust = 10
+	maxStrong         = 5
+)
+
+// psEstimate returns column j's up/down predicted degradations at fraction
+// frac, and its observation counts. Unseen directions fall back to |obj| —
+// CBC's initial dynamic pseudocost (costValue).
+func (m *Model) psEstimate(j int, frac float64) (estUp, estDn float64, upN, dnN int) {
+	if m.psUpN != nil {
+		upN, dnN = m.psUpN[j], m.psDnN[j]
+	}
+	init := math.Abs(m.P.Cols[j].Obj)
+	pu, pd := init, init
+	if upN > 0 {
+		pu = m.psUp[j] / float64(upN)
+	}
+	if dnN > 0 {
+		pd = m.psDn[j] / float64(dnN)
+	}
+	return pu * (1 - frac), pd * frac, upN, dnN
+}
+
+// chooseBranch is CBC reliability branching: untrusted pseudocosts float up,
+// the top maxStrong are probed to seed them, best cbcScore wins (see below).
+func (m *Model) chooseBranch(nd *node, x []float64, endState *simplex.State, obj, cutoff float64, hasIncumbent bool) (int, []boundOverride) {
 	type cand struct {
-		j    int
-		dist float64
+		j       int
+		frac    float64
+		sortKey float64
+		trusted bool
 	}
 	var cands []cand
 	for j, c := range m.P.Cols {
@@ -1237,33 +1268,40 @@ func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj
 			continue
 		}
 		frac := x[j] - math.Floor(x[j])
-		if dist := math.Min(frac, 1-frac); dist > intTol {
-			cands = append(cands, cand{j, dist})
+		if math.Min(frac, 1-frac) <= intTol {
+			continue
 		}
+		estUp, estDn, upN, dnN := m.psEstimate(j, frac)
+		key := cbcScore(estUp, estDn, hasIncumbent)
+		trusted := upN >= numberBeforeTrust && dnN >= numberBeforeTrust
+		if !trusted {
+			key *= 1e3 // untrusted floats up; never-probed higher still
+			if upN == 0 && dnN == 0 {
+				key *= 1e10
+			}
+		}
+		cands = append(cands, cand{j, frac, key, trusted})
 	}
-	if len(cands) < 2 {
+	if len(cands) == 0 {
 		return -1, nil
 	}
-	sort.Slice(cands, func(a, b int) bool { return cands[a].dist > cands[b].dist })
-	if len(cands) > 6 {
-		cands = cands[:6]
-	}
+	sort.Slice(cands, func(a, b int) bool { return cands[a].sortKey > cands[b].sortKey })
 
-	// short per-probe deadline: strong branching must never eat the budget
+	// short per-probe deadline + cheap dual-only cap (CBC hot-start iter cap).
 	saved := m.LP.Deadline
 	defer func() { m.LP.Deadline = saved }()
-	// cheap strong-branch probes: a capped dual-only re-solve returns a valid
-	// lower bound (CBC limited-iteration strong branching) instead of a full
-	// node solve, at a fraction of the pivots
 	m.LP.SetProbe(strongProbeCap)
 	defer m.LP.ClearProbe()
 
-	bestCol, bestScore := -1, math.Inf(-1)
 	var fixed []boundOverride
+	probed := 0
 	for _, cd := range cands {
+		if cd.trusted || probed >= maxStrong {
+			continue // trust the pseudocost; no probe
+		}
+		probed++
 		lb, ub := m.nodeBound(nd, cd.j)
 		floorV := math.Floor(x[cd.j])
-		gain := [2]float64{}
 		dead := [2]bool{}
 		sides := [2][2]float64{{lb, floorV}, {floorV + 1, ub}}
 		for s, b := range sides {
@@ -1279,39 +1317,36 @@ func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj
 			m.LP.Deadline = saved
 			switch status {
 			case simplex.Optimal:
-				m.psRecord(cd.j, b[0] == floorV+1, x[cd.j]-floorV, cObj-obj)
+				m.psRecord(cd.j, b[0] == floorV+1, cd.frac, cObj-obj)
 				if !m.improves(cObj, cutoff) {
 					dead[s] = true // fathomed by the cutoff: as good as pruned
-					break
 				}
-				gain[s] = cObj - obj // bound gain of this side
 			case simplex.Infeasible:
 				dead[s] = true // side prunes outright
-			default:
-				gain[s] = 0 // probe unresolved: no credit
 			}
 		}
 		if dead[0] != dead[1] {
-			// one side dies: the variable is fixed to the survivor here
 			surv := sides[0]
 			if dead[0] {
 				surv = sides[1]
 			}
 			fixed = append(fixed, boundOverride{cd.j, surv[0], surv[1]})
-			continue
-		}
-		// product rule (Achterberg): reward the variable that moves BOTH
-		// bounds, which shrinks the tree more than the weaker-side min rule
-		score := math.Max(gain[0], 1e-6) * math.Max(gain[1], 1e-6)
-		if score > bestScore {
-			bestScore, bestCol = score, cd.j
 		}
 	}
 	if len(fixed) > 0 {
 		return -1, fixed
 	}
-	if bestScore <= 1e-12 {
-		return -1, nil // nothing moves the bound; fall back to least-fractional
+
+	// final pick: score every candidate by its (now seeded) pseudocost.
+	best, bestCol := 0.0, -1
+	for _, cd := range cands {
+		estUp, estDn, upN, dnN := m.psEstimate(cd.j, cd.frac)
+		if upN == 0 || dnN == 0 {
+			continue // still unseeded: no reliable score
+		}
+		if score := cbcScore(estUp, estDn, hasIncumbent); score > best {
+			best, bestCol = score, cd.j
+		}
 	}
 	return bestCol, nil
 }

@@ -126,11 +126,10 @@ func presolvePass(p *problem.Problem) (changed bool) {
 			}
 		}
 
-		// coefficient tightening: binaries in pure one-sided big-M rows.
-		// The >= mirror is gated to large models: on small proof-tree
-		// cases it perturbs the cut set for no gain (see perf notes).
+		// coefficient tightening: binaries in pure one-sided big-M rows. The
+		// >= mirror is CBC-ungated under D1, else gated to large models.
 		pureLE := rub < inf && rlb == -inf
-		pureGE := rlb > -inf && rub == inf && len(p.Rows) > 3000
+		pureGE := rlb > -inf && rub == inf && (cbcD1 || len(p.Rows) > 3000)
 		if !pureLE && !pureGE {
 			continue
 		}

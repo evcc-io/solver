@@ -36,7 +36,7 @@ func BenchmarkLUFactorize(b *testing.B) {
 	k, colIdx, colVal := loadKernel(b)
 	b.ResetTimer()
 	for range b.N {
-		if lu := luFactorize(k, colIdx, colVal); lu == nil {
+		if lu := luFactorize(k, colIdx, colVal, nil); lu == nil {
 			b.Fatal("singular")
 		}
 	}
@@ -44,7 +44,7 @@ func BenchmarkLUFactorize(b *testing.B) {
 
 func BenchmarkLUSolve(b *testing.B) {
 	k, colIdx, colVal := loadKernel(b)
-	lu := luFactorize(k, colIdx, colVal)
+	lu := luFactorize(k, colIdx, colVal, nil)
 	if lu == nil {
 		b.Fatal("singular")
 	}
@@ -60,7 +60,7 @@ func BenchmarkLUSolve(b *testing.B) {
 
 func BenchmarkLUSolveT(b *testing.B) {
 	k, colIdx, colVal := loadKernel(b)
-	lu := luFactorize(k, colIdx, colVal)
+	lu := luFactorize(k, colIdx, colVal, nil)
 	if lu == nil {
 		b.Fatal("singular")
 	}
