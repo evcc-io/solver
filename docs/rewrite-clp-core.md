@@ -37,7 +37,9 @@ real CBC (`cbc_run.py`) before activation.
 
 ## Status
 
-- [ ] 1. Forrest-Tomlin factorization  ← in progress
+- [x] 1. Forrest-Tomlin factorization — LU + solves + `replaceColumn` (FT column
+      update) + sparse solve kernel, property-tested. Dense-backed storage;
+      fully-sparse update (row+col U structures) still to come. Not yet wired.
 - [ ] 2. Markowitz LU
 - [ ] 3. CglPreProcess
 - [ ] 4. Cgl suite

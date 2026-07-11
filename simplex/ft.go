@@ -14,6 +14,13 @@ type ftLU struct {
 	rlist   []ftR     // FT update row-transforms, applied after L^-1 P
 	z       []float64 // solve scratch, step-indexed
 	spike   []float64 // replaceColumn scratch, pooled (hot path)
+
+	// sparse solve kernel: nonzero indices over the dense factors (O(nnz)
+	// solves). L lists built once; U lists rebuilt after each replaceColumn.
+	uNZrow [][]int32 // step-row s -> step-cols j>s with ustep[s][j] != 0
+	uNZcol [][]int32 // step-col s -> step-rows t<s with ustep[t][s] != 0
+	lFwd   [][]int32 // step s -> steps t<s with lmult[prow[s]][t] != 0
+	lBack  [][]int32 // step s -> steps t>s with lmult[prow[t]][s] != 0
 }
 
 // ftR is one update elimination: step-row s+1 -= mult * step-row s.
@@ -69,7 +76,49 @@ func newFTLU(m int, a []float64) *ftLU {
 			}
 		}
 	}
+	f.buildLNZ()
+	f.buildUNZ()
 	return f
+}
+
+// buildLNZ records L's nonzero indices (L is fixed under column swaps).
+func (f *ftLU) buildLNZ() {
+	m := f.m
+	f.lFwd = make([][]int32, m)
+	f.lBack = make([][]int32, m)
+	for s := range m {
+		for t := 0; t < s; t++ {
+			if f.lmult[f.prow[s]*m+t] != 0 {
+				f.lFwd[s] = append(f.lFwd[s], int32(t))
+			}
+		}
+		for t := s + 1; t < m; t++ {
+			if f.lmult[f.prow[t]*m+s] != 0 {
+				f.lBack[s] = append(f.lBack[s], int32(t))
+			}
+		}
+	}
+}
+
+// buildUNZ (re)builds U's row/column nonzero indices from the dense factor.
+func (f *ftLU) buildUNZ() {
+	m := f.m
+	if f.uNZrow == nil {
+		f.uNZrow = make([][]int32, m)
+		f.uNZcol = make([][]int32, m)
+	}
+	for s := range m {
+		f.uNZrow[s] = f.uNZrow[s][:0]
+		f.uNZcol[s] = f.uNZcol[s][:0]
+	}
+	for s := range m {
+		for j := s + 1; j < m; j++ {
+			if f.ustep[s*m+j] != 0 {
+				f.uNZrow[s] = append(f.uNZrow[s], int32(j))
+				f.uNZcol[j] = append(f.uNZcol[j], int32(s))
+			}
+		}
+	}
 }
 
 // forwardLR computes z = R L^-1 P b in step space (shared by ftran).
@@ -78,8 +127,9 @@ func (f *ftLU) forwardLR(b []float64) {
 	z := f.z
 	for s := range m {
 		v := b[f.prow[s]]
-		for t := 0; t < s; t++ {
-			v -= f.lmult[f.prow[s]*m+t] * z[t]
+		row := f.prow[s] * m
+		for _, t := range f.lFwd[s] {
+			v -= f.lmult[row+int(t)] * z[t]
 		}
 		z[s] = v
 	}
@@ -95,10 +145,11 @@ func (f *ftLU) ftran(b []float64) {
 	z := f.z
 	for s := m - 1; s >= 0; s-- { // U^-1, z becomes x in step space
 		v := z[s]
-		for j := s + 1; j < m; j++ {
-			v -= f.ustep[s*m+j] * z[j]
+		row := s * m
+		for _, j := range f.uNZrow[s] {
+			v -= f.ustep[row+int(j)] * z[j]
 		}
-		z[s] = v / f.ustep[s*m+s]
+		z[s] = v / f.ustep[row+s]
 	}
 	for s := range m {
 		b[f.pcol[s]] = z[s]
@@ -111,8 +162,8 @@ func (f *ftLU) btran(c []float64) {
 	z := f.z
 	for s := range m { // U^-T (forward), c mapped through pcol
 		v := c[f.pcol[s]]
-		for t := 0; t < s; t++ {
-			v -= f.ustep[t*m+s] * z[t]
+		for _, t := range f.uNZcol[s] {
+			v -= f.ustep[int(t)*m+s] * z[t]
 		}
 		z[s] = v / f.ustep[s*m+s]
 	}
@@ -122,7 +173,7 @@ func (f *ftLU) btran(c []float64) {
 	}
 	for s := m - 1; s >= 0; s-- { // L^-T (back), map through prow
 		v := z[s]
-		for t := s + 1; t < m; t++ {
+		for _, t := range f.lBack[s] {
 			v -= f.lmult[f.prow[t]*m+s] * z[t]
 		}
 		z[s] = v
@@ -172,5 +223,6 @@ func (f *ftLU) replaceColumn(col int, a []float64) bool {
 		}
 		f.rlist = append(f.rlist, ftR{s, mult})
 	}
+	f.buildUNZ() // U changed; L (and its lFwd/lBack) is fixed under swaps
 	return math.Abs(f.ustep[(m-1)*m+(m-1)]) >= 1e-12
 }
