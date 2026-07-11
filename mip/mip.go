@@ -378,7 +378,11 @@ func (m *Model) Solve() Result {
 					mir = m.rowMIRCuts(x, origRows)
 				}
 			}
-			added := gmi + prb + mir
+			cgl := 0
+			if cglEnabled {
+				cgl = m.knapsackCoverCuts(x) + m.cliqueCuts(x) + m.zeroHalfCuts(x)
+			}
+			added := gmi + prb + mir + cgl
 			debugf("cuts: round %d added %d rows (gmi %d, probing %d, mir %d, bound %g, pivots %d)",
 				round, added, gmi, prb, mir, obj, m.LP.Stats.Phase1+m.LP.Stats.Phase2+m.LP.Stats.Dual)
 			if added == 0 {
