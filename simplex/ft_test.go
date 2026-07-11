@@ -56,6 +56,64 @@ func ftMatVecT(m int, a, x []float64) []float64 { // B^T * x
 	return y
 }
 
+// TestFTReplaceColumn applies random column swaps and checks ftran/btran
+// against the rebuilt basis (Forrest-Tomlin update correctness).
+func TestFTReplaceColumn(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	for trial := 0; trial < 150; trial++ {
+		m := 2 + rng.Intn(10)
+		a := make([]float64, m*m)
+		for i := range a {
+			a[i] = rng.NormFloat64()
+		}
+		for d := range m {
+			a[d*m+d] += float64(2 * m)
+		}
+		f := newFTLU(m, a)
+		if f == nil {
+			continue
+		}
+		for upd := 0; upd < 5; upd++ {
+			col := rng.Intn(m)
+			nv := make([]float64, m)
+			for i := range nv {
+				nv[i] = rng.NormFloat64()
+			}
+			nv[col] += float64(2 * m) // keep well-conditioned
+			if !f.replaceColumn(col, nv) {
+				break
+			}
+			for r := range m { // apply the swap to the reference basis
+				a[col*m+r] = nv[r]
+			}
+			x := make([]float64, m)
+			for i := range x {
+				x[i] = rng.NormFloat64()
+			}
+			b := ftMatVec(m, a, x)
+			bb := append([]float64(nil), b...)
+			f.ftran(bb)
+			for i := range m {
+				if math.Abs(bb[i]-x[i]) > 1e-6*(1+math.Abs(x[i])) {
+					t.Fatalf("ftran trial %d upd %d m=%d col %d: got %g want %g", trial, upd, m, i, bb[i], x[i])
+				}
+			}
+			y := make([]float64, m)
+			for i := range y {
+				y[i] = rng.NormFloat64()
+			}
+			c := ftMatVecT(m, a, y)
+			cc := append([]float64(nil), c...)
+			f.btran(cc)
+			for i := range m {
+				if math.Abs(cc[i]-y[i]) > 1e-6*(1+math.Abs(y[i])) {
+					t.Fatalf("btran trial %d upd %d m=%d row %d: got %g want %g", trial, upd, m, i, cc[i], y[i])
+				}
+			}
+		}
+	}
+}
+
 // TestFTLUSolve checks ftran/btran against a known x on random nonsingular B.
 func TestFTLUSolve(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
