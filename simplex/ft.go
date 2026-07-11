@@ -3,24 +3,22 @@ package simplex
 import "math"
 
 // Forrest-Tomlin basis factorization (Clp CoinFactorization port, component 1;
-// see docs/rewrite-clp-core.md). Column swap = shift + Hessenberg elimination.
+// see docs/rewrite-clp-core.md). Sparse U-rows, O(nnz) solves and column swap.
 type ftLU struct {
 	m       int
-	lmult   []float64 // lmult[origRow*m+step]: unit-lower L multiplier
-	ustep   []float64 // ustep[step*m+jcol]: upper triangular in step-col space
-	prow    []int     // prow[step] = original basis row
-	pcol    []int     // pcol[stepCol] = original basis column at that step-col
-	rinvcol []int     // original column -> step-col
-	rlist   []ftR     // FT update row-transforms, applied after L^-1 P
-	z       []float64 // solve scratch, step-indexed
-	spike   []float64 // replaceColumn scratch, pooled (hot path)
-
-	// sparse solve kernel: nonzero indices over the dense factors (O(nnz)
-	// solves). L lists built once; U lists rebuilt after each replaceColumn.
-	uNZrow [][]int32 // step-row s -> step-cols j>s with ustep[s][j] != 0
-	uNZcol [][]int32 // step-col s -> step-rows t<s with ustep[t][s] != 0
-	lFwd   [][]int32 // step s -> steps t<s with lmult[prow[s]][t] != 0
-	lBack  [][]int32 // step s -> steps t>s with lmult[prow[t]][s] != 0
+	lmult   []float64 // lmult[origRow*m+step]: unit-lower L multiplier (dense, fixed)
+	lFwd    [][]int32 // step s -> steps t<s with lmult[prow[s]][t] != 0
+	lBack   [][]int32 // step s -> steps t>s with lmult[prow[t]][s] != 0
+	udiag   []float64 // udiag[s] = U[s][s]
+	uCol    [][]int32 // step-row s -> step-cols j>s with a nonzero
+	uVal    [][]float64
+	prow    []int // prow[step] = original basis row
+	pcol    []int // pcol[stepCol] = original basis column
+	rinvcol []int // original column -> step-col
+	rlist   []ftR
+	z       []float64 // solve scratch
+	spike   []float64 // replaceColumn scratch (pooled)
+	blk     []float64 // trailing-block dense scratch (pooled)
 }
 
 // ftR is one update elimination: step-row s+1 -= mult * step-row s.
@@ -33,9 +31,10 @@ type ftR struct {
 // partial row pivoting; nil if singular.
 func newFTLU(m int, a []float64) *ftLU {
 	f := &ftLU{
-		m: m, lmult: make([]float64, m*m), ustep: make([]float64, m*m),
+		m: m, lmult: make([]float64, m*m), udiag: make([]float64, m),
+		uCol: make([][]int32, m), uVal: make([][]float64, m),
 		prow: make([]int, m), pcol: make([]int, m), rinvcol: make([]int, m),
-		z: make([]float64, m), spike: make([]float64, m),
+		z: make([]float64, m), spike: make([]float64, m), blk: make([]float64, m*m),
 	}
 	work := make([]float64, m*m) // work[row*m+col]
 	for c := range m {
@@ -59,8 +58,12 @@ func newFTLU(m int, a []float64) *ftLU {
 		used[pr] = true
 		f.prow[step], f.pcol[step], f.rinvcol[step] = pr, step, step
 		piv := work[pr*m+step]
-		for j := step; j < m; j++ {
-			f.ustep[step*m+j] = work[pr*m+j]
+		f.udiag[step] = piv
+		for j := step + 1; j < m; j++ {
+			if v := work[pr*m+j]; v != 0 {
+				f.uCol[step] = append(f.uCol[step], int32(j))
+				f.uVal[step] = append(f.uVal[step], v)
+			}
 		}
 		for r := range m {
 			if used[r] {
@@ -77,7 +80,6 @@ func newFTLU(m int, a []float64) *ftLU {
 		}
 	}
 	f.buildLNZ()
-	f.buildUNZ()
 	return f
 }
 
@@ -100,28 +102,7 @@ func (f *ftLU) buildLNZ() {
 	}
 }
 
-// buildUNZ (re)builds U's row/column nonzero indices from the dense factor.
-func (f *ftLU) buildUNZ() {
-	m := f.m
-	if f.uNZrow == nil {
-		f.uNZrow = make([][]int32, m)
-		f.uNZcol = make([][]int32, m)
-	}
-	for s := range m {
-		f.uNZrow[s] = f.uNZrow[s][:0]
-		f.uNZcol[s] = f.uNZcol[s][:0]
-	}
-	for s := range m {
-		for j := s + 1; j < m; j++ {
-			if f.ustep[s*m+j] != 0 {
-				f.uNZrow[s] = append(f.uNZrow[s], int32(j))
-				f.uNZcol[j] = append(f.uNZcol[j], int32(s))
-			}
-		}
-	}
-}
-
-// forwardLR computes z = R L^-1 P b in step space (shared by ftran).
+// forwardLR computes z = R L^-1 P b in step space.
 func (f *ftLU) forwardLR(b []float64) {
 	m := f.m
 	z := f.z
@@ -143,13 +124,13 @@ func (f *ftLU) ftran(b []float64) {
 	m := f.m
 	f.forwardLR(b)
 	z := f.z
-	for s := m - 1; s >= 0; s-- { // U^-1, z becomes x in step space
+	for s := m - 1; s >= 0; s-- { // U^-1
 		v := z[s]
-		row := s * m
-		for _, j := range f.uNZrow[s] {
-			v -= f.ustep[row+int(j)] * z[j]
+		uc, uv := f.uCol[s], f.uVal[s]
+		for k, j := range uc {
+			v -= uv[k] * z[j]
 		}
-		z[s] = v / f.ustep[row+s]
+		z[s] = v / f.udiag[s]
 	}
 	for s := range m {
 		b[f.pcol[s]] = z[s]
@@ -160,18 +141,22 @@ func (f *ftLU) ftran(b []float64) {
 func (f *ftLU) btran(c []float64) {
 	m := f.m
 	z := f.z
-	for s := range m { // U^-T (forward), c mapped through pcol
-		v := c[f.pcol[s]]
-		for _, t := range f.uNZcol[s] {
-			v -= f.ustep[int(t)*m+s] * z[t]
-		}
-		z[s] = v / f.ustep[s*m+s]
+	for s := range m {
+		z[s] = c[f.pcol[s]]
 	}
-	for i := len(f.rlist) - 1; i >= 0; i-- { // R^T, reverse order
+	for s := range m { // U^-T forward by push (row storage)
+		zs := z[s] / f.udiag[s]
+		z[s] = zs
+		uc, uv := f.uCol[s], f.uVal[s]
+		for k, j := range uc {
+			z[j] -= uv[k] * zs
+		}
+	}
+	for i := len(f.rlist) - 1; i >= 0; i-- {
 		r := f.rlist[i]
 		z[r.s] -= r.mult * z[r.s+1]
 	}
-	for s := m - 1; s >= 0; s-- { // L^-T (back), map through prow
+	for s := m - 1; s >= 0; s-- { // L^-T back
 		v := z[s]
 		for _, t := range f.lBack[s] {
 			v -= f.lmult[f.prow[t]*m+s] * z[t]
@@ -181,15 +166,15 @@ func (f *ftLU) btran(c []float64) {
 	}
 }
 
-// replaceColumn swaps basis column `col` for vector a (original-row indexed),
-// updating the factors in place (Forrest-Tomlin); false if it goes singular.
+// replaceColumn swaps basis column `col` for vector a (Forrest-Tomlin); false
+// if singular. Trailing rows [p..m-1] update in a dense block, others renumber.
 func (f *ftLU) replaceColumn(col int, a []float64) bool {
 	m := f.m
 	w := f.spike
-	for s := range m { // spike w = R L^-1 P a (current U-space)
+	for s := range m { // spike w = R L^-1 P a
 		v := a[f.prow[s]]
-		for t := 0; t < s; t++ {
-			v -= f.lmult[f.prow[s]*m+t] * w[t]
+		for _, t := range f.lFwd[s] {
+			v -= f.lmult[f.prow[s]*m+int(t)] * w[t]
 		}
 		w[s] = v
 	}
@@ -197,32 +182,87 @@ func (f *ftLU) replaceColumn(col int, a []float64) bool {
 		w[r.s+1] -= r.mult * w[r.s]
 	}
 	p := f.rinvcol[col]
-	for s := range m { // shift step-cols p+1..m-1 left, spike -> last col
-		for j := p; j < m-1; j++ {
-			f.ustep[s*m+j] = f.ustep[s*m+j+1]
+
+	// rows above p: renumber columns (drop p, shift >p down, append spike col)
+	for s := 0; s < p; s++ {
+		uc, uv := f.uCol[s], f.uVal[s]
+		nc, nv := uc[:0], uv[:0]
+		for k, j := range uc {
+			if int(j) == p {
+				continue
+			}
+			jj := j
+			if int(j) > p {
+				jj--
+			}
+			nc = append(nc, jj)
+			nv = append(nv, uv[k])
 		}
-		f.ustep[s*m+(m-1)] = w[s]
+		if w[s] != 0 {
+			nc = append(nc, int32(m-1))
+			nv = append(nv, w[s])
+		}
+		f.uCol[s], f.uVal[s] = nc, nv
 	}
+
+	// trailing block d[i*bm+j], i,j in [0..bm), global step = p+i / col = p+j
+	bm := m - p
+	d := f.blk[:bm*bm]
+	for i := range d {
+		d[i] = 0
+	}
+	for i := 0; i < bm; i++ {
+		s := p + i
+		d[i*bm+i] = f.udiag[s]
+		for k, j := range f.uCol[s] {
+			d[i*bm+(int(j)-p)] = f.uVal[s][k]
+		}
+	}
+	// column shift inside the block: drop col 0 (global p), shift left, spike last
+	for i := 0; i < bm; i++ {
+		for j := 0; j < bm-1; j++ {
+			d[i*bm+j] = d[i*bm+j+1]
+		}
+		d[i*bm+(bm-1)] = w[p+i]
+	}
+	// eliminate the Hessenberg subdiagonal top-down
+	for j := 0; j < bm-1; j++ {
+		sub := d[(j+1)*bm+j]
+		if sub == 0 {
+			continue
+		}
+		diag := d[j*bm+j]
+		if math.Abs(diag) < 1e-12 {
+			return false
+		}
+		mult := sub / diag
+		for c := j; c < bm; c++ {
+			d[(j+1)*bm+c] -= mult * d[j*bm+c]
+		}
+		f.rlist = append(f.rlist, ftR{p + j, mult})
+	}
+	if math.Abs(d[(bm-1)*bm+(bm-1)]) < 1e-12 {
+		return false
+	}
+	// re-sparsify trailing rows
+	for i := 0; i < bm; i++ {
+		s := p + i
+		f.udiag[s] = d[i*bm+i]
+		nc, nv := f.uCol[s][:0], f.uVal[s][:0]
+		for j := i + 1; j < bm; j++ {
+			if v := d[i*bm+j]; v != 0 {
+				nc = append(nc, int32(p+j))
+				nv = append(nv, v)
+			}
+		}
+		f.uCol[s], f.uVal[s] = nc, nv
+	}
+
+	// pcol / rinvcol
 	for j := p; j < m-1; j++ {
 		f.pcol[j] = f.pcol[j+1]
 		f.rinvcol[f.pcol[j]] = j
 	}
 	f.pcol[m-1], f.rinvcol[col] = col, m-1
-	for s := p; s < m-1; s++ { // eliminate Hessenberg subdiagonal
-		sub := f.ustep[(s+1)*m+s]
-		if sub == 0 {
-			continue
-		}
-		diag := f.ustep[s*m+s]
-		if math.Abs(diag) < 1e-12 {
-			return false
-		}
-		mult := sub / diag
-		for j := s; j < m; j++ {
-			f.ustep[(s+1)*m+j] -= mult * f.ustep[s*m+j]
-		}
-		f.rlist = append(f.rlist, ftR{s, mult})
-	}
-	f.buildUNZ() // U changed; L (and its lFwd/lBack) is fixed under swaps
-	return math.Abs(f.ustep[(m-1)*m+(m-1)]) >= 1e-12
+	return true
 }

@@ -50,16 +50,19 @@ func BenchmarkFTReplace(b *testing.B) {
 	for i := range nv {
 		nv[i] = rng.NormFloat64()
 	}
-	nv[0] += float64(m)
 	rhs := make([]float64, m)
 	for i := range rhs {
 		rhs[i] = rng.NormFloat64()
 	}
+	f := newFTLU(m, a)
+	v := make([]float64, m)
 	b.ResetTimer()
-	for range b.N {
-		f := newFTLU(m, a)
-		f.replaceColumn(0, nv)
-		v := append([]float64(nil), rhs...)
+	for n := range b.N {
+		col := n % m
+		nv[col] += float64(m)
+		f.replaceColumn(col, nv)
+		nv[col] -= float64(m)
+		copy(v, rhs)
 		f.ftran(v)
 	}
 }
