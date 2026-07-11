@@ -1216,6 +1216,10 @@ func (m *Model) nodeBound(nd *node, j int) (float64, float64) {
 	return lb, ub
 }
 
+// strongProbeCap bounds dual pivots per strong-branch probe: enough for a
+// useful bound, cheap enough that probing all shallow nodes stays affordable.
+const strongProbeCap = 100
+
 // strongBranch (CBC-style) probes both children of the top candidates and
 // returns the column whose worse child moves the bound most; -1 if none do.
 // strongBranch probes both sides of the most fractional candidates. A side
@@ -1248,6 +1252,11 @@ func (m *Model) strongBranch(nd *node, x []float64, endState *simplex.State, obj
 	// short per-probe deadline: strong branching must never eat the budget
 	saved := m.LP.Deadline
 	defer func() { m.LP.Deadline = saved }()
+	// cheap strong-branch probes: a capped dual-only re-solve returns a valid
+	// lower bound (CBC limited-iteration strong branching) instead of a full
+	// node solve, at a fraction of the pivots
+	m.LP.SetProbe(strongProbeCap)
+	defer m.LP.ClearProbe()
 
 	bestCol, bestScore := -1, math.Inf(-1)
 	var fixed []boundOverride
