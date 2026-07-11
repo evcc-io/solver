@@ -102,6 +102,10 @@ type Model struct {
 	// per-column pseudocosts: observed bound gain per unit fraction
 	psUp, psDn   []float64
 	psUpN, psDnN []int
+
+	// continuous-row drop postsolve: keep mask + pre-drop rows for a·x
+	rrKeep []bool
+	rrRows []problem.Row
 }
 
 // psRecord accumulates one observed branching gain for column j.
@@ -205,6 +209,12 @@ func (m *Model) Solve() Result {
 		}
 		probe(m.P, probeDeadline)
 		presolve(m.P)
+		// forcing-row removal: drop redundant continuous rows (inert AND
+		// clear of the integer cut suite). Postsolve rebuilds their outputs.
+		if q, keep := dropRedundantContinuousRows(m.P); q != nil {
+			m.rrKeep, m.rrRows = keep, m.P.Rows
+			m.P = q
+		}
 		if q, red := eliminateSingletons(m.P); red != nil {
 			m.P, m.red = q, red
 			if len(m.MIPStart) == len(red.orig.Cols) {
@@ -676,6 +686,9 @@ func (m *Model) Solve() Result {
 	}
 	if m.red != nil {
 		m.red.expand(&res)
+	}
+	if m.rrKeep != nil {
+		expandRows(&res, m.rrKeep, m.rrRows)
 	}
 	return res
 }

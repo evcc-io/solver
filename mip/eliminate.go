@@ -167,6 +167,105 @@ func eliminateSingletons(p *problem.Problem) (*problem.Problem, *reduction) {
 	return q, &reduction{orig: p, records: records, colMap: colMap}
 }
 
+// dropRedundantContinuousRows removes rows that (a) can never bind under the
+// current column bounds (min activity >= lb and max activity <= ub) and (b)
+// contain no integer column. Condition (a) makes removal exact for the LP;
+// condition (b) keeps it clear of the GMI/MIR cut suite, which only derives
+// from integer structure — so the relaxation, cuts and branch tree are all
+// unchanged, only inert continuous rows leave (CBC forcing-row removal).
+// Returns (nil,nil) when nothing qualifies; keep[origRow]=false when dropped.
+func dropRedundantContinuousRows(p *problem.Problem) (*problem.Problem, []bool) {
+	inf := problem.Inf
+	keep := make([]bool, len(p.Rows))
+	nkeep := 0
+	for ri := range p.Rows {
+		r := &p.Rows[ri]
+		rlb, rub := r.Bounds()
+		var mn, mx float64
+		var mni, mxi int
+		hasInt := false
+		for k, j := range r.Idx {
+			if p.Cols[j].Integer {
+				hasInt = true
+			}
+			a := r.Coef[k]
+			c := &p.Cols[j]
+			lb, ub := c.LB, c.UB
+			loInf := (a > 0 && lb <= -inf) || (a < 0 && ub >= inf)
+			hiInf := (a > 0 && ub >= inf) || (a < 0 && lb <= -inf)
+			if loInf {
+				mni++
+			} else if a >= 0 {
+				mn += a * lb
+			} else {
+				mn += a * ub
+			}
+			if hiInf {
+				mxi++
+			} else if a >= 0 {
+				mx += a * ub
+			} else {
+				mx += a * lb
+			}
+		}
+		redundant := !hasInt && mni == 0 && mxi == 0 && mn >= rlb-1e-7 && mx <= rub+1e-7
+		keep[ri] = !redundant
+		if keep[ri] {
+			nkeep++
+		}
+	}
+	if nkeep == len(p.Rows) {
+		return nil, nil
+	}
+	q := problem.New()
+	q.Name, q.ObjSense, q.SOSs = p.Name, p.ObjSense, p.SOSs
+	for j := range p.Cols {
+		c := &p.Cols[j]
+		q.AddCol(c.Name, c.LB, c.UB, c.Obj, c.Integer, nil, nil)
+	}
+	for ri := range p.Rows {
+		if !keep[ri] {
+			continue
+		}
+		r := &p.Rows[ri]
+		nri := q.AddRow(r.Name, r.Idx, r.Coef, r.Sense, r.RHS)
+		q.Rows[nri].HasRange, q.Rows[nri].Range = r.HasRange, r.Range
+	}
+	debugf("presolve: dropped %d/%d redundant continuous rows", len(p.Rows)-nkeep, len(p.Rows))
+	return q, keep
+}
+
+// expandRows restores full-length row outputs after a continuous-row drop:
+// kept rows copy through in order, dropped inert rows get activity a·x and a
+// zero dual (they never bind). orig is the pre-drop row set.
+func expandRows(res *Result, keep []bool, orig []problem.Row) {
+	if res.X == nil {
+		return
+	}
+	act := make([]float64, len(keep))
+	price := make([]float64, len(keep))
+	ri := 0
+	for i, k := range keep {
+		if k {
+			if ri < len(res.RowActivity) {
+				act[i] = res.RowActivity[ri]
+			}
+			if ri < len(res.RowPrice) {
+				price[i] = res.RowPrice[ri]
+			}
+			ri++
+			continue
+		}
+		r := &orig[i]
+		a := 0.0
+		for kk, j := range r.Idx {
+			a += r.Coef[kk] * res.X[j]
+		}
+		act[i] = a // price stays 0: an inert row never binds
+	}
+	res.RowActivity, res.RowPrice = act, price
+}
+
 // setRowBounds rewrites a row's sense/rhs/range to represent [lb, ub].
 func setRowBounds(r *problem.Row, lb, ub float64) {
 	inf := problem.Inf
