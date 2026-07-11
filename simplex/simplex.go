@@ -122,16 +122,25 @@ type State struct {
 	value   []float64
 	f       *factor // basis factorization, shared between clones
 	etas    []eta   // product-form updates since f was built
+	ft      *ftLU   // Forrest-Tomlin factor (CBC_FT); when set, supersedes f+etas
 }
 
 // ftranVec computes Binv*v in place (v by row in, by basis position out).
 func (st *State) ftranVec(v []float64) {
+	if st.ft != nil {
+		st.ft.ftran(v)
+		return
+	}
 	st.f.ftran(v)
 	applyEtas(st.etas, v)
 }
 
 // btranVec computes Binv^T*w in place (w by basis position in, by row out).
 func (st *State) btranVec(w []float64) {
+	if st.ft != nil {
+		st.ft.btran(w)
+		return
+	}
 	applyEtasT(st.etas, w)
 	st.f.btran(w)
 }
@@ -155,6 +164,23 @@ func (lp *LP) refactorize(st *State) bool {
 	}
 	st.f = f
 	st.etas = nil
+	if ftEnabled {
+		bcr := make([][]int32, lp.m)
+		bcv := make([][]float64, lp.m)
+		for pos, j := range st.basicOf {
+			rows, vals := lp.column(int(j))
+			cr := make([]int32, len(rows))
+			for k, r := range rows {
+				cr[k] = int32(r)
+			}
+			bcr[pos], bcv[pos] = cr, append([]float64(nil), vals...)
+		}
+		if ft := newFTLUSparse(lp.m, bcr, bcv); ft != nil {
+			st.ft = ft
+		} else {
+			st.ft = nil // singular under FT ordering: fall back to f+etas
+		}
+	}
 	return true
 }
 
@@ -278,13 +304,17 @@ func (lp *LP) resetNonbasic(st *State, j int) {
 // Clone returns a deep copy, safe to mutate independently of st (used to
 // warm-start a branch-and-bound child node from its parent's basis).
 func (st *State) Clone() *State {
-	return &State{
+	c := &State{
 		status:  append([]varStat(nil), st.status...),
 		basicOf: append([]int(nil), st.basicOf...),
 		value:   append([]float64(nil), st.value...),
 		f:       st.f, // immutable, shared
 		etas:    append([]eta(nil), st.etas...),
 	}
+	if st.ft != nil {
+		c.ft = st.ft.clone() // mutable: each child owns its FT factor
+	}
+	return c
 }
 
 // WarmSolve resolves from st after bound changes on touched. A touched
@@ -1127,6 +1157,25 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 	} else {
 		st.status[leaving] = atUpper
 		st.value[leaving] = ub
+	}
+
+	if st.ft != nil { // Forrest-Tomlin column swap in place of an eta
+		cb := st.ft.colBuf
+		for i := range cb {
+			cb[i] = 0
+		}
+		rows, vals := lp.column(q)
+		for k, r := range rows {
+			cb[r] = vals[k]
+		}
+		ok := st.ft.replaceColumn(leaveRow, cb)
+		st.basicOf[leaveRow] = q
+		st.status[q] = basic
+		if !ok || len(st.ft.rlist) > maxEtas { // unstable/full: rebuild ft
+			lp.refactorize(st)
+			lp.recomputeBasics(st)
+		}
+		return
 	}
 
 	idx := make([]int32, len(wsIdx))

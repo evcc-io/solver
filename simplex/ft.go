@@ -1,6 +1,34 @@
 package simplex
 
-import "math"
+import (
+	"math"
+	"os"
+)
+
+// ftEnabled wires the Forrest-Tomlin factor into the solve path (experimental).
+var ftEnabled = os.Getenv("CBC_FT") == "1"
+
+// clone deep-copies the mutable factor so a branch-and-bound child updates it
+// independently of its parent.
+func (f *ftLU) clone() *ftLU {
+	c := &ftLU{
+		m: f.m, udiag: append([]float64(nil), f.udiag...),
+		prow: append([]int(nil), f.prow...), pcol: append([]int(nil), f.pcol...),
+		rinvrow: append([]int(nil), f.rinvrow...), rinvcol: append([]int(nil), f.rinvcol...),
+		rlist: append([]ftR(nil), f.rlist...),
+		z:     make([]float64, f.m), spike: make([]float64, f.m), blk: make([]float64, f.m*f.m),
+		colBuf: make([]float64, f.m),
+		lCol:   make([][]int32, f.m), lVal: make([][]float64, f.m),
+		uCol: make([][]int32, f.m), uVal: make([][]float64, f.m),
+	}
+	for s := range f.m {
+		c.lCol[s] = append([]int32(nil), f.lCol[s]...)
+		c.lVal[s] = append([]float64(nil), f.lVal[s]...)
+		c.uCol[s] = append([]int32(nil), f.uCol[s]...)
+		c.uVal[s] = append([]float64(nil), f.uVal[s]...)
+	}
+	return c
+}
 
 // Forrest-Tomlin basis factorization (Clp CoinFactorization port, components
 // 1+2; see docs/rewrite-clp-core.md). Sparse L-columns + U-rows, O(nnz) solves.
@@ -19,6 +47,7 @@ type ftLU struct {
 	z       []float64 // solve scratch
 	spike   []float64 // replaceColumn scratch (pooled)
 	blk     []float64 // trailing-block dense scratch (pooled)
+	colBuf  []float64 // dense entering-column scatter (pivot wiring)
 }
 
 // ftR is one update elimination: step-row s+1 -= mult * step-row s.
@@ -52,6 +81,7 @@ func newFTLUSparse(m int, colRow [][]int32, colVal [][]float64) *ftLU {
 		prow: make([]int, m), pcol: make([]int, m),
 		rinvrow: make([]int, m), rinvcol: make([]int, m),
 		z: make([]float64, m), spike: make([]float64, m), blk: make([]float64, m*m),
+		colBuf: make([]float64, m),
 	}
 	// working sparse rows (by original row); entries are (origCol, val)
 	rowCol := make([][]int32, m)
@@ -316,6 +346,9 @@ func (f *ftLU) replaceColumn(col int, a []float64) bool {
 			return false
 		}
 		mult := sub / diag
+		if math.Abs(mult) > 1e8 { // unstable update (no pivoting): refactorize
+			return false
+		}
 		for c := j; c < bm; c++ {
 			d[(j+1)*bm+c] -= mult * d[j*bm+c]
 		}
