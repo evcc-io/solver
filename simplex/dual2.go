@@ -118,8 +118,8 @@ func (lp *LP) dual2Run(st *State) dual2Result {
 		lp.recomputeBasics(st)
 	}
 
-	// DSE weights per row, reset each solve (re-solves are short; the
-	// reference framework is the start basis with unit weights)
+	// DSE weights reset to 1 each solve: Clp mode-3 fresh reference frame.
+	// (Persisting them across sibling node bases measured worse — stale.)
 	w := make([]float64, m)
 	for i := range w {
 		w[i] = 1
