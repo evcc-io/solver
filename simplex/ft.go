@@ -13,6 +13,7 @@ type ftLU struct {
 	rinvcol []int     // original column -> step-col
 	rlist   []ftR     // FT update row-transforms, applied after L^-1 P
 	z       []float64 // solve scratch, step-indexed
+	spike   []float64 // replaceColumn scratch, pooled (hot path)
 }
 
 // ftR is one update elimination: step-row s+1 -= mult * step-row s.
@@ -27,7 +28,7 @@ func newFTLU(m int, a []float64) *ftLU {
 	f := &ftLU{
 		m: m, lmult: make([]float64, m*m), ustep: make([]float64, m*m),
 		prow: make([]int, m), pcol: make([]int, m), rinvcol: make([]int, m),
-		z: make([]float64, m),
+		z: make([]float64, m), spike: make([]float64, m),
 	}
 	work := make([]float64, m*m) // work[row*m+col]
 	for c := range m {
@@ -133,7 +134,7 @@ func (f *ftLU) btran(c []float64) {
 // updating the factors in place (Forrest-Tomlin); false if it goes singular.
 func (f *ftLU) replaceColumn(col int, a []float64) bool {
 	m := f.m
-	w := make([]float64, m)
+	w := f.spike
 	for s := range m { // spike w = R L^-1 P a (current U-space)
 		v := a[f.prow[s]]
 		for t := 0; t < s; t++ {

@@ -33,6 +33,37 @@ func BenchmarkFTLU(b *testing.B) {
 	}
 }
 
+// BenchmarkFTReplace: one FT column update + solve (the per-pivot engine cost).
+func BenchmarkFTReplace(b *testing.B) {
+	const m = 300
+	rng := rand.New(rand.NewSource(9))
+	a := make([]float64, m*m)
+	for i := range a {
+		if rng.Float64() < 0.03 {
+			a[i] = rng.NormFloat64()
+		}
+	}
+	for d := range m {
+		a[d*m+d] += float64(m)
+	}
+	nv := make([]float64, m)
+	for i := range nv {
+		nv[i] = rng.NormFloat64()
+	}
+	nv[0] += float64(m)
+	rhs := make([]float64, m)
+	for i := range rhs {
+		rhs[i] = rng.NormFloat64()
+	}
+	b.ResetTimer()
+	for range b.N {
+		f := newFTLU(m, a)
+		f.replaceColumn(0, nv)
+		v := append([]float64(nil), rhs...)
+		f.ftran(v)
+	}
+}
+
 // matVec computes B*x for column-major B (a[col*m+row]).
 func ftMatVec(m int, a, x []float64) []float64 {
 	y := make([]float64, m)
