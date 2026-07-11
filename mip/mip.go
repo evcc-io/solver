@@ -380,7 +380,7 @@ func (m *Model) Solve() Result {
 			}
 			cgl := 0
 			if cglEnabled {
-				cgl = m.knapsackCoverCuts(x) + m.cliqueCuts(x) + m.zeroHalfCuts(x)
+				cgl = m.knapsackCoverCuts(x) + m.cliqueCuts(x) + m.zeroHalfCuts(x) + m.flowCoverCuts(x)
 			}
 			added := gmi + prb + mir + cgl
 			debugf("cuts: round %d added %d rows (gmi %d, probing %d, mir %d, bound %g, pivots %d)",

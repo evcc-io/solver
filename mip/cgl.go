@@ -279,6 +279,78 @@ func (m *Model) zeroHalfCuts(x []float64) int {
 	return added
 }
 
+// flowCoverCuts adds simple flow-cover inequalities (Padberg-Van Roy-Wolsey)
+// for capacity rows sum x_j <= b whose x_j carry VUBs x_j <= u_j y_j.
+func (m *Model) flowCoverCuts(x []float64) int {
+	vubs := m.detectVUBs()
+	if len(vubs) == 0 {
+		return 0
+	}
+	added := 0
+	origRows := len(m.P.Rows)
+	for ri := 0; ri < origRows; ri++ {
+		r := &m.P.Rows[ri]
+		_, b := r.Bounds()
+		if math.IsInf(b, 1) || len(r.Idx) < 2 {
+			continue
+		}
+		// require every term a continuous +1 non-complemented VUB var
+		ok := true
+		for k, j := range r.Idx {
+			v, has := vubs[j]
+			if !has || v.complement || math.Abs(r.Coef[k]-1) > 1e-9 {
+				ok = false
+				break
+			}
+		}
+		if !ok {
+			continue
+		}
+		// cover C: greedily add until sum u_j > b
+		type cj struct {
+			j int
+			u float64
+		}
+		var cover []cj
+		sumU := 0.0
+		for _, j := range r.Idx {
+			v := vubs[j]
+			cover = append(cover, cj{j, v.m})
+			sumU += v.m
+			if sumU > b+1e-9 {
+				break
+			}
+		}
+		lambda := sumU - b
+		if lambda <= 1e-9 || len(cover) < 2 {
+			continue
+		}
+		// cut: sum_{C} [ x_j + (u_j-lambda)^+ (1 - y_j) ] <= b
+		var ci []int
+		var cv []float64
+		rhs := b
+		viol := 0.0
+		for _, e := range cover {
+			ci = append(ci, e.j)
+			cv = append(cv, 1)
+			viol += x[e.j]
+			if g := e.u - lambda; g > 0 {
+				y := vubs[e.j].z
+				ci = append(ci, y) // +g*(1-y): -g*y, rhs -= g
+				cv = append(cv, -g)
+				rhs -= g
+				viol += g * (1 - x[y])
+			}
+		}
+		if viol <= rhs+1e-6 {
+			continue
+		}
+		m.P.AddRow("", ci, cv, problem.LE, rhs)
+		added++
+	}
+	return added
+}
+
 // sortByXhatDesc sorts items by descending xhat (small n, insertion sort).
 func sortByXhatDesc(items []coverItem) {
 	for a := 1; a < len(items); a++ {
