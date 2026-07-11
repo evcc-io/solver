@@ -17,6 +17,10 @@ const (
 	cutDropTol  = 1e-11
 	maxCutsPer  = 32 // cuts per round
 	maxCutRound = 30 // hard cap; rounds stop early once the bound stalls
+
+	// cutMarginFrac stops cut rounds once a round's bound gain drops below this
+	// fraction of the cumulative gain (warm-invariant diminishing-returns test)
+	cutMarginFrac = 0.02
 )
 
 // probingCuts probes fractional binaries at x and adds violated implication

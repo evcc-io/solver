@@ -275,9 +275,14 @@ func (m *Model) Solve() Result {
 			m.LP.Deadline = cutDeadline
 		}
 		prevObj := math.Inf(1)
+		firstObj := 0.0 // round-0 bound, for the relative diminishing-returns test
 		flat := 0       // bound improvement can pause a round and resume
 		lastBatch := -1 // first row index of the previous round's cuts
 		poisoned := 0
+		// carry the prior round's solved state so the next round warm-starts
+		// the appended cut rows (dual repair) instead of solving from scratch
+		var warmPrev *simplex.State
+		var warmPrevM int
 		// pivots are speed-invariant work units: budgeting rounds by pivots
 		// keeps the cut set deterministic across engine speed changes; the
 		// wall-clock box stays as a safety cap only
@@ -308,6 +313,8 @@ func (m *Model) Solve() Result {
 			var st *simplex.State
 			if round == 0 && preSolved != nil {
 				status, st = simplex.Optimal, preSolved
+			} else if warmPrev != nil {
+				status, st, _ = m.LP.WarmSolveExtended(warmPrev, warmPrevM)
 			} else {
 				status, st, _ = m.LP.ColdSolve()
 			}
@@ -321,6 +328,7 @@ func (m *Model) Solve() Result {
 					m.LP = simplex.Build(m.P)
 					m.LP.Stats = stats // counters survive the retraction rebuild
 					m.LP.Deadline = cutDeadline
+					warmPrev = nil // retracted: cold-solve the last good relaxation
 					debugf("cuts: retracted poison batch, back to %d rows", lastBatch)
 					lastBatch = -1
 					if poisoned++; poisoned <= 2 {
@@ -341,7 +349,14 @@ func (m *Model) Solve() Result {
 			// stall test is relative to the proof gap: a round that raises the
 			// bound by less than the gap we're proving is work the tree absorbs
 			gapTol := math.Max(m.Limits.GapAbs, m.Limits.GapRel*math.Abs(obj))
-			if round > 0 && obj-prevObj < math.Max(1e-7, gapTol) {
+			if round == 0 {
+				firstObj = obj
+			}
+			// diminishing returns vs cumulative gain: warm re-solves are too
+			// cheap for the pivot budget to stop over-cutting (weak late cuts)
+			total := obj - firstObj
+			marginal := round > 0 && total > 0 && obj-prevObj < cutMarginFrac*total
+			if marginal || (round > 0 && obj-prevObj < math.Max(1e-7, gapTol)) {
 				if flat++; flat >= 2 {
 					debugf("cuts: bound stalled at %g after %d rounds", obj, round)
 					break
@@ -378,16 +393,17 @@ func (m *Model) Solve() Result {
 			m.LP.Stats = stats // carry pivot counters across rebuilds
 			m.LP.Deadline = cutDeadline
 			rootSt = nil
+			warmPrev, warmPrevM = st, lastBatch // resolve appended rows warm
 		}
 		m.LP.Deadline = deadline
 	}
 
-	// keep only cuts tight at the root: slack rows bloat every node re-solve
+	// keep only cuts tight at the root; drop against the cold canonical vertex
+	// (a warm re-solve lands elsewhere, keeping a different cut set)
 	if len(m.P.Rows) > origRows {
-		if rootSt == nil {
-			if status, st, _ := m.LP.ColdSolve(); status == simplex.Optimal {
-				rootSt = st
-			}
+		rootSt = nil
+		if status, st, _ := m.LP.ColdSolve(); status == simplex.Optimal {
+			rootSt = st
 		}
 		if rootSt != nil {
 			_, rowAct, _, _ := m.LP.Solution(rootSt)
