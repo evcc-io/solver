@@ -127,13 +127,13 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 
 ## Missing vs. real CBC
 
-- **Cut families beyond GMI, probing, single-row MIR and pairwise
-  TwoMIR**: no knapsack cover, clique, flow-cover, or lift-and-project
-  cuts; no cuts below the root. A sound multi-row c-MIR generator (equality-chain
-  aggregation with exact variable-bound substitution, property-tested)
-  exists in `mip/cmir.go` but stays unwired: measured on the target
-  instances it separates nothing that GMI + probing have not already
-  found.
+- **Extra cut families are gated off, not absent**: knapsack-cover, clique,
+  zero-half, flow-cover (PVRW) and lift-and-project (lifted cover) generators
+  live in `mip/cgl.go` behind `CBC_CGL` — all sound (soundness-tested; golden
+  13/13 objectives correct with `CBC_CGL=1`). They are gated because, as the
+  measurements show, they separate little that GMI + probing + TwoMir do not
+  already find on these instances. A sound multi-row c-MIR generator
+  (`mip/cmir.go`) is likewise unwired. No cuts below the root.
 - **Dual steepest edge, now active via a mixed engine**: the Clp-style
   dual (`simplex/dual2.go`: DSE matched to `ClpDualRowSteepest::updateWeights`,
   Harris ratio test, cost perturbation, hypersparse FTRAN) drives the deep

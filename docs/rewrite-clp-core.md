@@ -47,9 +47,9 @@ real CBC (`cbc_run.py`) before activation.
       needs a singleton pre-pass and bucketed pivot search (currently O(m^2)
       scans), and full Markowitz; not yet faster than the tuned dense path.
 - [ ] 3. CglPreProcess (large subsystem — not started)
-- [~] 4. Cgl generators — 7 of 9: GMI, probing, single-row MIR, TwoMir (active);
-      knapsack-cover, clique, zero-half (sound, soundness-tested, wired behind
-      CBC_CGL — golden 13/13 correct). Remaining: flow-cover (VUB flow-structure
-      detection) and lift-and-project (cut-generation LP) — the two hardest.
+- [x] 4. Cgl generators — 9 of 9: GMI, probing, single-row MIR, TwoMir (active);
+      knapsack-cover, clique, zero-half, flow-cover (PVRW), lift-and-project
+      (lifted cover cuts) behind CBC_CGL. All sound (soundness-tested +
+      golden 13/13 objectives correct with CBC_CGL=1).
 - [~] 5. Dual loop — `dual2.go` DSE dual is built and active via the mixed
       engine (shipped); Clp partial-pricing / infeasibility-list not ported.
