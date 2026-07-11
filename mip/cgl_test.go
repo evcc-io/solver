@@ -44,6 +44,7 @@ func TestCglCutsSound(t *testing.T) {
 		m.knapsackCoverCuts(x)
 		m.cliqueCuts(x)
 		m.zeroHalfCuts(x)
+		m.liftProjectCuts(x)
 
 		// enumerate all 0/1 points feasible for the original rows; each must
 		// satisfy every generated cut

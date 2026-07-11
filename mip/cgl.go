@@ -198,6 +198,110 @@ func (m *Model) cliqueCuts(x []float64) int {
 	return added
 }
 
+// liftProjectCuts adds lifted cover inequalities (sequential up-lifting of a
+// knapsack cover — a sound lift-and-project family cut).
+func (m *Model) liftProjectCuts(x []float64) int {
+	added := 0
+	origRows := len(m.P.Rows)
+	for ri := 0; ri < origRows; ri++ {
+		idx, a, b, compl, ok := m.binRowLE(&m.P.Rows[ri])
+		if !ok || b < 0 {
+			continue
+		}
+		items := make([]coverItem, len(idx))
+		for k := range idx {
+			xh := x[idx[k]]
+			if compl[k] {
+				xh = 1 - xh
+			}
+			items[k] = coverItem{k, xh}
+		}
+		sortByXhatDesc(items)
+		inCover := make([]bool, len(idx))
+		var cw []float64
+		sumA := 0.0
+		ncov := 0
+		for _, e := range items {
+			if e.xhat <= 1e-9 {
+				break
+			}
+			inCover[e.k] = true
+			cw = append(cw, a[e.k])
+			sumA += a[e.k]
+			ncov++
+			if sumA > b+1e-9 {
+				break
+			}
+		}
+		if sumA <= b+1e-9 || ncov < 2 {
+			continue
+		}
+		sortFloats(cw)
+		card := ncov - 1
+		maxfit := func(cap float64) int {
+			if cap < -1e-9 {
+				return 0
+			}
+			s, c := 0.0, 0
+			for _, w := range cw {
+				if s+w <= cap+1e-9 {
+					s += w
+					c++
+				} else {
+					break
+				}
+			}
+			return c
+		}
+		// build lifted cut in xhat: cover coef 1, non-cover lifted coef
+		var ci []int
+		var cv []float64
+		rhs := float64(card)
+		viol := 0.0
+		for k := range idx {
+			coef := 0.0
+			if inCover[k] {
+				coef = 1
+			} else if al := card - maxfit(b-a[k]); al > 0 {
+				coef = float64(al)
+			}
+			if coef == 0 {
+				continue
+			}
+			xh := x[idx[k]]
+			if compl[k] {
+				ci = append(ci, idx[k]) // coef*(1-x): -coef x, rhs -= coef
+				cv = append(cv, -coef)
+				rhs -= coef
+				viol += coef * (1 - xh)
+			} else {
+				ci = append(ci, idx[k])
+				cv = append(cv, coef)
+				viol += coef * xh
+			}
+		}
+		if viol <= float64(card)+1e-6 {
+			continue
+		}
+		m.P.AddRow("", ci, cv, problem.LE, rhs)
+		added++
+	}
+	return added
+}
+
+// sortFloats sorts ascending (small n, insertion sort).
+func sortFloats(a []float64) {
+	for i := 1; i < len(a); i++ {
+		v := a[i]
+		j := i - 1
+		for j >= 0 && a[j] > v {
+			a[j+1] = a[j]
+			j--
+		}
+		a[j+1] = v
+	}
+}
+
 // zeroHalfCuts adds {0,1/2}-Chvatal-Gomory cuts from pairs of integer-coefficient
 // <= rows whose coefficient sum is even and RHS sum is odd.
 func (m *Model) zeroHalfCuts(x []float64) int {
