@@ -298,9 +298,15 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 	// fractional tableau rows; the aggregate LHS stays integer, so the
 	// same MIR derivation applies. Big instances only (cf. probing cuts).
 	if m.LP.NumRows() > 1500 {
+		// D3: under CBC_D1 the model is reduced, so aggregate far more
+		// tableau pairs (toward CBC's TwoMir count) to re-derive strength.
+		topCap, pairCap := 8, 8
+		if cbcD1 {
+			topCap, pairCap = 24, 64
+		}
 		topN := len(cands)
-		if topN > 8 {
-			topN = 8
+		if topN > topCap {
+			topN = topCap
 		}
 		tabs := make([][]float64, topN)
 		bval := make([]float64, topN)
@@ -311,8 +317,8 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 		}
 		agg := make([]float64, nt)
 		pairAdded := 0
-		for a := 0; a < topN && pairAdded < 8; a++ {
-			for b := a + 1; b < topN && pairAdded < 8; b++ {
+		for a := 0; a < topN && pairAdded < pairCap; a++ {
+			for b := a + 1; b < topN && pairAdded < pairCap; b++ {
 				for _, sgn := range [2]float64{1, -1} {
 					for j := range nt {
 						agg[j] = tabs[a][j] + sgn*tabs[b][j]
