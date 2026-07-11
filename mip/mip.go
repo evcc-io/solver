@@ -26,6 +26,10 @@ const (
 
 const intTol = 1e-6
 
+// cbcD1 gates CBC-style CglPreProcess model reduction (D1): ungated coefficient
+// strengthening + integer redundant-row removal. Off by default (regresses 020).
+var cbcD1 = os.Getenv("CBC_D1") != ""
+
 // debugf prints heuristic diagnostics when SOLVER_DEBUG is set.
 func debugf(format string, args ...any) {
 	if os.Getenv("SOLVER_DEBUG") != "" {
@@ -194,9 +198,9 @@ func (m *Model) Solve() Result {
 		}
 		probe(m.P, probeDeadline)
 		presolve(m.P)
-		// forcing-row removal: drop redundant continuous rows (inert AND
-		// clear of the integer cut suite). Postsolve rebuilds their outputs.
-		if q, keep := dropRedundantContinuousRows(m.P); q != nil {
+		// CBC CglPreProcess forcing/redundant-row removal (D1): drop all
+		// never-binding rows incl. integer big-M. Postsolve rebuilds outputs.
+		if q, keep := dropRedundantRows(m.P, cbcD1); q != nil {
 			m.rrKeep, m.rrRows = keep, m.P.Rows
 			m.P = q
 		}

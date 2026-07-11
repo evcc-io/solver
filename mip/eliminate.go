@@ -167,14 +167,9 @@ func eliminateSingletons(p *problem.Problem) (*problem.Problem, *reduction) {
 	return q, &reduction{orig: p, records: records, colMap: colMap}
 }
 
-// dropRedundantContinuousRows removes rows that (a) can never bind under the
-// current column bounds (min activity >= lb and max activity <= ub) and (b)
-// contain no integer column. Condition (a) makes removal exact for the LP;
-// condition (b) keeps it clear of the GMI/MIR cut suite, which only derives
-// from integer structure — so the relaxation, cuts and branch tree are all
-// unchanged, only inert continuous rows leave (CBC forcing-row removal).
-// Returns (nil,nil) when nothing qualifies; keep[origRow]=false when dropped.
-func dropRedundantContinuousRows(p *problem.Problem) (*problem.Problem, []bool) {
+// dropRedundantRows removes never-binding rows (exact; postsolve: a·x, 0 dual).
+// includeInt also drops integer rows — CBC CglPreProcess forcing removal (D1).
+func dropRedundantRows(p *problem.Problem, includeInt bool) (*problem.Problem, []bool) {
 	inf := problem.Inf
 	keep := make([]bool, len(p.Rows))
 	nkeep := 0
@@ -208,7 +203,7 @@ func dropRedundantContinuousRows(p *problem.Problem) (*problem.Problem, []bool) 
 				mx += a * lb
 			}
 		}
-		redundant := !hasInt && mni == 0 && mxi == 0 && mn >= rlb-1e-7 && mx <= rub+1e-7
+		redundant := (includeInt || !hasInt) && mni == 0 && mxi == 0 && mn >= rlb-1e-7 && mx <= rub+1e-7
 		keep[ri] = !redundant
 		if keep[ri] {
 			nkeep++
@@ -231,7 +226,7 @@ func dropRedundantContinuousRows(p *problem.Problem) (*problem.Problem, []bool) 
 		nri := q.AddRow(r.Name, r.Idx, r.Coef, r.Sense, r.RHS)
 		q.Rows[nri].HasRange, q.Rows[nri].Range = r.HasRange, r.Range
 	}
-	debugf("presolve: dropped %d/%d redundant continuous rows", len(p.Rows)-nkeep, len(p.Rows))
+	debugf("presolve: dropped %d/%d redundant rows (includeInt=%v)", len(p.Rows)-nkeep, len(p.Rows), includeInt)
 	return q, keep
 }
 
