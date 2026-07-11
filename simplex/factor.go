@@ -47,6 +47,10 @@ type factor struct {
 	rdrHead []int32 // row -> [rdrHead[r], rdrHead[r+1]) into rdrList
 	rdrList []int32 // pivot seqs whose column reads that row
 
+	// ftran activation: a written row activates the one pivot that reads it
+	// as its pivot row; ftranOwner maps row -> that ftran seq (kernel shares one).
+	ftranOwner []int32
+
 	ws *factorWS // shared per-LP solve scratch (solver is single-threaded)
 }
 
@@ -336,11 +340,36 @@ func (f *factor) buildBtranGraph() {
 	}
 	head[0] = 0
 	f.rdrHead, f.rdrList = head, list
+
+	// ftran solve order: fwd forward (seq i), kernel (seq nf), bwd reversed
+	// (bwd[i] fires at seq nf+1+(nb-1-i)); own each row by its resolving seq.
+	owner := make([]int32, m)
+	for i, tp := range f.fwd {
+		owner[tp.row] = int32(i)
+	}
+	for _, r := range f.kRows {
+		owner[r] = int32(nf)
+	}
+	for i, tp := range f.bwd {
+		owner[tp.row] = int32(nf + 1 + (nb - 1 - i))
+	}
+	f.ftranOwner = owner
 }
 
 // ftranFactor solves B*x = v in place: v becomes x indexed by basis
 // position (x[pos] = multiplier of basic column pos).
 func (f *factor) ftran(v []float64) {
+	nnz := 0
+	for _, val := range v[:f.m] {
+		if val != 0 {
+			nnz++
+		}
+	}
+	// same activation-graph payoff threshold as btran: mostly-zero rhs
+	if nnz*10 <= f.m {
+		f.ftranSparse(v)
+		return
+	}
 	x := f.ws.xScratch // by basis position
 	clear(x)
 	// forward: row singletons
@@ -385,6 +414,83 @@ func (f *factor) ftran(v []float64) {
 			for k, r := range cr {
 				v[r] -= cv[k] * xc
 			}
+		}
+	}
+	copy(v, x)
+}
+
+// ftranSparse is ftran firing only activation-reachable pivots; skipped
+// pivots would compute exactly 0, so results match the dense path bitwise.
+func (f *factor) ftranSparse(v []float64) {
+	nf, nb := len(f.fwd), len(f.bwd)
+	kernelSeq := int32(nf)
+	x := f.ws.xScratch // by basis position
+	clear(x)
+	f.ws.gen++
+	gen := f.ws.gen
+	act := f.ws.actGen
+	for r := range f.m {
+		if v[r] != 0 {
+			act[f.ftranOwner[r]] = gen
+		}
+	}
+	// a fired pivot writes its column's rows; activate each written row's owner
+	mark := func(pos int32) {
+		for _, r := range f.tblRow[f.cols[pos]] {
+			act[f.ftranOwner[r]] = gen
+		}
+	}
+	// forward: row singletons
+	for i, tp := range f.fwd {
+		if act[i] != gen {
+			continue
+		}
+		xc := v[tp.row] / tp.a
+		x[tp.pos] = xc
+		if xc != 0 {
+			cr, cv := f.tblRow[f.cols[tp.pos]], f.tblVal[f.cols[tp.pos]]
+			for k, r := range cr {
+				v[r] -= cv[k] * xc
+			}
+			v[tp.row] = 0 // exactly resolved
+			mark(tp.pos)
+		}
+	}
+	// kernel: dense solve when reachable (matches btranSparse's solveT)
+	if k := len(f.kRows); k > 0 && act[kernelSeq] == gen {
+		kv := f.ws.kScratch[:k]
+		for ki, r := range f.kRows {
+			kv[ki] = v[r]
+		}
+		f.klu.solve(kv)
+		for ki := range k {
+			s := kv[ki]
+			pos := f.kPos[ki]
+			x[pos] = s
+			if s != 0 {
+				cr, cv := f.tblRow[f.cols[pos]], f.tblVal[f.cols[pos]]
+				for kk, r := range cr {
+					v[r] -= cv[kk] * s
+				}
+				mark(int32(pos))
+			}
+		}
+	}
+	// backward: col singletons in reverse
+	for i := nb - 1; i >= 0; i-- {
+		seq := int32(nf + 1 + (nb - 1 - i))
+		if act[seq] != gen {
+			continue
+		}
+		tp := f.bwd[i]
+		xc := v[tp.row] / tp.a
+		x[tp.pos] = xc
+		if xc != 0 {
+			cr, cv := f.tblRow[f.cols[tp.pos]], f.tblVal[f.cols[tp.pos]]
+			for k, r := range cr {
+				v[r] -= cv[k] * xc
+			}
+			mark(tp.pos)
 		}
 	}
 	copy(v, x)

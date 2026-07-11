@@ -54,6 +54,48 @@ func multiply(colRow [][]int32, colVal [][]float64, m int, x []float64) []float6
 	return v
 }
 
+// TestFactorFtranSparse drives the mostly-zero rhs that routes through
+// ftranSparse (unit vectors and 1-3 nonzeros), checking B*x == v.
+func TestFactorFtranSparse(t *testing.T) {
+	rng := rand.New(rand.NewSource(13))
+	for trial := range 200 {
+		m := 5 + rng.Intn(80)
+		colRow, colVal := randomBasis(rng, m)
+		f := factorize(m, identCols(m), colRow, colVal, nil)
+		if f == nil {
+			continue
+		}
+		v := make([]float64, m)
+		want := make([]float64, m)
+		// unit vector on even trials (the alpha/tau case), else 1-3 spikes
+		if trial%2 == 0 {
+			v[rng.Intn(m)] = 1
+		} else {
+			for n := 1 + rng.Intn(3); n > 0; n-- {
+				v[rng.Intn(m)] = rng.NormFloat64()
+			}
+		}
+		copy(want, v)
+		nnz := 0
+		for _, x := range v {
+			if x != 0 {
+				nnz++
+			}
+		}
+		if nnz*10 > m {
+			continue // would route dense; not the path under test
+		}
+		f.ftran(v)
+		back := multiply(colRow, colVal, m, v)
+		for i := range back {
+			if math.Abs(back[i]-want[i]) > 1e-7 {
+				t.Fatalf("trial %d m=%d sparse ftran: B*x[%d]=%g want %g (kernel %d fwd %d bwd %d)",
+					trial, m, i, back[i], want[i], len(f.kRows), len(f.fwd), len(f.bwd))
+			}
+		}
+	}
+}
+
 func TestFactorFtranBtran(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 	for trial := range 50 {
