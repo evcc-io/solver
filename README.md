@@ -94,11 +94,17 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   re-run on every improving incumbent, SOS1/SOS2 via Beale–Tomlin
   splitting; a failed pass restarts once on the same model, inheriting
   cuts, fixings and probe facts.
-- **Branching**: strong branching at shallow depths (to depth 6 on large
-  instances, 16 otherwise) seeding pseudocosts, with CBC-style
-  strong-branch fixing — a probe side that is infeasible or cannot beat
-  the incumbent fixes the variable at the node without spending a
-  branch; pseudocost selection deeper (reliability-branching shape).
+- **Branching**: CBC reliability branching — a column whose pseudocost
+  isn't yet trusted (fewer than `numberBeforeTrust`=10 observed gains
+  either way) is strong-branched with cheap capped dual probes to seed
+  it; trusted columns are scored straight from their pseudocost. The
+  branch variable is the best CBC score (max-weighted blend before an
+  incumbent, product rule after). Untrusted columns float to the top so
+  the per-node strong-branch budget (`maxStrong`=5) is spent where the
+  pseudocosts are least reliable — so it runs at every depth yet
+  self-limits once columns are seeded. CBC-style strong-branch fixing: a
+  probe side that is infeasible or cannot beat the incumbent fixes the
+  variable at the node without spending a branch.
 - **Heuristics**: caller-provided MIP start (`mip.Model.MIPStart`,
   completed via a warm child solve before the cut loop so reduced-cost
   fixing bites; the trivial start is deliberately not polished — measured
