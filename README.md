@@ -134,15 +134,20 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   exists in `mip/cmir.go` but stays unwired: measured on the target
   instances it separates nothing that GMI + probing have not already
   found.
-- **Simpler dual pricing than Clp**: the production dual picks the most
-  violated row (plus the revisit tabu) instead of dual steepest edge,
-  and runs unperturbed. The Clp-style engine (DSE, Harris ratio test,
-  cost perturbation — `simplex/dual2.go`) is property-tested but gated
-  off as measured-negative on the target instances. BTRAN is hypersparse
-  (activation-graph guarded, bitwise-identical to the dense path) for
-  mostly-zero right-hand sides and FTRAN skips zero pivots naturally,
-  but there is no Clp-style hypersparse bookkeeping across the eta file
-  (measured ~20% result density bounds the further payoff).
+- **Dual steepest edge, now active via a mixed engine**: the Clp-style
+  dual (`simplex/dual2.go`: DSE matched to `ClpDualRowSteepest::updateWeights`,
+  Harris ratio test, cost perturbation, hypersparse FTRAN) drives the deep
+  branch-and-bound node re-solves, while cut generation, the root and the
+  incumbent heuristics stay on the canonical most-violated dual (so those
+  vertex-sensitive heuristics still find the incumbent). All 13 golden cases
+  prove optimal with no timeouts; pivot counts drop 4–33x toward CBC's
+  iteration counts, though wall-clock stays ~4x CBC on the hardest case.
+- **Factorization is product-form (eta), not Forrest-Tomlin**: each pivot
+  cost is dominated by the dense kernel-LU solve, and sparser pivot orders
+  perturb the razor-edge degenerate optima. A Forrest-Tomlin factorization
+  (`simplex/ft.go`, Clp `CoinFactorization` port — LU + solves + the
+  `replaceColumn` column update, property-tested) is the first component of
+  an engine-core rewrite (`docs/rewrite-clp-core.md`); it is not yet wired.
 - **Partial CglPreProcess-style reductions**: singleton columns are
   eliminated, but rows never are, and the evcc instances' singletons are
   penalty slacks (cost fights the row — a `max(0, ·)` term no linear
