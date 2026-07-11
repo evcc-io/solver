@@ -117,7 +117,7 @@ type State struct {
 	basicOf []int // row -> basic variable index
 	value   []float64
 	f       *factor // basis factorization, shared between clones
-	etas    []*eta  // product-form updates since f was built
+	etas    []eta   // product-form updates since f was built
 }
 
 // ftranVec computes Binv*v in place (v by row in, by basis position out).
@@ -279,7 +279,7 @@ func (st *State) Clone() *State {
 		basicOf: append([]int(nil), st.basicOf...),
 		value:   append([]float64(nil), st.value...),
 		f:       st.f, // immutable, shared
-		etas:    append([]*eta(nil), st.etas...),
+		etas:    append([]eta(nil), st.etas...),
 	}
 }
 
@@ -1092,7 +1092,7 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 	val := make([]float64, len(wsVal))
 	copy(idx, wsIdx)
 	copy(val, wsVal)
-	st.etas = append(st.etas, &eta{r: leaveRow, idx: idx, val: val, ar: a[leaveRow]})
+	st.etas = append(st.etas, eta{r: leaveRow, idx: idx, val: val, ar: a[leaveRow]})
 	st.basicOf[leaveRow] = q
 	st.status[q] = basic
 	if len(st.etas) > maxEtas {

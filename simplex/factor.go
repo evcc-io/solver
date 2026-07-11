@@ -66,6 +66,14 @@ type factorWS struct {
 	actGen                     []int32
 	written                    []int32
 	gen                        int32
+
+	lu *luWS // kernel LU scratch, reused across refactorizations
+
+	// kernel-column feed for luFactorize (transient: LU copies it out)
+	kIdxArena []int32
+	kValArena []float64
+	kColIdx   [][]int32
+	kColVal   [][]float64
 }
 
 func newFactorWS(m int) *factorWS {
@@ -241,10 +249,16 @@ func factorize(m int, cols []int32, tblRow [][]int32, tblVal [][]float64, ws *fa
 				}
 			}
 		}
-		idxArena := make([]int32, 0, nnz)
-		valArena := make([]float64, 0, nnz)
-		colIdx := make([][]int32, k)
-		colVal := make([][]float64, k)
+		if cap(ws.kIdxArena) < nnz {
+			ws.kIdxArena = make([]int32, 0, nnz)
+			ws.kValArena = make([]float64, 0, nnz)
+		}
+		if cap(ws.kColIdx) < k {
+			ws.kColIdx = make([][]int32, k)
+			ws.kColVal = make([][]float64, k)
+		}
+		idxArena, valArena := ws.kIdxArena[:0], ws.kValArena[:0]
+		colIdx, colVal := ws.kColIdx[:k], ws.kColVal[:k]
 		for kc, pos := range f.kPos {
 			lo := len(idxArena)
 			cr, cv := tblRow[cols[pos]], tblVal[cols[pos]]
@@ -257,7 +271,10 @@ func factorize(m int, cols []int32, tblRow [][]int32, tblVal [][]float64, ws *fa
 			colIdx[kc] = idxArena[lo:len(idxArena):len(idxArena)]
 			colVal[kc] = valArena[lo:len(valArena):len(valArena)]
 		}
-		f.klu = luFactorize(k, colIdx, colVal)
+		if ws.lu == nil {
+			ws.lu = &luWS{}
+		}
+		f.klu = luFactorize(k, colIdx, colVal, ws.lu)
 		if f.klu == nil {
 			return nil
 		}
@@ -536,8 +553,9 @@ func (f *factor) btranSparse(w []float64) {
 }
 
 // applyEtas maps x = Binv_factor*v to Binv_current*v (FTRAN direction).
-func applyEtas(etas []*eta, x []float64) {
-	for _, e := range etas {
+func applyEtas(etas []eta, x []float64) {
+	for i := range etas {
+		e := &etas[i]
 		xr := x[e.r] / e.ar
 		x[e.r] = xr
 		if xr == 0 {
@@ -552,9 +570,9 @@ func applyEtas(etas []*eta, x []float64) {
 }
 
 // applyEtasT pre-transforms w for BTRAN: adjoints in reverse order.
-func applyEtasT(etas []*eta, w []float64) {
+func applyEtasT(etas []eta, w []float64) {
 	for i := len(etas) - 1; i >= 0; i-- {
-		e := etas[i]
+		e := &etas[i]
 		s := w[e.r]
 		for k, j := range e.idx {
 			if int(j) != e.r {

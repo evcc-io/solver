@@ -131,7 +131,7 @@ func TestFactorEtaUpdate(t *testing.T) {
 				val = append(val, v)
 			}
 		}
-		etas := []*eta{{r: r, idx: idx, val: val, ar: alpha[r]}}
+		etas := []eta{{r: r, idx: idx, val: val, ar: alpha[r]}}
 
 		// updated basis: column r swapped
 		colRow2 := append([][]int32{}, colRow...)
