@@ -45,11 +45,24 @@ func (lp *LP) dual2Run(st *State) dual2Result {
 	m, nt := lp.m, lp.nTotal()
 	lp.Stats.Dual2Runs++
 
+	if lp.d2ws == nil {
+		lp.d2ws = &dual2WS{
+			d: make([]float64, nt), w: make([]float64, m),
+			rowR: make([]float64, m), tau: make([]float64, m),
+			a: make([]float64, m), delta: make([]float64, m),
+			alphaRow: make([]float64, nt), costBuf: make([]float64, nt),
+			y: make([]float64, m), seen: make([]bool, nt),
+			touched: make([]int, 0, 256), cands: make([]dual2Cand, 0, 256),
+		}
+	}
+	ws := lp.d2ws
+
 	// perturbed cost copy (Clp-style anti-degeneracy): jitter favors each
 	// variable's entry status; solveFrom's true-cost primal cleanup undoes it
 	cost := lp.cost
 	if dual2Perturb {
-		cost = append([]float64(nil), lp.cost...)
+		cost = ws.costBuf
+		copy(cost, lp.cost)
 		for j := range nt {
 			// basic columns stay exact: their cost feeds y and would shift
 			// every reduced cost past the phase-0 tolerance
@@ -64,9 +77,10 @@ func (lp *LP) dual2Run(st *State) dual2Result {
 		}
 	}
 
-	d := make([]float64, nt)
+	d := ws.d
 	reprice := func() {
-		y := make([]float64, m)
+		y := ws.y
+		clear(y)
 		duals(st, cost, m, y)
 		for j := range nt {
 			if st.status[j] != basic {
@@ -120,19 +134,18 @@ func (lp *LP) dual2Run(st *State) dual2Result {
 
 	// DSE weights reset to 1 each solve: Clp mode-3 fresh reference frame.
 	// (Persisting them across sibling node bases measured worse — stale.)
-	w := make([]float64, m)
+	w := ws.w
 	for i := range w {
 		w[i] = 1
 	}
 
-	rowR := make([]float64, m)
-	tau := make([]float64, m)
-	a := make([]float64, m)
-	delta := make([]float64, m)
-	alphaRow := make([]float64, nt)
-	touched := make([]int, 0, 256)
-	seen := make([]bool, nt)
-	cands := make([]dual2Cand, 0, 256)
+	rowR, tau, a, delta := ws.rowR, ws.tau, ws.a, ws.delta
+	alphaRow := ws.alphaRow
+	clear(alphaRow) // stale from the prior re-solve; run maintains it via touched
+	touched := ws.touched[:0]
+	seen := ws.seen
+	clear(seen)
+	cands := ws.cands[:0]
 	verified := false // one refactorize+reprice before trusting a certificate
 
 	refresh := func() {

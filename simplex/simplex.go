@@ -91,8 +91,9 @@ type LP struct {
 	pricingWindow int
 	pricingCursor int // scan position for partial pricing
 
-	fws *factorWS // reusable factorization workspace
-	dws *dualWS   // reusable dualRun workspace
+	fws  *factorWS // reusable factorization workspace
+	dws  *dualWS   // reusable dualRun workspace
+	d2ws *dual2WS  // reusable dual2Run (DSE node re-solve) workspace
 
 	// dseOff suspends the DSE dual (dual2) so this solve runs on the
 	// canonical dualRun vertex; DSE is reserved for deep node re-solves.
@@ -658,6 +659,15 @@ type dualWS struct {
 	touched                   []int
 	cands                     []dualCand
 	stamp                     []int32 // pivot index when row was last fixed
+}
+
+// dual2WS pools dual2Run's per-solve scratch (Clp keeps persistent work
+// arrays on ClpSimplex) so a warm node re-solve allocates nothing hot-path.
+type dual2WS struct {
+	d, w, rowR, tau, a, delta, alphaRow, costBuf, y []float64
+	seen                                            []bool
+	touched                                         []int
+	cands                                           []dual2Cand
 }
 
 // dualCand is one eligible entering candidate in the dual ratio test.

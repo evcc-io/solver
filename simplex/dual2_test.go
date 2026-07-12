@@ -34,6 +34,51 @@ func randomBoxedLP(rng *rand.Rand) *problem.Problem {
 	return p
 }
 
+// biggerBoxedLP builds a denser LP sized to exercise the DSE re-solve pool.
+func biggerBoxedLP(rng *rand.Rand, nv, nr int) *problem.Problem {
+	p := problem.New()
+	for j := 0; j < nv; j++ {
+		p.AddCol("x", 0, 1+rng.Float64()*9, rng.Float64()*4-2, false, nil, nil)
+	}
+	for i := 0; i < nr; i++ {
+		var idx []int
+		var coef []float64
+		for j := 0; j < nv; j++ {
+			if rng.Float64() < 0.4 {
+				idx = append(idx, j)
+				coef = append(coef, rng.Float64()*4-2)
+			}
+		}
+		if len(idx) == 0 {
+			idx, coef = []int{rng.Intn(nv)}, []float64{1}
+		}
+		p.AddRow("r", idx, coef, problem.LE, float64(len(idx))*2)
+	}
+	return p
+}
+
+// BenchmarkDual2WarmResolve measures the DSE warm node re-solve; with the
+// pooled dual2WS the per-solve scratch is reused (only State.Clone allocs).
+func BenchmarkDual2WarmResolve(b *testing.B) {
+	rng := rand.New(rand.NewSource(11))
+	p := biggerBoxedLP(rng, 80, 60)
+	lp := Build(p)
+	status, st, _ := lp.ColdSolve()
+	if status != Optimal {
+		b.Skip("cold solve not optimal")
+	}
+	touched := []int{3, 7, 12, 20}
+	for _, j := range touched {
+		lb, ub := lp.Bound(j)
+		lp.SetBound(j, lb+0.25*(ub-lb), ub-0.1*(ub-lb))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		lp.WarmSolve(st.Clone(), touched)
+	}
+}
+
 // TestDual2WarmResolve checks the Clp-style dual engine against both the
 // legacy warm path and a cold reference solve after random bound changes.
 func TestDual2WarmResolve(t *testing.T) {

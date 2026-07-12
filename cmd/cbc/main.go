@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
@@ -26,7 +27,15 @@ var valueOnlyFlags = map[string]bool{
 }
 
 func main() {
+	// CBC_CPUPROFILE gates a dev-only CPU profile of the whole solve
+	if pf := os.Getenv("CBC_CPUPROFILE"); pf != "" {
+		if f, err := os.Create(pf); err == nil {
+			pprof.StartCPUProfile(f)
+			defer pprof.StopCPUProfile()
+		}
+	}
 	if err := run(os.Args[1:]); err != nil {
+		pprof.StopCPUProfile()
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
