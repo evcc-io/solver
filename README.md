@@ -99,13 +99,12 @@ perf gap. Hot-path FTRAN/BTRAN is sparse-gather bound (compute, not GC/locality
 
 ## Missing vs. real CBC
 
-- **Forrest-Tomlin off by default** (`CBC_FT`): whole-solve still slower than the
-  tuned eta path despite ~10× faster per-update. The eta kernel-LU solve is the
-  per-pivot cost CBC's FT avoids.
-- **Extra cut families gated** (`CBC_CGL`): knapsack-cover, clique, zero-half,
-  flow-cover, lift-and-project (`mip/cgl.go`) + multi-row c-MIR (`mip/cmir.go`) —
-  all sound, but measured to separate little beyond GMI+probing+TwoMir here. No
-  cuts below the root.
+- **Forrest-Tomlin gated off** (`CBC_FT=1`): the only gated feature not on by
+  default — whole-solve regresses 2–79× on the evcc models (the eta kernel-LU
+  per-pivot cost CBC's FT avoids; ~10× faster per-update doesn't recover it).
+  Enabling it is the one gate that fails the performance bar; stays off until the
+  FT solve path is optimized. Scaling, the extra cut families (`CBC_CGL`) and the
+  DSE dual (`CBC_DUAL2`) are all on by default and pass the golden suite.
 - **DSE dual is ~4× CBC wall** on the hardest case (pivot counts already 4–33×
   down toward CBC's).
 - **Proving 020** is the open perf gap (incumbent ≈ CBC under scaling; proof

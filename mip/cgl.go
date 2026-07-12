@@ -9,7 +9,7 @@ import (
 
 // cglEnabled gates the extra Cgl cut generators (knapsack-cover, clique,
 // zero-half — all sound; gated as measured low-value here). Component 4.
-var cglEnabled = os.Getenv("CBC_CGL") == "1"
+var cglEnabled = os.Getenv("CBC_CGL") != "0"
 
 // coverItem is a knapsack element with its complemented LP value.
 type coverItem struct {
