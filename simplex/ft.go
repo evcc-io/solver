@@ -13,6 +13,10 @@ var ftEnabled = os.Getenv("CBC_FT") == "1"
 // a dense spike is cheaper to refactor (O(nnz)) than to update.
 const ftFillCap = 16
 
+// ftPivTol gates Markowitz pivot-column choice: candidate within this fraction
+// of the row max. 1.0 = sparsest among max-abs entries (no stability loss).
+const ftPivTol = 1.0
+
 // clone deep-copies the mutable factor so a branch-and-bound child updates it
 // independently of its parent.
 func (f *ftLU) clone() *ftLU {
@@ -29,6 +33,7 @@ func (f *ftLU) clone() *ftLU {
 		bRow: f.bRow, bVal: f.bVal, bacc: f.bacc, bmark: f.bmark, bTouch: f.bTouch,
 		wRowCol: f.wRowCol, wRowVal: f.wRowVal, wColRows: f.wColRows, wBuck: f.wBuck,
 		wRowUsed: f.wRowUsed, wColUsed: f.wColUsed, wMrk: f.wMrk, wAcc: f.wAcc, wPcols: f.wPcols,
+		wColLen: f.wColLen,
 	}
 	for s := range f.m {
 		c.lCol[s] = append([]int32(nil), f.lCol[s]...)
@@ -71,6 +76,7 @@ type ftLU struct {
 	wRowUsed, wColUsed, wMrk []bool
 	wAcc                     []float64
 	wPcols                   []int32
+	wColLen                  []int // active-row count per column (Markowitz)
 }
 
 // ftR is one R-file op: swap step-rows r,s (swap) or r -= mult*s (r>s). The
@@ -98,7 +104,7 @@ func newFTLU(m int, a []float64) *ftLU {
 }
 
 // newFTLUSparse factors a basis given as sparse columns (colRow[c]/colVal[c]),
-// with shortest-row + largest-entry pivoting; nil if singular.
+// with shortest-row + Markowitz least-fill pivoting; nil if singular.
 func newFTLUSparse(m int, colRow [][]int32, colVal [][]float64) *ftLU {
 	f := &ftLU{
 		m: m, udiag: make([]float64, m),
@@ -113,7 +119,7 @@ func newFTLUSparse(m int, colRow [][]int32, colVal [][]float64) *ftLU {
 		wRowCol: make([][]int32, m), wRowVal: make([][]float64, m),
 		wColRows: make([][]int32, m), wBuck: make([][]int32, m+1),
 		wRowUsed: make([]bool, m), wColUsed: make([]bool, m), wMrk: make([]bool, m),
-		wAcc: make([]float64, m), wPcols: make([]int32, 0, m),
+		wAcc: make([]float64, m), wPcols: make([]int32, 0, m), wColLen: make([]int, m),
 	}
 	if !f.rebuild(colRow, colVal) {
 		return nil
@@ -147,6 +153,10 @@ func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 	for r := range m {
 		buckets[len(rowCol[r])] = append(buckets[len(rowCol[r])], int32(r))
 	}
+	colLen := f.wColLen
+	for c := range m {
+		colLen[c] = len(colRows[c])
+	}
 	minL := 0
 	for step := range m {
 		// pivot row: shortest active row (via buckets)
@@ -168,11 +178,27 @@ func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 		if pr < 0 {
 			return false
 		}
-		// pivot col: largest active entry in the row
-		pc, pv := int32(-1), 0.0
+		// pivot col: among the numerically strongest entries in the row (within
+		// ftPivTol of the max), take the sparsest column — Markowitz least-fill.
+		maxAbs := 0.0
 		for k, c := range rowCol[pr] {
-			if !colUsed[c] && math.Abs(rowVal[pr][k]) > math.Abs(pv) {
-				pc, pv = c, rowVal[pr][k]
+			if !colUsed[c] {
+				if av := math.Abs(rowVal[pr][k]); av > maxAbs {
+					maxAbs = av
+				}
+			}
+		}
+		pc, pv, bestLen := int32(-1), 0.0, 1<<62
+		for k, c := range rowCol[pr] {
+			if colUsed[c] {
+				continue
+			}
+			av := math.Abs(rowVal[pr][k])
+			if av < ftPivTol*maxAbs {
+				continue
+			}
+			if cl := colLen[c]; cl < bestLen || (cl == bestLen && av > math.Abs(pv)) {
+				pc, pv, bestLen = c, rowVal[pr][k], cl
 			}
 		}
 		if pc < 0 || math.Abs(pv) < 1e-12 {
@@ -191,6 +217,9 @@ func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 			}
 		}
 		f.wPcols = pcols
+		for _, c := range pcols { // pivot row leaves: its columns lose a row
+			colLen[c]--
+		}
 		// eliminate pivot col only from rows that contain it (lazy colRows:
 		// stale rows are skipped when they no longer hold pc)
 		for _, rr32 := range colRows[pc] {
@@ -225,6 +254,8 @@ func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 				if v != 0 {
 					rc[w], rv[w] = c, v
 					w++
+				} else {
+					colLen[c]-- // column cancelled out of this row
 				}
 			}
 			rc, rv = rc[:w], rv[:w]
@@ -234,6 +265,7 @@ func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 						rc = append(rc, c)
 						rv = append(rv, v)
 						colRows[c] = append(colRows[c], int32(rr)) // fill
+						colLen[c]++
 					}
 				}
 				mark[c] = false
