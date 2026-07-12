@@ -129,7 +129,7 @@ func presolvePass(p *problem.Problem) (changed bool) {
 		// coefficient tightening: binaries in pure one-sided big-M rows. The
 		// >= mirror is CBC-ungated under D1, else gated to large models.
 		pureLE := rub < inf && rlb == -inf
-		pureGE := rlb > -inf && rub == inf && (cbcD1 || d1Adaptive || len(p.Rows) > 3000)
+		pureGE := rlb > -inf && rub == inf
 		if !pureLE && !pureGE {
 			continue
 		}

@@ -26,18 +26,6 @@ const (
 
 const intTol = 1e-6
 
-// cbcD1 forces CBC-style CglPreProcess model reduction (D1) on; otherwise it is
-// applied adaptively (d1Adaptive) when the root LP is loose enough to benefit.
-var cbcD1 = os.Getenv("CBC_D1") != ""
-
-// d1Adaptive is the per-solve D1 decision (set in Solve from the relaxation
-// fractionality); presolve's coefficient strengthening reads it.
-var d1Adaptive bool
-
-// d1FracThreshold: apply D1 when this fraction of integer variables is
-// fractional at the root LP — a loose relaxation is what D1 strengthening helps.
-const d1FracThreshold = 0.18
-
 // debugf prints heuristic diagnostics when SOLVER_DEBUG is set.
 func debugf(format string, args ...any) {
 	if os.Getenv("SOLVER_DEBUG") != "" {
@@ -211,35 +199,11 @@ func (m *Model) Solve() Result {
 		if m.Limits.MaxTime > 0 {
 			probeDeadline = time.Now().Add(m.Limits.MaxTime / 6)
 		}
-		// CBC-style adaptive preprocessing: gauge the raw relaxation's
-		// fractionality first, so presolve's D1 strengthening can gate on it.
-		d1Adaptive = cbcD1
-		if !d1Adaptive {
-			tmpLP := simplex.Build(m.P) // throwaway: don't disturb m.LP
-			tmpLP.SuspendDSE(true)
-			if _, st, _ := tmpLP.ColdSolve(); st != nil {
-				x, _, _, _ := tmpLP.Solution(st)
-				nFrac, nInt := 0, 0
-				for j, c := range m.P.Cols {
-					if !c.Integer || j >= len(x) {
-						continue
-					}
-					nInt++
-					f := x[j] - math.Floor(x[j])
-					if math.Min(f, 1-f) > intTol {
-						nFrac++
-					}
-				}
-				fracFrac := float64(nFrac) / math.Max(1, float64(nInt))
-				debugf("d1: nFrac=%d nInt=%d fracFrac=%.4f (gate %.2f)", nFrac, nInt, fracFrac, d1FracThreshold)
-				d1Adaptive = fracFrac > d1FracThreshold
-			}
-		}
 		probe(m.P, probeDeadline)
 		presolve(m.P)
-		// CBC CglPreProcess forcing/redundant-row removal (D1): drop all
-		// never-binding rows incl. integer big-M. Postsolve rebuilds outputs.
-		if q, keep := dropRedundantRows(m.P, d1Adaptive); q != nil {
+		// CBC CglPreProcess applied uniformly (as CBC/Clp do), not gated on the
+		// relaxation: strengthening (presolve) + forcing/redundant-row removal.
+		if q, keep := dropRedundantRows(m.P, true); q != nil {
 			m.rrKeep, m.rrRows = keep, m.P.Rows
 			m.P = q
 		}
