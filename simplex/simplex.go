@@ -881,6 +881,7 @@ func (lp *LP) run(st *State) Status {
 	phase1Cost, y, a := lp.runCost, lp.runY, lp.runA
 	degen := 0 // consecutive zero-step pivots; Bland's rule breaks cycles
 	cleaned := false
+	ubChecked := false // verified an unbounded ray against a fresh factorization
 	lp.xtol = xtolInit
 	for iter := 0; ; iter++ {
 		if iter > maxIter {
@@ -933,6 +934,15 @@ func (lp *LP) run(st *State) Status {
 			if inPhase1 {
 				return Infeasible
 			}
+			// A stale factorization can fake a ray; refactorize + reprice and
+			// re-test before concluding, as CBC/Clp do (mirrors the opt path).
+			if !ubChecked {
+				ubChecked = true
+				lp.refactorize(st)
+				lp.recomputeBasics(st)
+				lp.xtol = xtolInit
+				continue
+			}
 			return Unbounded
 		}
 		if inPhase1 {
@@ -947,6 +957,7 @@ func (lp *LP) run(st *State) Status {
 		}
 		lp.pivot(st, q, dir, a, t, row, isFlip)
 		cleaned = false
+		ubChecked = false
 	}
 }
 
