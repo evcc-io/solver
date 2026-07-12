@@ -98,6 +98,10 @@ type LP struct {
 	// canonical dualRun vertex; DSE is reserved for deep node re-solves.
 	dseOff bool
 
+	// ftBCR/ftBCV pool the basis-column buffers fed to the FT refactorize.
+	ftBCR [][]int32
+	ftBCV [][]float64
+
 	// run/recomputeBasics per-call vectors, reused (single-threaded)
 	runCost, runY, runA, residual []float64
 	// pivot's eta staging, copied into exact-size arrays per eta
@@ -155,6 +159,32 @@ func (lp *LP) refactorize(st *State) bool {
 	if lp.fws == nil {
 		lp.fws = newFactorWS(lp.m)
 	}
+	if ftEnabled { // build only the FT factor; the eta factor is unused
+		if lp.ftBCR == nil {
+			lp.ftBCR = make([][]int32, lp.m)
+			lp.ftBCV = make([][]float64, lp.m)
+		}
+		for pos, j := range st.basicOf {
+			rows, vals := lp.column(int(j))
+			cr := lp.ftBCR[pos][:0]
+			for _, r := range rows {
+				cr = append(cr, int32(r))
+			}
+			lp.ftBCR[pos] = cr
+			lp.ftBCV[pos] = append(lp.ftBCV[pos][:0], vals...)
+		}
+		ok := false
+		if st.ft != nil && st.ft.m == lp.m {
+			ok = st.ft.rebuild(lp.ftBCR, lp.ftBCV)
+		} else if ft := newFTLUSparse(lp.m, lp.ftBCR, lp.ftBCV); ft != nil {
+			st.ft, ok = ft, true
+		}
+		if ok {
+			st.etas = nil
+			return true
+		}
+		st.ft = nil // singular under FT: fall through to the eta factor
+	}
 	f := factorize(lp.m, cols, lp.colRow32, lp.colVal32, lp.fws)
 	if f == nil {
 		return false
@@ -164,23 +194,6 @@ func (lp *LP) refactorize(st *State) bool {
 	}
 	st.f = f
 	st.etas = nil
-	if ftEnabled {
-		bcr := make([][]int32, lp.m)
-		bcv := make([][]float64, lp.m)
-		for pos, j := range st.basicOf {
-			rows, vals := lp.column(int(j))
-			cr := make([]int32, len(rows))
-			for k, r := range rows {
-				cr[k] = int32(r)
-			}
-			bcr[pos], bcv[pos] = cr, append([]float64(nil), vals...)
-		}
-		if ft := newFTLUSparse(lp.m, bcr, bcv); ft != nil {
-			st.ft = ft
-		} else {
-			st.ft = nil // singular under FT ordering: fall back to f+etas
-		}
-	}
 	return true
 }
 

@@ -8,6 +8,7 @@ import (
 // ftEnabled wires the Forrest-Tomlin factor into the solve path (experimental).
 var ftEnabled = os.Getenv("CBC_FT") == "1"
 
+
 // clone deep-copies the mutable factor so a branch-and-bound child updates it
 // independently of its parent.
 func (f *ftLU) clone() *ftLU {
@@ -16,10 +17,13 @@ func (f *ftLU) clone() *ftLU {
 		prow: append([]int(nil), f.prow...), pcol: append([]int(nil), f.pcol...),
 		rinvrow: append([]int(nil), f.rinvrow...), rinvcol: append([]int(nil), f.rinvcol...),
 		rlist: append([]ftR(nil), f.rlist...),
-		z:     make([]float64, f.m), spike: make([]float64, f.m), blk: make([]float64, f.m*f.m),
-		colBuf: make([]float64, f.m),
-		lCol:   make([][]int32, f.m), lVal: make([][]float64, f.m),
+		lCol:  make([][]int32, f.m), lVal: make([][]float64, f.m),
 		uCol: make([][]int32, f.m), uVal: make([][]float64, f.m),
+		// transient scratch is shared (single-threaded, sequential solves);
+		// only the factor data above needs an independent copy
+		z: f.z, spike: f.spike, blk: f.blk, colBuf: f.colBuf,
+		wRowCol: f.wRowCol, wRowVal: f.wRowVal, wColRows: f.wColRows, wBuck: f.wBuck,
+		wRowUsed: f.wRowUsed, wColUsed: f.wColUsed, wMrk: f.wMrk, wAcc: f.wAcc, wPcols: f.wPcols,
 	}
 	for s := range f.m {
 		c.lCol[s] = append([]int32(nil), f.lCol[s]...)
@@ -48,6 +52,13 @@ type ftLU struct {
 	spike   []float64 // replaceColumn scratch (pooled)
 	blk     []float64 // trailing-block dense scratch (pooled)
 	colBuf  []float64 // dense entering-column scatter (pivot wiring)
+
+	// factorize working scratch, reused across in-place rebuilds
+	wRowCol, wColRows, wBuck [][]int32
+	wRowVal                  [][]float64
+	wRowUsed, wColUsed, wMrk []bool
+	wAcc                     []float64
+	wPcols                   []int32
 }
 
 // ftR is one update elimination: step-row s+1 -= mult * step-row s.
@@ -81,37 +92,63 @@ func newFTLUSparse(m int, colRow [][]int32, colVal [][]float64) *ftLU {
 		prow: make([]int, m), pcol: make([]int, m),
 		rinvrow: make([]int, m), rinvcol: make([]int, m),
 		z: make([]float64, m), spike: make([]float64, m), blk: make([]float64, m*m),
-		colBuf: make([]float64, m),
+		colBuf:   make([]float64, m),
+		wRowCol:  make([][]int32, m), wRowVal: make([][]float64, m),
+		wColRows: make([][]int32, m), wBuck: make([][]int32, m+1),
+		wRowUsed: make([]bool, m), wColUsed: make([]bool, m), wMrk: make([]bool, m),
+		wAcc:     make([]float64, m), wPcols: make([]int32, 0, m),
 	}
-	// working sparse rows (by original row); entries are (origCol, val)
-	rowCol := make([][]int32, m)
-	rowVal := make([][]float64, m)
+	if !f.rebuild(colRow, colVal) {
+		return nil
+	}
+	return f
+}
+
+// rebuild refactorizes in place, reusing all working buffers (no allocation).
+func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
+	m := f.m
+	f.rlist = f.rlist[:0]
+	rowCol, rowVal, colRows := f.wRowCol, f.wRowVal, f.wColRows
+	buckets := f.wBuck
+	rowUsed, colUsed, mark, acc := f.wRowUsed, f.wColUsed, f.wMrk, f.wAcc
+	for r := range m {
+		rowCol[r], rowVal[r], colRows[r] = rowCol[r][:0], rowVal[r][:0], colRows[r][:0]
+		rowUsed[r], colUsed[r], mark[r], acc[r] = false, false, false, 0
+		f.lCol[r], f.lVal[r] = f.lCol[r][:0], f.lVal[r][:0]
+		f.uCol[r], f.uVal[r] = f.uCol[r][:0], f.uVal[r][:0]
+		buckets[r] = buckets[r][:0]
+	}
+	buckets[m] = buckets[m][:0]
 	for c := range m {
 		for k, r := range colRow[c] {
 			rowCol[r] = append(rowCol[r], int32(c))
 			rowVal[r] = append(rowVal[r], colVal[c][k])
+			colRows[c] = append(colRows[c], r)
 		}
 	}
-	rowUsed := make([]bool, m)
-	colUsed := make([]bool, m)
-	acc := make([]float64, m)
-	mark := make([]bool, m)
+	for r := range m {
+		buckets[len(rowCol[r])] = append(buckets[len(rowCol[r])], int32(r))
+	}
+	minL := 0
 	for step := range m {
-		// pivot row: shortest active row with a usable entry
-		pr, best := -1, 1<<30
-		for r := range m {
-			if rowUsed[r] || len(rowCol[r]) >= best {
-				continue
-			}
-			for k, c := range rowCol[r] {
-				if !colUsed[c] && math.Abs(rowVal[r][k]) > 1e-12 {
-					pr, best = r, len(rowCol[r])
+		// pivot row: shortest active row (via buckets)
+		pr := -1
+		for minL <= m {
+			for len(buckets[minL]) > 0 {
+				r := int(buckets[minL][len(buckets[minL])-1])
+				buckets[minL] = buckets[minL][:len(buckets[minL])-1]
+				if !rowUsed[r] && len(rowCol[r]) == minL {
+					pr = r
 					break
 				}
 			}
+			if pr >= 0 {
+				break
+			}
+			minL++
 		}
 		if pr < 0 {
-			return nil
+			return false
 		}
 		// pivot col: largest active entry in the row
 		pc, pv := int32(-1), 0.0
@@ -121,22 +158,25 @@ func newFTLUSparse(m int, colRow [][]int32, colVal [][]float64) *ftLU {
 			}
 		}
 		if pc < 0 || math.Abs(pv) < 1e-12 {
-			return nil
+			return false
 		}
 		rowUsed[pr], colUsed[pc] = true, true
 		f.prow[step], f.pcol[step] = pr, int(pc)
 		f.rinvrow[pr], f.rinvcol[pc] = step, step
 		f.udiag[step] = pv
 		// scatter the pivot row's other active entries (the U row, by origCol)
-		var pcols []int32
+		pcols := f.wPcols[:0]
 		for k, c := range rowCol[pr] {
 			if c != pc && !colUsed[c] {
 				acc[c] = rowVal[pr][k]
 				pcols = append(pcols, c)
 			}
 		}
-		// eliminate pivot col from every active row
-		for rr := range m {
+		f.wPcols = pcols
+		// eliminate pivot col only from rows that contain it (lazy colRows:
+		// stale rows are skipped when they no longer hold pc)
+		for _, rr32 := range colRows[pc] {
+			rr := int(rr32)
 			if rowUsed[rr] {
 				continue
 			}
@@ -175,18 +215,24 @@ func newFTLUSparse(m int, colRow [][]int32, colVal [][]float64) *ftLU {
 					if v := -mult * a; v != 0 {
 						rc = append(rc, c)
 						rv = append(rv, v)
+						colRows[c] = append(colRows[c], int32(rr)) // fill
 					}
 				}
 				mark[c] = false
 			}
 			rowCol[rr], rowVal[rr] = rc, rv
+			nl := len(rc)
+			buckets[nl] = append(buckets[nl], int32(rr))
+			if nl < minL {
+				minL = nl
+			}
 		}
 		for _, c := range pcols {
 			acc[c] = 0
 		}
 	}
 	f.buildURows(rowCol, rowVal)
-	return f
+	return true
 }
 
 // buildURows converts the eliminated working rows into step-col U rows.
