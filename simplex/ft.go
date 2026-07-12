@@ -61,10 +61,13 @@ type ftLU struct {
 	wPcols                   []int32
 }
 
-// ftR is one update elimination: step-row s+1 -= mult * step-row s.
+// ftR is one R-file op: swap step-rows r,s (swap) or r -= mult*s (r>s). The
+// interleaved swaps+elims are the trailing block's pivoted Lblk^-1.
 type ftR struct {
+	r    int
 	s    int
 	mult float64
+	swap bool
 }
 
 // newFTLU factors dense basis a (column-major a[col*m+row]); nil if singular.
@@ -269,7 +272,11 @@ func (f *ftLU) forwardLR(b []float64) {
 		}
 	}
 	for _, r := range f.rlist {
-		z[r.s+1] -= r.mult * z[r.s]
+		if r.swap {
+			z[r.r], z[r.s] = z[r.s], z[r.r]
+		} else {
+			z[r.r] -= r.mult * z[r.s]
+		}
 	}
 }
 
@@ -308,7 +315,11 @@ func (f *ftLU) btran(c []float64) {
 	}
 	for i := len(f.rlist) - 1; i >= 0; i-- {
 		r := f.rlist[i]
-		z[r.s] -= r.mult * z[r.s+1]
+		if r.swap {
+			z[r.r], z[r.s] = z[r.s], z[r.r]
+		} else {
+			z[r.s] -= r.mult * z[r.r]
+		}
 	}
 	for s := m - 1; s >= 0; s-- { // L^-T back by column
 		v := z[s]
@@ -339,7 +350,11 @@ func (f *ftLU) replaceColumn(col int, a []float64) bool {
 		}
 	}
 	for _, r := range f.rlist {
-		w[r.s+1] -= r.mult * w[r.s]
+		if r.swap {
+			w[r.r], w[r.s] = w[r.s], w[r.r]
+		} else {
+			w[r.r] -= r.mult * w[r.s]
+		}
 	}
 	p := f.rinvcol[col]
 
@@ -382,23 +397,28 @@ func (f *ftLU) replaceColumn(col int, a []float64) bool {
 		}
 		d[i*bm+(bm-1)] = w[p+i]
 	}
-	for j := 0; j < bm-1; j++ { // eliminate Hessenberg subdiagonal
-		sub := d[(j+1)*bm+j]
-		if sub == 0 {
-			continue
+	// Hessenberg LU with partial pivoting: swaps + elims recorded interleaved
+	// into the R-file are the block's pivoted Lblk^-1 (|mult| <= 1, stable).
+	for j := 0; j < bm-1; j++ {
+		if math.Abs(d[(j+1)*bm+j]) > math.Abs(d[j*bm+j]) {
+			for c := 0; c < bm; c++ {
+				d[j*bm+c], d[(j+1)*bm+c] = d[(j+1)*bm+c], d[j*bm+c]
+			}
+			f.rlist = append(f.rlist, ftR{r: p + j, s: p + j + 1, swap: true})
 		}
 		diag := d[j*bm+j]
 		if math.Abs(diag) < 1e-12 {
 			return false
 		}
-		mult := sub / diag
-		if math.Abs(mult) > 1e8 { // unstable update (no pivoting): refactorize
-			return false
+		sub := d[(j+1)*bm+j]
+		if sub == 0 {
+			continue
 		}
+		mult := sub / diag
 		for c := j; c < bm; c++ {
 			d[(j+1)*bm+c] -= mult * d[j*bm+c]
 		}
-		f.rlist = append(f.rlist, ftR{p + j, mult})
+		f.rlist = append(f.rlist, ftR{r: p + j + 1, s: p + j, mult: mult})
 	}
 	if math.Abs(d[(bm-1)*bm+(bm-1)]) < 1e-12 {
 		return false
