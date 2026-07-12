@@ -51,12 +51,13 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   flips, just-fixed-row tabu, in-loop deadline). A fuller DSE dual
   (`simplex/dual2.go`: steepest edge, Harris ratio test, perturbation) drives
   deep node re-solves.
-- **Scaling** (`CBC_SCALE`, off by default): Clp geometric row/column scaling,
-  source-matched to `ClpPackedMatrix::scale` / `ClpSimplex` — internal to the
-  LP, with bounds/solution/duals/tableau unscaled at the boundary. Conditions
-  the evcc big-M models (1e6 coefficient range): 018 ~29× faster, 021 5.8× and
-  now matches CBC's optimum exactly, 020 near-proven (see Benchmarks). Default
-  engine byte-identical when off.
+- **Scaling** (on by default, as Clp; `CBC_SCALE=0` disables): Clp geometric
+  row/column scaling, source-matched to `ClpPackedMatrix::scale` / `ClpSimplex`
+  — internal to the LP, with bounds/solution/duals/tableau unscaled at the
+  boundary. Like Clp, a well-conditioned matrix is left unscaled (byte-identical),
+  so scaling only bites on ill-conditioned models like the evcc big-M cases (1e6
+  coefficient range): 018 ~29× faster, 021 5.8× and now matches CBC's optimum
+  exactly, 020 near-proven (see Benchmarks).
 - **Factorization**: singleton triangularization + sparse-LU kernel,
   product-form (eta) updates, periodic refactorize; no dense inverse;
   int32-compacted arenas, per-LP scratch. True Forrest-Tomlin (`simplex/ft.go`,
@@ -83,23 +84,21 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 
 Objective + wall-clock; CBC's optima shown for reference.
 
-| case | main (pre-rewrite) | this branch | this branch `CBC_SCALE=1` | CBC |
-|---|---|---|---|---|
-| 018 | 4.9s, 18291.45 | 8.8s, 18291.45 | **0.4s, 18291.46** | correct |
-| 021 | 5.8s, **8.6901 (wrong)** | 15.4s, 8.70073 | **2.6s, 8.70087** | 8.70087 |
-| 020 | 60s, **−140 (garbage)** | 60s, 0.547 | 60s, **0.558**, gap 6e-4 | 0.5583 |
+| case | main (pre-rewrite) | this branch (scaling default) | CBC |
+|---|---|---|---|
+| 018 | 4.9s, 18291.45 | **0.3s, 18291.46** | correct |
+| 021 | 5.8s, **8.6901 (wrong)** | **2.6s, 8.70087** | 8.70087 |
+| 020 | 60s, **−140 (garbage)** | 60s, **0.558**, gap 6e-4 | 0.5583 |
 
 The 1e6-range big-M coefficients make these models ill-conditioned; scaling
-(as Clp does by default) is the lever — correct on all three and far faster.
-Proving 020 is the remaining perf gap. Hot-path FTRAN/BTRAN is sparse-gather
-bound (compute, not GC/locality — measured: `GOGC=off` moves wall <0.5%), so
-further speed is algorithmic (scaling, Forrest-Tomlin), not micro-optimization.
+(on by default, as Clp) is the lever — correct on all three and far faster
+than main, which is both slower and unsound here. Proving 020 is the remaining
+perf gap. Hot-path FTRAN/BTRAN is sparse-gather bound (compute, not GC/locality
+— measured: `GOGC=off` moves wall <0.5%), so further speed is algorithmic
+(scaling, Forrest-Tomlin), not micro-optimization.
 
 ## Missing vs. real CBC
 
-- **Scaling off by default**: Clp scales every model; cbcgo gates it (`CBC_SCALE`)
-  to keep the default byte-identical. Un-gating (after full-suite validation) is
-  the top item to match CBC's out-of-the-box correctness+speed on these models.
 - **Forrest-Tomlin off by default** (`CBC_FT`): whole-solve still slower than the
   tuned eta path despite ~10× faster per-update. The eta kernel-LU solve is the
   per-pivot cost CBC's FT avoids.

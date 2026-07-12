@@ -283,13 +283,27 @@ func Build(p *problem.Problem) *LP {
 	return lp
 }
 
-// scaleEnabled gates Clp-style geometric scaling (CBC_SCALE=1).
-var scaleEnabled = os.Getenv("CBC_SCALE") == "1"
+// scaleEnabled gates Clp-style geometric scaling; on by default (as Clp),
+// but scaleModel skips already-well-conditioned matrices. CBC_SCALE=0 disables.
+var scaleEnabled = os.Getenv("CBC_SCALE") != "0"
 
 // scaleModel computes Clp geometric row/col scales and transforms A/bounds/
 // cost to scaled space; integer columns keep colScale=1 (clean rounding).
 func (lp *LP) scaleModel(isInt []bool) {
 	n, m := lp.n, lp.m
+	// Clp: leave a well-conditioned matrix unscaled (byte-identical default)
+	smallest, largest := math.Inf(1), 0.0
+	for j := range n {
+		for _, v := range lp.colVal[j] {
+			if a := math.Abs(v); a > 1e-20 {
+				smallest = math.Min(smallest, a)
+				largest = math.Max(largest, a)
+			}
+		}
+	}
+	if largest == 0 || (smallest >= 0.5 && largest <= 2.0) {
+		return
+	}
 	rs := make([]float64, m)
 	cs := make([]float64, n)
 	for i := range rs {
