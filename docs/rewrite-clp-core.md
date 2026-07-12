@@ -37,11 +37,15 @@ real CBC (`cbc_run.py`) before activation.
 
 ## Status
 
-- [x] 1. Forrest-Tomlin factorization — sparse L-col/U-row LU + O(nnz) solves +
-      fully-sparse alloc-free `replaceColumn` (trailing-block Bartels-Golub),
-      property-tested. WIRED into the solve path behind `CBC_FT` (clone-safe deep
-      copy; refactorize on an unstable no-pivot update). Correct end-to-end on
-      the golden suite; default-off because it is slow (see 2).
+- [x] 1. Forrest-Tomlin factorization — sparse L-col/U-row LU + O(nnz) solves,
+      alloc-free pooled `replaceColumn`, WIRED behind `CBC_FT` (clone-safe).
+      NUMERICALLY STABLE: trailing-block Bartels-Golub with PARTIAL PIVOTING,
+      expressed as a general R-file (interleaved swap + elimination ops),
+      property-tested; |mult|<=1. Correct end-to-end on the golden suite.
+      STILL SLOW (default-off): Bartels-Golub re-triangularizes the whole
+      trailing block, so a small-position update adds O(block) R-file entries
+      and refactorizes almost every pivot. True Forrest-Tomlin eliminates only
+      the spike (bounded etas) — the remaining efficiency piece.
 - [~] 2. Sparse factorize — shortest-row + largest-entry pivoting, sparse
       L-columns + U-rows, no dense work matrix, property-tested. Not yet fast:
       needs a singleton pre-pass and bucketed pivot search (currently O(m^2)
