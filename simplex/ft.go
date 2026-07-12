@@ -48,6 +48,7 @@ type ftLU struct {
 	rinvrow []int // original row -> step
 	rinvcol []int // original column -> step-col
 	rlist   []ftR
+	nUpd    int       // column updates since the last (re)factorize
 	z       []float64 // solve scratch
 	spike   []float64 // replaceColumn scratch (pooled)
 	blk     []float64 // trailing-block dense scratch (pooled)
@@ -111,6 +112,7 @@ func newFTLUSparse(m int, colRow [][]int32, colVal [][]float64) *ftLU {
 func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 	m := f.m
 	f.rlist = f.rlist[:0]
+	f.nUpd = 0
 	rowCol, rowVal, colRows := f.wRowCol, f.wRowVal, f.wColRows
 	buckets := f.wBuck
 	rowUsed, colUsed, mark, acc := f.wRowUsed, f.wColUsed, f.wMrk, f.wAcc
@@ -440,5 +442,6 @@ func (f *ftLU) replaceColumn(col int, a []float64) bool {
 		f.rinvcol[f.pcol[j]] = j
 	}
 	f.pcol[m-1], f.rinvcol[col] = col, m-1
+	f.nUpd++
 	return true
 }

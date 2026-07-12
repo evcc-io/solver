@@ -159,7 +159,16 @@ func (lp *LP) refactorize(st *State) bool {
 	if lp.fws == nil {
 		lp.fws = newFactorWS(lp.m)
 	}
-	if ftEnabled { // build only the FT factor; the eta factor is unused
+	f := factorize(lp.m, cols, lp.colRow32, lp.colVal32, lp.fws)
+	if f == nil {
+		return false
+	}
+	if k := int64(len(f.kRows)); k > lp.Stats.KernelMax {
+		lp.Stats.KernelMax = k
+	}
+	st.f = f
+	st.etas = nil
+	if ftEnabled { // FT drives solves; st.f stays as a valid fallback
 		if lp.ftBCR == nil {
 			lp.ftBCR = make([][]int32, lp.m)
 			lp.ftBCV = make([][]float64, lp.m)
@@ -173,27 +182,16 @@ func (lp *LP) refactorize(st *State) bool {
 			lp.ftBCR[pos] = cr
 			lp.ftBCV[pos] = append(lp.ftBCV[pos][:0], vals...)
 		}
-		ok := false
 		if st.ft != nil && st.ft.m == lp.m {
-			ok = st.ft.rebuild(lp.ftBCR, lp.ftBCV)
+			if !st.ft.rebuild(lp.ftBCR, lp.ftBCV) {
+				st.ft = nil
+			}
 		} else if ft := newFTLUSparse(lp.m, lp.ftBCR, lp.ftBCV); ft != nil {
-			st.ft, ok = ft, true
+			st.ft = ft
+		} else {
+			st.ft = nil // singular under FT ordering: fall back to st.f
 		}
-		if ok {
-			st.etas = nil
-			return true
-		}
-		st.ft = nil // singular under FT: fall through to the eta factor
 	}
-	f := factorize(lp.m, cols, lp.colRow32, lp.colVal32, lp.fws)
-	if f == nil {
-		return false
-	}
-	if k := int64(len(f.kRows)); k > lp.Stats.KernelMax {
-		lp.Stats.KernelMax = k
-	}
-	st.f = f
-	st.etas = nil
 	return true
 }
 
@@ -1184,7 +1182,7 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 		ok := st.ft.replaceColumn(leaveRow, cb)
 		st.basicOf[leaveRow] = q
 		st.status[q] = basic
-		if !ok || len(st.ft.rlist) > maxEtas { // unstable/full: rebuild ft
+		if !ok || st.ft.nUpd > maxEtas { // too many updates: rebuild ft
 			lp.refactorize(st)
 			lp.recomputeBasics(st)
 		}
