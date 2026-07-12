@@ -13,7 +13,6 @@ var ftEnabled = os.Getenv("CBC_FT") == "1"
 // a dense spike is cheaper to refactor (O(nnz)) than to update.
 const ftFillCap = 16
 
-
 // clone deep-copies the mutable factor so a branch-and-bound child updates it
 // independently of its parent.
 func (f *ftLU) clone() *ftLU {
@@ -110,11 +109,11 @@ func newFTLUSparse(m int, colRow [][]int32, colVal [][]float64) *ftLU {
 		z: make([]float64, m), spike: make([]float64, m),
 		colBuf: make([]float64, m),
 		bRow:   make([][]int32, m), bVal: make([][]float64, m),
-		bacc:   make([]float64, m), bmark: make([]bool, m), bTouch: make([]int32, 0, m),
-		wRowCol:  make([][]int32, m), wRowVal: make([][]float64, m),
+		bacc: make([]float64, m), bmark: make([]bool, m), bTouch: make([]int32, 0, m),
+		wRowCol: make([][]int32, m), wRowVal: make([][]float64, m),
 		wColRows: make([][]int32, m), wBuck: make([][]int32, m+1),
 		wRowUsed: make([]bool, m), wColUsed: make([]bool, m), wMrk: make([]bool, m),
-		wAcc:     make([]float64, m), wPcols: make([]int32, 0, m),
+		wAcc: make([]float64, m), wPcols: make([]int32, 0, m),
 	}
 	if !f.rebuild(colRow, colVal) {
 		return nil
