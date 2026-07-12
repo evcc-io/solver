@@ -44,6 +44,22 @@ func TestWriteStoppedWithIncumbentParsesAsOptimal(t *testing.T) {
 	}
 }
 
+// TestWriteSkipsUnnamedCutRows: B&B appends cut rows with empty names; emitting
+// them yields 3-token lines that IndexError PuLP's readsol on l[3].
+func TestWriteSkipsUnnamedCutRows(t *testing.T) {
+	var buf bytes.Buffer
+	Write(&buf, "Optimal", 1, []string{"x0", ""}, []float64{1, 9}, []float64{0, 9},
+		[]string{"c0", "", ""}, []float64{2, 9, 9}, []float64{3, 9, 9})
+	for _, line := range strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")[1:] {
+		if n := len(strings.Fields(line)); n < 4 {
+			t.Fatalf("data line %q has %d tokens, want >=4 (PuLP needs l[3])", line, n)
+		}
+	}
+	if strings.Contains(buf.String(), "  9 ") {
+		t.Fatalf("unnamed entries leaked into output:\n%s", buf.String())
+	}
+}
+
 func TestReadWriteRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	Write(&buf, "Optimal", 41, []string{"x0", "x1"}, []float64{1, 3.5}, []float64{0, 0}, nil, nil, nil)
