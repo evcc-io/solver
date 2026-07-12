@@ -584,34 +584,55 @@ func (m *Model) Solve() Result {
 				// box the heuristic burst: dives must never eat the tree's time.
 				// The root burst gets more — success there ends the whole solve
 				savedDL := m.LP.Deadline
+				burstDL := savedDL
 				if m.Limits.MaxTime > 0 {
 					div := time.Duration(8)
 					if nodeCount == 1 {
 						div = 3
 					}
 					if hb := time.Now().Add(m.Limits.MaxTime / div); savedDL.IsZero() || hb.Before(savedDL) {
-						m.LP.Deadline = hb
+						burstDL = hb
 					}
 				}
+				m.LP.Deadline = burstDL
 				cutoff := math.Inf(1)
 				if hasIncumbent {
 					cutoff = bestInternal
 				}
+				var hObj float64
+				var hx, hAct, hRC, hPrice []float64
+				ok := false
+				keep := func(o float64, ax, aa, ar, ap []float64, k bool) {
+					if k && (!ok || m.improves(o, hObj)) {
+						hObj, hx, hAct, hRC, hPrice, ok = o, ax, aa, ar, ap, true
+					}
+				}
+				// pump FIRST at the root with its own sub-budget so faceWalk
+				// can't starve it (CBC runs the feasibility pump first).
+				if nodeCount == 1 {
+					if m.Limits.MaxTime > 0 {
+						if pd := time.Now().Add(m.Limits.MaxTime / 6); pd.Before(burstDL) {
+							m.LP.Deadline = pd
+						}
+					}
+					fpBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+					keep(m.feasibilityPump(nd, x, endState))
+					m.dbgFP += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - fpBase
+					m.LP.Deadline = burstDL
+				}
 				fwBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
-				hObj, hx, hAct, hRC, hPrice, ok := m.faceWalk(nd, x, endState, obj, cutoff)
+				keep(m.faceWalk(nd, x, endState, obj, cutoff))
 				m.dbgFW += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - fwBase
-				if ok {
-					debugf("facewalk: integral vertex on face obj=%g", hObj)
-				} else {
-					hObj, hx, hAct, hRC, hPrice, ok = m.rensImprove(nd, x)
+				if !ok {
+					keep(m.rensImprove(nd, x))
 				}
 				if !ok {
 					fpBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
-					hObj, hx, hAct, hRC, hPrice, ok = m.feasibilityPump(nd, x, endState)
+					keep(m.feasibilityPump(nd, x, endState))
 					m.dbgFP += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - fpBase
 					if !ok {
 						dvBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
-						hObj, hx, hAct, hRC, hPrice, ok = m.diveForIncumbent(nd, x, endState)
+						keep(m.diveForIncumbent(nd, x, endState))
 						m.dbgDive += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - dvBase
 					}
 				}
@@ -826,57 +847,116 @@ func (m *Model) feasibilityPump(nd *node, x []float64, endState *simplex.State) 
 	orig := m.LP.SwapCost(fpCost)
 	defer func() { m.LP.SwapCost(orig) }()
 
+	// objective feasibility pump: blend the decaying true objective into the L1
+	// projection so it lands near good-objective points (Achterberg-Berthold).
+	cNorm := 0.0
+	for _, v := range orig {
+		cNorm += v * v
+	}
+	cNorm = math.Sqrt(cNorm)
+	alpha := 1.0
+
+	ints := make([]int, 0, 64)
+	for j, c := range m.P.Cols {
+		if c.Integer {
+			ints = append(ints, j)
+		}
+	}
+	rounded := make([]float64, len(ints))
+	fracOf := make([]float64, len(ints)) // signed distance curX-rounded
 	st := endState.Clone()
 	curX := x
 	var prev []float64
-	for iter := range 30 {
+	for iter := range 50 {
 		if !m.LP.Deadline.IsZero() && time.Now().After(m.LP.Deadline) {
 			return fail()
 		}
-		// round the current LP point and build the L1 pull-back objective
-		integral := true
-		rounded := make([]float64, 0, 64)
-		for j, c := range m.P.Cols {
-			if !c.Integer {
-				continue
-			}
+		integral, nFrac := true, 0
+		for k, j := range ints {
 			lb, ub := m.LP.Bound(j)
 			v := math.Max(lb, math.Min(ub, math.Round(curX[j])))
-			if frac := math.Abs(curX[j] - v); frac > intTol {
+			rounded[k], fracOf[k] = v, curX[j]-v
+			if math.Abs(fracOf[k]) > intTol {
 				integral = false
+				nFrac++
 			}
-			switch {
-			case v <= lb+intTol:
-				fpCost[j] = 1
-			case v >= ub-intTol:
-				fpCost[j] = -1
-			default:
-				fpCost[j] = 0
-			}
-			rounded = append(rounded, v)
 		}
 		if integral {
 			debugf("fp: integral at iter %d", iter)
-			// polish: real objective, all integers fixed at their values
-			m.LP.SwapCost(orig)
-			// fp's basis optimized the L1 cost, not the real one: cold here
-			return m.completePoint(nd, curX, nil)
+			m.LP.SwapCost(orig) // polish the real objective, integers fixed
+			cx := append([]float64(nil), curX...)
+			for k, j := range ints {
+				cx[j] = rounded[k]
+			}
+			return m.completePoint(nd, cx, nil)
 		}
 		if prev != nil && slicesEqual(prev, rounded) {
-			debugf("fp: cycle at iter %d", iter)
-			return fail() // cycling
+			flipMostFractional(rounded, fracOf, ints, m.LP, 10+3*iter)
 		}
-		prev = rounded
+		prev = append(prev[:0], rounded...)
 
-		status, nst, _ := m.LP.WarmSolve(st, nil)
-		if status != simplex.Optimal {
+		// projection cost: unit-normalized L1 pull-back to `rounded` blended
+		// with the true objective, objective-heavy (alpha~1) decaying to L1.
+		dNorm := math.Sqrt(float64(nFrac))
+		w1, wc := 0.0, 0.0
+		if dNorm > 0 {
+			w1 = (1 - alpha) / dNorm
+		}
+		if cNorm > 0 {
+			wc = alpha / cNorm
+		}
+		for j := range fpCost {
+			fpCost[j] = wc * orig[j]
+		}
+		for k, j := range ints {
+			lb, ub := m.LP.Bound(j)
+			switch {
+			case rounded[k] <= lb+intTol:
+				fpCost[j] += w1
+			case rounded[k] >= ub-intTol:
+				fpCost[j] -= w1
+			}
+		}
+		alpha *= fpDecay
+
+		if status := m.LP.PrimalResolve(st); status != simplex.Optimal {
 			debugf("fp: projection LP status=%d at iter %d", status, iter)
 			return fail()
 		}
-		st = nst
 		curX, _, _, _ = m.LP.Solution(st)
 	}
 	return fail()
+}
+
+// fpDecay is the objective-pump alpha decay per iteration: slower decay keeps
+// the pump objective-guided longer, landing near good-objective incumbents.
+const fpDecay = 0.7
+
+// flipMostFractional rounds the T most-fractional entries the other way to
+// break a feasibility-pump cycle (CBC's FPump restart perturbation).
+func flipMostFractional(rounded, fracOf []float64, ints []int, lp *simplex.LP, T int) {
+	order := make([]int, len(fracOf))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool {
+		return math.Abs(fracOf[order[a]]) > math.Abs(fracOf[order[b]])
+	})
+	if T > len(order) {
+		T = len(order)
+	}
+	for i := 0; i < T; i++ {
+		k := order[i]
+		if math.Abs(fracOf[k]) <= intTol {
+			break
+		}
+		v := rounded[k] - 1
+		if fracOf[k] > 0 {
+			v = rounded[k] + 1
+		}
+		lb, ub := lp.Bound(ints[k])
+		rounded[k] = math.Max(lb, math.Min(ub, v))
+	}
 }
 
 func slicesEqual(a, b []float64) bool {

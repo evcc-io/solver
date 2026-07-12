@@ -344,6 +344,13 @@ func (lp *LP) WarmSolve(st *State, touched []int) (Status, *State, float64) {
 	return lp.warmSolve(st, touched, true)
 }
 
+// PrimalResolve re-optimizes from st with the primal simplex — use after an
+// objective change, which breaks the dual feasibility WarmSolve assumes.
+func (lp *LP) PrimalResolve(st *State) Status {
+	lp.recomputeBasics(st)
+	return lp.run(st)
+}
+
 func (lp *LP) warmSolve(st *State, touched []int, preserve bool) (Status, *State, float64) {
 	for _, j := range touched {
 		switch {
