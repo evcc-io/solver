@@ -8,6 +8,10 @@ import (
 // ftEnabled wires the Forrest-Tomlin factor into the solve path (experimental).
 var ftEnabled = os.Getenv("CBC_FT") == "1"
 
+// ftBlockCap bounds the dense trailing block of a column update; past it a
+// pooled refactorize (O(nnz)) is far cheaper than the O(block^2) dense update.
+const ftBlockCap = 256
+
 
 // clone deep-copies the mutable factor so a branch-and-bound child updates it
 // independently of its parent.
@@ -95,7 +99,7 @@ func newFTLUSparse(m int, colRow [][]int32, colVal [][]float64) *ftLU {
 		uCol: make([][]int32, m), uVal: make([][]float64, m),
 		prow: make([]int, m), pcol: make([]int, m),
 		rinvrow: make([]int, m), rinvcol: make([]int, m),
-		z: make([]float64, m), spike: make([]float64, m), blk: make([]float64, m*m),
+		z: make([]float64, m), spike: make([]float64, m), blk: make([]float64, ftBlockCap*ftBlockCap),
 		colBuf:   make([]float64, m),
 		wRowCol:  make([][]int32, m), wRowVal: make([][]float64, m),
 		wColRows: make([][]int32, m), wBuck: make([][]int32, m+1),
@@ -359,6 +363,9 @@ func (f *ftLU) replaceColumn(col int, a []float64) bool {
 		}
 	}
 	p := f.rinvcol[col]
+	if m-p > ftBlockCap { // large trailing block: refactorize is cheaper
+		return false
+	}
 
 	for s := 0; s < p; s++ { // rows above p: renumber columns
 		uc, uv := f.uCol[s], f.uVal[s]
