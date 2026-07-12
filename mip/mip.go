@@ -684,8 +684,8 @@ func (m *Model) Solve() Result {
 		remaining = math.Min(remaining, (*pq)[0].bound)
 	}
 	proven := hasIncumbent && !m.improves(remaining, bestInternal)
-	debugf("mip exit: nodes=%d pivots=%d best=%g remaining=%g proven=%v stopped=%v proofLost=%v heap=%d",
-		nodeCount, m.LP.Stats.Phase1+m.LP.Stats.Phase2+m.LP.Stats.Dual, bestInternal, remaining, proven, stopped, proofLost, pq.Len())
+	debugf("mip exit: nodes=%d pivots=%d best=%g remaining=%g proven=%v stopped=%v proofLost=%v heap=%d elapsed=%v",
+		nodeCount, m.LP.Stats.Phase1+m.LP.Stats.Phase2+m.LP.Stats.Dual, bestInternal, remaining, proven, stopped, proofLost, pq.Len(), time.Since(t0).Round(time.Millisecond))
 	debugf("pivot split: facewalk %d, fpump %d, dive %d, rins %d, coldfallbacks %d", m.dbgFW, m.dbgFP, m.dbgDive, m.dbgRINS, m.dbgNodeCold)
 
 	res := Result{HasIncumbent: hasIncumbent, NodeCount: nodeCount}

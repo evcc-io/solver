@@ -39,6 +39,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	// CBC_MEMPROFILE gates a dev-only allocation profile of the whole solve
+	if pf := os.Getenv("CBC_MEMPROFILE"); pf != "" {
+		if f, err := os.Create(pf); err == nil {
+			pprof.WriteHeapProfile(f)
+			f.Close()
+		}
+	}
 }
 
 func run(args []string) error {
