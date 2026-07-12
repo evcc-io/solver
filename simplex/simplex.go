@@ -166,18 +166,25 @@ func (lp *LP) refactorize(st *State) bool {
 			lp.ftBCR[pos] = cr
 			lp.ftBCV[pos] = append(lp.ftBCV[pos][:0], vals...)
 		}
+		ftOK := false
 		if st.ft != nil && st.ft.m == lp.m {
 			if st.ft.rebuild(lp.ftBCR, lp.ftBCV) {
-				st.etas = nil
-				return true
+				ftOK = true
+			} else {
+				st.ft = nil
 			}
-			st.ft = nil
 		} else if ft := newFTLUSparse(lp.m, lp.ftBCR, lp.ftBCV); ft != nil {
 			st.ft = ft
-			st.etas = nil
-			return true
+			ftOK = true
 		}
-		// FT singular: fall through and build the sparseLU fallback
+		if ftOK {
+			st.etas = nil
+			if st.f != nil { // keep st.f as an emergency fallback; skip factorize
+				return true
+			}
+			// no fallback yet: build st.f once below, then reuse it
+		}
+		// FT singular or first solve: build the sparseLU fallback below
 	}
 	cols := make([]int32, lp.m)
 	for pos, j := range st.basicOf {
