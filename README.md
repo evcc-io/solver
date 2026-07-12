@@ -142,22 +142,23 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   vertex-sensitive heuristics still find the incumbent). All 13 golden cases
   prove optimal with no timeouts; pivot counts drop 4–33x toward CBC's
   iteration counts, though wall-clock stays ~4x CBC on the hardest case.
-- **Factorization is product-form (eta), not Forrest-Tomlin**: each pivot
-  cost is dominated by the dense kernel-LU solve, and sparser pivot orders
-  perturb the razor-edge degenerate optima. A Forrest-Tomlin factorization
-  (`simplex/ft.go`, Clp `CoinFactorization` port) is the first component of an
-  engine-core rewrite (`docs/rewrite-clp-core.md`): sparse U-row storage,
-  O(nnz) ftran/btran, and an alloc-free `replaceColumn` column update
-  (trailing-block Bartels-Golub with an R-transform file), all property-tested.
-  It is wired into the solve path behind `CBC_FT` (clone-safe; refactorizes on
-  an unstable no-pivot update) and solves the golden suite correctly, but is
-  gated off: the sparse factorize still lacks a singleton pre-pass and full
-  Markowitz (component 2), so it is far slower than the eta path.
-- **Partial CglPreProcess-style reductions**: singleton columns are
-  eliminated, but rows never are, and the evcc instances' singletons are
-  penalty slacks (cost fights the row — a `max(0, ·)` term no linear
-  presolve can remove), so node LPs stay large on them (real CBC works
-  on a ~4x smaller reduced model via row aggregation).
+- **Default factorization is product-form (eta), not Forrest-Tomlin**: each
+  pivot cost is dominated by the dense kernel-LU solve. A true Forrest-Tomlin
+  factorization (`simplex/ft.go`, Clp `CoinFactorization` port) is wired behind
+  `CBC_FT` (clone-safe): sparse L-col/U-row storage, O(nnz) ftran/btran, a
+  sparse-Hessenberg `replaceColumn` column update (O(spike+fill), no dense
+  block), and Clp Markowitz least-fill pivoting in the refactorize (~24% sparser
+  factors on the 3312-row case). Numerically stable (partial pivoting, |mult|≤1),
+  property-tested, correct on the golden suite. Still experimental/off by
+  default: whole-solve is slower than the tuned eta path (the R-file + updated-U
+  solve cost), even though per-update is ~10x faster.
+- **CglPreProcess reductions are applied uniformly** (as CBC/Clp): binary
+  big-M coefficient strengthening plus forcing/redundant-row removal, run on
+  every model rather than gated on the relaxation. This matches CBC's
+  objectives (e.g. the evcc 021 case) but costs speed — cbcgo's strengthening
+  densifies the model where CBC's implementation stays cheap. The evcc
+  penalty-slack singletons (a `max(0, ·)` term no linear presolve can remove)
+  still leave node LPs larger than CBC's ~4x smaller row-aggregated model.
 - **`-mips <file>` warm start is parsed but not wired** to
   `Model.MIPStart`, so `warmStart=True` in PuLP buys nothing yet.
 - **No multi-threaded search.** `-threads N` is accepted, ignored.
