@@ -322,6 +322,9 @@ func (f *ftLU) btran(c []float64) {
 		z[s] = c[f.pcol[s]]
 	}
 	for s := range m { // U^-T forward by push
+		if z[s] == 0 { // sparse RHS (dual pricing): skip empty steps
+			continue
+		}
 		zs := z[s] / f.udiag[s]
 		z[s] = zs
 		uc, uv := f.uCol[s], f.uVal[s]

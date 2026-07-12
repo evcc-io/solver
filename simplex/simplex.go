@@ -152,6 +152,33 @@ func (st *State) btranVec(w []float64) {
 // refactorize rebuilds st's basis factorization and clears its eta file;
 // on (numerical) failure the existing factor+etas stay valid.
 func (lp *LP) refactorize(st *State) bool {
+	if ftEnabled { // FT drives solves; build only the FT factor unless it fails
+		if lp.ftBCR == nil {
+			lp.ftBCR = make([][]int32, lp.m)
+			lp.ftBCV = make([][]float64, lp.m)
+		}
+		for pos, j := range st.basicOf {
+			rows, vals := lp.column(int(j))
+			cr := lp.ftBCR[pos][:0]
+			for _, r := range rows {
+				cr = append(cr, int32(r))
+			}
+			lp.ftBCR[pos] = cr
+			lp.ftBCV[pos] = append(lp.ftBCV[pos][:0], vals...)
+		}
+		if st.ft != nil && st.ft.m == lp.m {
+			if st.ft.rebuild(lp.ftBCR, lp.ftBCV) {
+				st.etas = nil
+				return true
+			}
+			st.ft = nil
+		} else if ft := newFTLUSparse(lp.m, lp.ftBCR, lp.ftBCV); ft != nil {
+			st.ft = ft
+			st.etas = nil
+			return true
+		}
+		// FT singular: fall through and build the sparseLU fallback
+	}
 	cols := make([]int32, lp.m)
 	for pos, j := range st.basicOf {
 		cols[pos] = int32(j)
@@ -168,30 +195,6 @@ func (lp *LP) refactorize(st *State) bool {
 	}
 	st.f = f
 	st.etas = nil
-	if ftEnabled { // FT drives solves; st.f stays as a valid fallback
-		if lp.ftBCR == nil {
-			lp.ftBCR = make([][]int32, lp.m)
-			lp.ftBCV = make([][]float64, lp.m)
-		}
-		for pos, j := range st.basicOf {
-			rows, vals := lp.column(int(j))
-			cr := lp.ftBCR[pos][:0]
-			for _, r := range rows {
-				cr = append(cr, int32(r))
-			}
-			lp.ftBCR[pos] = cr
-			lp.ftBCV[pos] = append(lp.ftBCV[pos][:0], vals...)
-		}
-		if st.ft != nil && st.ft.m == lp.m {
-			if !st.ft.rebuild(lp.ftBCR, lp.ftBCV) {
-				st.ft = nil
-			}
-		} else if ft := newFTLUSparse(lp.m, lp.ftBCR, lp.ftBCV); ft != nil {
-			st.ft = ft
-		} else {
-			st.ft = nil // singular under FT ordering: fall back to st.f
-		}
-	}
 	return true
 }
 
