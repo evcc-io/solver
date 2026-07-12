@@ -61,7 +61,8 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 - **Factorization**: singleton triangularization + sparse-LU kernel,
   product-form (eta) updates, periodic refactorize; no dense inverse;
   int32-compacted arenas, per-LP scratch. True Forrest-Tomlin (`simplex/ft.go`,
-  `CBC_FT`) wired but off — per-update ~10× faster, whole-solve still slower.
+  `CBC_FT=1`): row-spike update, O(nnz) R-file, per-pivot parity with the eta
+  path on the large cases; off by default (see below).
 - **Presolve**: activity-based bound tightening to fixpoint, big-M binary
   coefficient tightening, CglProbing binary probing, singleton-column
   elimination (exact postsolve).
@@ -100,11 +101,17 @@ perf gap. Hot-path FTRAN/BTRAN is sparse-gather bound (compute, not GC/locality
 ## Missing vs. real CBC
 
 - **Forrest-Tomlin gated off** (`CBC_FT=1`): the only gated feature not on by
-  default — whole-solve regresses 2–79× on the evcc models (the eta kernel-LU
-  per-pivot cost CBC's FT avoids; ~10× faster per-update doesn't recover it).
-  Enabling it is the one gate that fails the performance bar; stays off until the
-  FT solve path is optimized. Scaling, the extra cut families (`CBC_CGL`) and the
-  DSE dual (`CBC_DUAL2`) are all on by default and pass the golden suite.
+  default. Its old 2–79× regression was a Bartels-Golub-style trailing-block
+  update growing the R-file by Θ(m−p) ops per pivot; rewritten as true FT
+  (single sparse row-spike elimination, O(nnz(row)) R-ops) it reaches per-pivot
+  parity with the eta path (021: 50µs vs 52µs). Whole-solve can still lose on
+  the golden suite because tiny solve-roundoff differences land B&B in a
+  different (larger) node basin — measured chaos, not an FT defect: the eta
+  path swings the same way across refactorize intervals (021: 3 nodes/2.7s at
+  `CBC_MAXETAS=16` vs 131 nodes/31s at 24). Stays off until branching/
+  degeneracy handling stops amplifying solve roundoff into node-count swings.
+  Scaling, the extra cut families (`CBC_CGL`) and the DSE dual (`CBC_DUAL2`)
+  are all on by default and pass the golden suite.
 - **DSE dual is ~4× CBC wall** on the hardest case (pivot counts already 4–33×
   down toward CBC's).
 - **Proving 020** is the open perf gap (incumbent ≈ CBC under scaling; proof

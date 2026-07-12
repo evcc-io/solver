@@ -5,13 +5,9 @@ import (
 	"os"
 )
 
-// ftEnabled wires the Forrest-Tomlin factor into the solve path (experimental).
+// ftEnabled wires the Forrest-Tomlin factor into the solve path (opt-in:
+// per-pivot parity with the eta path, but node-path variance loses wall-clock).
 var ftEnabled = os.Getenv("CBC_FT") == "1"
-
-// ftFillCap bails a column update to a pooled refactorize when the sparse
-// Hessenberg elimination fills past this multiple of the trailing block size —
-// a dense spike is cheaper to refactor (O(nnz)) than to update.
-const ftFillCap = 16
 
 // ftPivTol gates Markowitz pivot-column choice: candidate within this fraction
 // of the row max. 1.0 = sparsest among max-abs entries (no stability loss).
@@ -25,12 +21,15 @@ func (f *ftLU) clone() *ftLU {
 		prow: append([]int(nil), f.prow...), pcol: append([]int(nil), f.pcol...),
 		rinvrow: append([]int(nil), f.rinvrow...), rinvcol: append([]int(nil), f.rinvcol...),
 		rlist: append([]ftR(nil), f.rlist...),
+		nUpd:  f.nUpd,
+		lPr:   append([]int(nil), f.lPr...),
 		lCol:  make([][]int32, f.m), lVal: make([][]float64, f.m),
 		uCol: make([][]int32, f.m), uVal: make([][]float64, f.m),
+		ucRows: make([][]int32, f.m),
 		// transient scratch is shared (single-threaded, sequential solves);
 		// only the factor data above needs an independent copy
 		z: f.z, spike: f.spike, colBuf: f.colBuf,
-		bRow: f.bRow, bVal: f.bVal, bacc: f.bacc, bmark: f.bmark, bTouch: f.bTouch,
+		bacc: f.bacc, bmark: f.bmark, bTouch: f.bTouch,
 		wRowCol: f.wRowCol, wRowVal: f.wRowVal, wColRows: f.wColRows, wBuck: f.wBuck,
 		wRowUsed: f.wRowUsed, wColUsed: f.wColUsed, wMrk: f.wMrk, wAcc: f.wAcc, wPcols: f.wPcols,
 		wColLen: f.wColLen,
@@ -40,32 +39,33 @@ func (f *ftLU) clone() *ftLU {
 		c.lVal[s] = append([]float64(nil), f.lVal[s]...)
 		c.uCol[s] = append([]int32(nil), f.uCol[s]...)
 		c.uVal[s] = append([]float64(nil), f.uVal[s]...)
+		c.ucRows[s] = append([]int32(nil), f.ucRows[s]...)
 	}
 	return c
 }
 
-// Forrest-Tomlin basis factorization (Clp CoinFactorization port, components
-// 1+2; see docs/rewrite-clp-core.md). Sparse L-columns + U-rows, O(nnz) solves.
+// Forrest-Tomlin factorization (Clp port; docs/rewrite-clp-core.md). L/R-file
+// keyed by stable orig rows, U by stable basis cols; "step" order remaps freely.
 type ftLU struct {
 	m       int
-	lCol    [][]int32   // step s -> original rows eliminated at s
+	lCol    [][]int32   // factorize step s -> orig rows eliminated at s
 	lVal    [][]float64 // matching L multipliers
+	lPr     []int       // factorize step s -> its pivot orig row (immutable)
 	udiag   []float64   // udiag[s] = U[s][s]
-	uCol    [][]int32   // step-row s -> step-cols j>s with a nonzero
+	uCol    [][]int32   // step-row s -> basis cols c with rinvcol[c] > s
 	uVal    [][]float64
-	prow    []int // prow[step] = original basis row
-	pcol    []int // pcol[stepCol] = original basis column
-	rinvrow []int // original row -> step
-	rinvcol []int // original column -> step-col
+	ucRows  [][]int32 // basis col -> orig rows whose U row may hold it (lazy)
+	prow    []int     // prow[step] = orig row
+	pcol    []int     // pcol[step] = basis col
+	rinvrow []int     // orig row -> step
+	rinvcol []int     // basis col -> step
 	rlist   []ftR
 	nUpd    int       // column updates since the last (re)factorize
 	z       []float64 // solve scratch
 	spike   []float64 // replaceColumn scratch (pooled)
 	colBuf  []float64 // dense entering-column scatter (pivot wiring)
 
-	// sparse Hessenberg column-update scratch (pooled)
-	bRow   [][]int32
-	bVal   [][]float64
+	// row-spike elimination scratch, keyed by basis col (pooled)
 	bacc   []float64
 	bmark  []bool
 	bTouch []int32
@@ -79,13 +79,11 @@ type ftLU struct {
 	wColLen                  []int // active-row count per column (Markowitz)
 }
 
-// ftR is one R-file op: swap step-rows r,s (swap) or r -= mult*s (r>s). The
-// interleaved swaps+elims are the trailing block's pivoted Lblk^-1.
+// ftR is one R-file op in orig-row space: row r -= mult * row s. Orig-row ids
+// stay valid across step renumbering, so the list never needs rewriting.
 type ftR struct {
-	r    int
-	s    int
+	r, s int32
 	mult float64
-	swap bool
 }
 
 // newFTLU factors dense basis a (column-major a[col*m+row]); nil if singular.
@@ -109,13 +107,14 @@ func newFTLUSparse(m int, colRow [][]int32, colVal [][]float64) *ftLU {
 	f := &ftLU{
 		m: m, udiag: make([]float64, m),
 		lCol: make([][]int32, m), lVal: make([][]float64, m),
+		lPr:  make([]int, m),
 		uCol: make([][]int32, m), uVal: make([][]float64, m),
-		prow: make([]int, m), pcol: make([]int, m),
+		ucRows: make([][]int32, m),
+		prow:   make([]int, m), pcol: make([]int, m),
 		rinvrow: make([]int, m), rinvcol: make([]int, m),
 		z: make([]float64, m), spike: make([]float64, m),
 		colBuf: make([]float64, m),
-		bRow:   make([][]int32, m), bVal: make([][]float64, m),
-		bacc: make([]float64, m), bmark: make([]bool, m), bTouch: make([]int32, 0, m),
+		bacc:   make([]float64, m), bmark: make([]bool, m), bTouch: make([]int32, 0, m),
 		wRowCol: make([][]int32, m), wRowVal: make([][]float64, m),
 		wColRows: make([][]int32, m), wBuck: make([][]int32, m+1),
 		wRowUsed: make([]bool, m), wColUsed: make([]bool, m), wMrk: make([]bool, m),
@@ -140,6 +139,7 @@ func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 		rowUsed[r], colUsed[r], mark[r], acc[r] = false, false, false, 0
 		f.lCol[r], f.lVal[r] = f.lCol[r][:0], f.lVal[r][:0]
 		f.uCol[r], f.uVal[r] = f.uCol[r][:0], f.uVal[r][:0]
+		f.ucRows[r] = f.ucRows[r][:0]
 		buckets[r] = buckets[r][:0]
 	}
 	buckets[m] = buckets[m][:0]
@@ -208,7 +208,7 @@ func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 		f.prow[step], f.pcol[step] = pr, int(pc)
 		f.rinvrow[pr], f.rinvcol[pc] = step, step
 		f.udiag[step] = pv
-		// scatter the pivot row's other active entries (the U row, by origCol)
+		// scatter the pivot row's other active entries (the U row, by basis col)
 		pcols := f.wPcols[:0]
 		for k, c := range rowCol[pr] {
 			if c != pc && !colUsed[c] {
@@ -281,265 +281,202 @@ func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 			acc[c] = 0
 		}
 	}
+	copy(f.lPr, f.prow) // L stays keyed by factorize-time pivot rows
 	f.buildURows(rowCol, rowVal)
 	return true
 }
 
-// buildURows converts the eliminated working rows into step-col U rows.
+// buildURows converts the eliminated working rows into U rows keyed by basis
+// col, and indexes them column-wise in ucRows.
 func (f *ftLU) buildURows(rowCol [][]int32, rowVal [][]float64) {
-	m := f.m
-	for s := range m {
+	for s := range f.m {
 		pr := f.prow[s]
 		rc, rv := rowCol[pr], rowVal[pr]
 		for k, c := range rc {
-			jc := f.rinvcol[c]
-			if jc > s { // strictly upper in step space
-				f.uCol[s] = append(f.uCol[s], int32(jc))
+			if f.rinvcol[c] > s { // strictly upper in step space
+				f.uCol[s] = append(f.uCol[s], c)
 				f.uVal[s] = append(f.uVal[s], rv[k])
+				f.ucRows[c] = append(f.ucRows[c], int32(pr))
 			}
 		}
 	}
 }
 
-// forwardLR computes z = R L^-1 P b in step space.
+// forwardLR applies R L^-1 P to b in place, in orig-row space.
 func (f *ftLU) forwardLR(b []float64) {
-	m := f.m
-	z := f.z
-	for s := range m {
-		z[s] = b[f.prow[s]]
-	}
-	for s := range m { // L^-1 forward by column push
-		zs := z[s]
-		if zs == 0 {
+	for s := range f.m { // L^-1 forward by column push
+		v := b[f.lPr[s]]
+		if v == 0 {
 			continue
 		}
 		lc, lv := f.lCol[s], f.lVal[s]
 		for k, r := range lc {
-			z[f.rinvrow[r]] -= lv[k] * zs
+			b[r] -= lv[k] * v
 		}
 	}
-	for _, r := range f.rlist {
-		if r.swap {
-			z[r.r], z[r.s] = z[r.s], z[r.r]
-		} else {
-			z[r.r] -= r.mult * z[r.s]
-		}
+	for _, op := range f.rlist {
+		b[op.r] -= op.mult * b[op.s]
 	}
 }
 
-// ftran solves B*x = b in place: b by original row in, x by basis column out.
+// ftran solves B*x = b in place: b by orig row in, x by basis column out.
 func (f *ftLU) ftran(b []float64) {
 	m := f.m
 	f.forwardLR(b)
-	z := f.z
-	for s := m - 1; s >= 0; s-- {
-		v := z[s]
+	x := f.z
+	for s := m - 1; s >= 0; s-- { // U backward; x keyed by basis col
+		v := b[f.prow[s]]
 		uc, uv := f.uCol[s], f.uVal[s]
-		for k, j := range uc {
-			v -= uv[k] * z[j]
+		for k, c := range uc {
+			v -= uv[k] * x[c]
 		}
-		z[s] = v / f.udiag[s]
+		x[f.pcol[s]] = v / f.udiag[s]
 	}
-	for s := range m {
-		b[f.pcol[s]] = z[s]
-	}
+	copy(b, x[:m])
 }
 
-// btran solves B^T*y = c in place: c by basis column in, y by original row out.
+// btran solves B^T*y = c in place: c by basis column in, y by orig row out.
 func (f *ftLU) btran(c []float64) {
 	m := f.m
-	z := f.z
-	for s := range m {
-		z[s] = c[f.pcol[s]]
-	}
-	for s := range m { // U^-T forward by push
-		if z[s] == 0 { // sparse RHS (dual pricing): skip empty steps
+	for s := range m { // U^-T forward by push, in place on c
+		cc := f.pcol[s]
+		v := c[cc]
+		if v == 0 { // sparse RHS (dual pricing): skip empty steps
 			continue
 		}
-		zs := z[s] / f.udiag[s]
-		z[s] = zs
+		v /= f.udiag[s]
+		c[cc] = v
 		uc, uv := f.uCol[s], f.uVal[s]
 		for k, j := range uc {
-			z[j] -= uv[k] * zs
+			c[j] -= uv[k] * v
 		}
+	}
+	z := f.z
+	for s := range m { // move to orig-row space for the R/L passes
+		z[f.prow[s]] = c[f.pcol[s]]
 	}
 	for i := len(f.rlist) - 1; i >= 0; i-- {
-		r := f.rlist[i]
-		if r.swap {
-			z[r.r], z[r.s] = z[r.s], z[r.r]
-		} else {
-			z[r.s] -= r.mult * z[r.r]
-		}
+		op := f.rlist[i]
+		z[op.s] -= op.mult * z[op.r]
 	}
 	for s := m - 1; s >= 0; s-- { // L^-T back by column
-		v := z[s]
+		pr := f.lPr[s]
+		v := z[pr]
 		lc, lv := f.lCol[s], f.lVal[s]
 		for k, r := range lc {
-			v -= lv[k] * z[f.rinvrow[r]]
+			v -= lv[k] * z[r]
 		}
-		z[s] = v
-		c[f.prow[s]] = v
+		z[pr] = v
+		c[pr] = v
 	}
 }
 
-// replaceColumn swaps basis column `col` for vector a (Forrest-Tomlin); false
-// if singular. Trailing rows [p..m-1] update in a dense block, others renumber.
+// replaceColumn swaps basis column `col` for vector a: the pivot cycles to the
+// last step, its row spike eliminated in O(nnz(row)); false = refactorize.
 func (f *ftLU) replaceColumn(col int, a []float64) bool {
 	m := f.m
 	w := f.spike
-	for s := range m {
-		w[s] = a[f.prow[s]]
-	}
-	for s := range m { // w = L^-1 P a by column push
-		ws := w[s]
-		if ws == 0 {
-			continue
-		}
-		for k, r := range f.lCol[s] {
-			w[f.rinvrow[r]] -= f.lVal[s][k] * ws
-		}
-	}
-	for _, r := range f.rlist {
-		if r.swap {
-			w[r.r], w[r.s] = w[r.s], w[r.r]
-		} else {
-			w[r.r] -= r.mult * w[r.s]
-		}
-	}
+	copy(w, a[:m])
+	f.forwardLR(w) // w = R L^-1 P a, orig-row space
+
 	p := f.rinvcol[col]
+	rp := f.prow[p]
 
-	for s := 0; s < p; s++ { // rows above p: renumber columns
-		uc, uv := f.uCol[s], f.uVal[s]
-		nc, nv := uc[:0], uv[:0]
-		for k, j := range uc {
-			if int(j) == p {
-				continue
-			}
-			jj := j
-			if int(j) > p {
-				jj--
-			}
-			nc = append(nc, jj)
-			nv = append(nv, uv[k])
-		}
-		if w[s] != 0 {
-			nc = append(nc, int32(m-1))
-			nv = append(nv, w[s])
-		}
-		f.uCol[s], f.uVal[s] = nc, nv
-	}
-
-	bm := m - p
-	// Sparse upper-Hessenberg block, local coords [0..bm-1]: old U rows p..m-1,
-	// columns shifted left one (dropping the pivot col), spike w in last col.
-	brow, bval := f.bRow, f.bVal
-	fill := 0
-	for i := 0; i < bm; i++ {
-		s := p + i
-		rc, rv := brow[i][:0], bval[i][:0]
-		if i > 0 { // old diagonal becomes the Hessenberg subdiagonal
-			rc, rv = append(rc, int32(i-1)), append(rv, f.udiag[s])
-		}
-		for k, j := range f.uCol[s] {
-			rc, rv = append(rc, int32(int(j)-p-1)), append(rv, f.uVal[s][k])
-		}
-		if w[s] != 0 {
-			rc, rv = append(rc, int32(bm-1)), append(rv, w[s])
-		}
-		brow[i], bval[i] = rc, rv
-		fill += len(rc)
-	}
-	// Sparse Hessenberg LU with partial pivoting; swaps+elims record the block's
-	// pivoted Lblk^-1 into the R-file (|mult| <= 1, stable).
-	for j := 0; j < bm-1; j++ {
-		dj := valAt(brow[j], bval[j], j)
-		sj := valAt(brow[j+1], bval[j+1], j)
-		if math.Abs(sj) > math.Abs(dj) {
-			brow[j], brow[j+1] = brow[j+1], brow[j]
-			bval[j], bval[j+1] = bval[j+1], bval[j]
-			dj, sj = sj, dj
-			f.rlist = append(f.rlist, ftR{r: p + j, s: p + j + 1, swap: true})
-		}
-		if math.Abs(dj) < 1e-12 {
-			return false
-		}
-		if sj == 0 {
-			continue
-		}
-		mult := sj / dj
-		nl := f.rowCombine(j+1, j, mult) // row_{j+1} -= mult*row_j over cols>=j
-		fill += nl
-		if fill > ftFillCap*bm { // pathological fill: refactorize instead
-			return false
-		}
-		f.rlist = append(f.rlist, ftR{r: p + j + 1, s: p + j, mult: mult})
-	}
-	if math.Abs(valAt(brow[bm-1], bval[bm-1], bm-1)) < 1e-12 {
-		return false
-	}
-	for i := 0; i < bm; i++ { // re-sparsify trailing rows back into U
-		s := p + i
-		nc, nv := f.uCol[s][:0], f.uVal[s][:0]
-		diag := 0.0
-		for k, c := range brow[i] {
-			switch cc := int(c); {
-			case cc == i:
-				diag = bval[i][k]
-			case cc > i:
-				nc, nv = append(nc, int32(p+cc)), append(nv, bval[i][k])
-			}
-		}
-		f.udiag[s] = diag
-		f.uCol[s], f.uVal[s] = nc, nv
-	}
-	for j := p; j < m-1; j++ {
-		f.pcol[j] = f.pcol[j+1]
-		f.rinvcol[f.pcol[j]] = j
-	}
-	f.pcol[m-1], f.rinvcol[col] = col, m-1
-	f.nUpd++
-	return true
-}
-
-// valAt returns the entry at local column c in a sparse Hessenberg row (0 if absent).
-func valAt(cols []int32, vals []float64, c int) float64 {
-	for k, cc := range cols {
-		if int(cc) == c {
-			return vals[k]
-		}
-	}
-	return 0
-}
-
-// rowCombine does brow[dst] -= mult*brow[src] over cols >= src via a dense
-// accumulator; returns the new nnz of the dst row.
-func (f *ftLU) rowCombine(dst, src int, mult float64) int {
+	// stash row p (the row spike) into acc, keyed by basis col
 	acc, mark, touch := f.bacc, f.bmark, f.bTouch[:0]
-	dc, dv := f.bRow[dst], f.bVal[dst]
-	for k, c := range dc {
-		acc[c], mark[c] = dv[k], true
+	for k, c := range f.uCol[p] {
+		acc[c], mark[c] = f.uVal[p][k], true
 		touch = append(touch, c)
 	}
-	sc, sv := f.bRow[src], f.bVal[src]
-	for k, c := range sc {
-		if int(c) < src {
+	savedC, savedV := f.uCol[p][:0], f.uVal[p][:0]
+
+	// drop the leaving column's entries from rows above p (lazy ucRows:
+	// stale rows no longer holding col are skipped)
+	for _, r32 := range f.ucRows[col] {
+		s := f.rinvrow[r32]
+		if s == p {
+			continue // row p already extracted
+		}
+		uc, uv := f.uCol[s], f.uVal[s]
+		for k, c := range uc {
+			if int(c) == col {
+				last := len(uc) - 1
+				uc[k], uv[k] = uc[last], uv[last]
+				f.uCol[s], f.uVal[s] = uc[:last], uv[:last]
+				break
+			}
+		}
+	}
+
+	// cycle steps p+1..m-1 up one; the spike takes the last step
+	for s := p; s < m-1; s++ {
+		f.prow[s] = f.prow[s+1]
+		f.rinvrow[f.prow[s]] = s
+		f.pcol[s] = f.pcol[s+1]
+		f.rinvcol[f.pcol[s]] = s
+		f.udiag[s] = f.udiag[s+1]
+		f.uCol[s], f.uVal[s] = f.uCol[s+1], f.uVal[s+1]
+	}
+	f.prow[m-1], f.rinvrow[rp] = rp, m-1
+	f.pcol[m-1], f.rinvcol[col] = col, m-1
+	f.uCol[m-1], f.uVal[m-1] = savedC, savedV // empty; reuses capacity
+
+	// scatter spike w as the new column: above-diagonal entries into U rows
+	rows := f.ucRows[col][:0]
+	for r := range m {
+		wv := w[r]
+		if wv == 0 || r == rp {
 			continue
 		}
+		s := f.rinvrow[r]
+		f.uCol[s] = append(f.uCol[s], int32(col))
+		f.uVal[s] = append(f.uVal[s], wv)
+		rows = append(rows, int32(r))
+	}
+	f.ucRows[col] = rows
+	if !mark[col] {
+		mark[col] = true
+		touch = append(touch, int32(col))
+	}
+	acc[col] = w[rp]
+
+	// eliminate the row spike's below-diagonal entries in ascending step
+	// order; fill stays inside the row, the R-file records the multipliers
+	ok := true
+	for s := p; s < m-1; s++ {
+		c := f.pcol[s]
 		if !mark[c] {
-			mark[c] = true
-			touch = append(touch, c)
+			continue
 		}
-		acc[c] -= mult * sv[k]
-	}
-	nc, nv := dc[:0], dv[:0]
-	for _, c := range touch {
 		v := acc[c]
-		acc[c], mark[c] = 0, false
-		if v != 0 {
-			nc, nv = append(nc, c), append(nv, v)
+		acc[c] = 0
+		if v == 0 {
+			continue
+		}
+		mult := v / f.udiag[s]
+		if math.Abs(mult) > 1e8 { // unstable update: refactorize instead
+			ok = false
+			break
+		}
+		f.rlist = append(f.rlist, ftR{r: int32(rp), s: int32(f.prow[s]), mult: mult})
+		uc, uv := f.uCol[s], f.uVal[s]
+		for k, c2 := range uc {
+			if !mark[c2] {
+				mark[c2] = true
+				touch = append(touch, c2)
+			}
+			acc[c2] -= mult * uv[k]
 		}
 	}
-	f.bRow[dst], f.bVal[dst] = nc, nv
+	d := acc[col]
+	for _, c := range touch {
+		acc[c], mark[c] = 0, false
+	}
 	f.bTouch = touch[:0]
-	return len(nc)
+	if !ok || math.Abs(d) < 1e-12 {
+		return false
+	}
+	f.udiag[m-1] = d
+	f.nUpd++
+	return true
 }
