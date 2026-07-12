@@ -169,10 +169,11 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 	}
 	var cands []cand
 	for r := range mm {
-		j, v := st.BasicVar(r)
+		j, _ := st.BasicVar(r)
 		if j >= n || !m.P.Cols[j].Integer {
 			continue
 		}
+		v := m.LP.VarValueOrig(st, j)
 		f := v - math.Floor(v)
 		if f < cutFracMin || f > 1-cutFracMin {
 			continue
@@ -285,8 +286,9 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 	tab := make([]float64, nt)
 	added := 0
 	for _, cd := range cands {
-		_, v := st.BasicVar(cd.r)
-		f0 := v - math.Floor(v)
+		j, _ := st.BasicVar(cd.r)
+		f0 := m.LP.VarValueOrig(st, j)
+		f0 -= math.Floor(f0)
 		clear(tab)
 		m.LP.TableauRow(st, cd.r, tab)
 		if derive(tab, f0, max(200, n/3)) {
@@ -309,7 +311,8 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 		for i := range topN {
 			tabs[i] = make([]float64, nt)
 			m.LP.TableauRow(st, cands[i].r, tabs[i])
-			_, bval[i] = st.BasicVar(cands[i].r)
+			jb, _ := st.BasicVar(cands[i].r)
+			bval[i] = m.LP.VarValueOrig(st, jb)
 		}
 		agg := make([]float64, nt)
 		pairAdded := 0

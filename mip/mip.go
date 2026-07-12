@@ -390,7 +390,11 @@ func (m *Model) Solve() Result {
 			m.LP.Stats = stats // carry pivot counters across rebuilds
 			m.LP.Deadline = cutDeadline
 			rootSt = nil
-			warmPrev, warmPrevM = st, lastBatch // resolve appended rows warm
+			// warm re-solve reuses the pre-rebuild basis; invalid once scaling
+			// recomputes factors on rebuild, so cold-solve each round when scaled
+			if !m.LP.Scaled() {
+				warmPrev, warmPrevM = st, lastBatch
+			}
 		}
 		m.LP.Deadline = deadline
 	}
@@ -843,9 +847,11 @@ func (m *Model) feasibilityPump(nd *node, x []float64, endState *simplex.State) 
 	fail := func() (float64, []float64, []float64, []float64, []float64, bool) {
 		return 0, nil, nil, nil, nil, false
 	}
-	fpCost := m.LP.ZeroCost()
-	orig := m.LP.SwapCost(fpCost)
-	defer func() { m.LP.SwapCost(orig) }()
+	// work in ORIGINAL space (the LP scales internally, CBC/OSI-style)
+	orig := m.LP.ObjectiveOrig()
+	fpCost := make([]float64, len(orig))
+	m.LP.SetObjectiveOrig(fpCost)
+	defer func() { m.LP.SetObjectiveOrig(orig) }()
 
 	// objective feasibility pump: blend the decaying true objective into the L1
 	// projection so it lands near good-objective points (Achterberg-Berthold).
@@ -883,7 +889,7 @@ func (m *Model) feasibilityPump(nd *node, x []float64, endState *simplex.State) 
 		}
 		if integral {
 			debugf("fp: integral at iter %d", iter)
-			m.LP.SwapCost(orig) // polish the real objective, integers fixed
+			m.LP.SetObjectiveOrig(orig) // polish the real objective, integers fixed
 			cx := append([]float64(nil), curX...)
 			for k, j := range ints {
 				cx[j] = rounded[k]
@@ -919,6 +925,7 @@ func (m *Model) feasibilityPump(nd *node, x []float64, endState *simplex.State) 
 		}
 		alpha *= fpDecay
 
+		m.LP.SetObjectiveOrig(fpCost) // scale the projection cost into the LP
 		if status := m.LP.PrimalResolve(st); status != simplex.Optimal {
 			debugf("fp: projection LP status=%d at iter %d", status, iter)
 			return fail()
@@ -1252,6 +1259,9 @@ func (m *Model) diveForIncumbent(nd *node, x []float64, endState *simplex.State)
 // reducedCostFix tightens integer bounds the root reduced costs prove cannot
 // beat the incumbent by more than the gap (CBC-style); runs on first incumbent.
 func (m *Model) reducedCostFix(rootX, rootRC []float64, rootObj, best float64) {
+	if os.Getenv("CBC_NORCFIX") != "" {
+		return
+	}
 	gap := math.Max(m.Limits.GapAbs, m.Limits.GapRel*math.Abs(best))
 	slack := best - gap - rootObj
 	if slack < 0 {
