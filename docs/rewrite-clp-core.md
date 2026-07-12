@@ -42,10 +42,11 @@ real CBC (`cbc_run.py`) before activation.
       NUMERICALLY STABLE: trailing-block Bartels-Golub with PARTIAL PIVOTING,
       expressed as a general R-file (interleaved swap + elimination ops),
       property-tested; |mult|<=1. Correct end-to-end on the golden suite.
-      STILL SLOW (default-off): Bartels-Golub re-triangularizes the whole
-      trailing block, so a small-position update adds O(block) R-file entries
-      and refactorizes almost every pivot. True Forrest-Tomlin eliminates only
-      the spike (bounded etas) — the remaining efficiency piece.
+      TRUE FT: the trailing-block re-triangularization is now sparse Hessenberg
+      elimination on the U rows (O(spike + fill), no dense block, no block cap),
+      with an `ftFillCap` bail to refactorize on pathological fill. ~10x faster
+      per update than the dense block; PuLP suite under `CBC_FT` matches the
+      default engine and is no slower. Stays active on large trailing blocks.
 - [~] 2. Sparse factorize — shortest-row + largest-entry pivoting, sparse
       L-columns + U-rows, no dense work matrix, property-tested. Not yet fast:
       needs a singleton pre-pass and bucketed pivot search (currently O(m^2)

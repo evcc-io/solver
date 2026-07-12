@@ -8,9 +8,10 @@ import (
 // ftEnabled wires the Forrest-Tomlin factor into the solve path (experimental).
 var ftEnabled = os.Getenv("CBC_FT") == "1"
 
-// ftBlockCap bounds the dense trailing block of a column update; past it a
-// pooled refactorize (O(nnz)) is far cheaper than the O(block^2) dense update.
-const ftBlockCap = 256
+// ftFillCap bails a column update to a pooled refactorize when the sparse
+// Hessenberg elimination fills past this multiple of the trailing block size —
+// a dense spike is cheaper to refactor (O(nnz)) than to update.
+const ftFillCap = 16
 
 
 // clone deep-copies the mutable factor so a branch-and-bound child updates it
@@ -25,7 +26,8 @@ func (f *ftLU) clone() *ftLU {
 		uCol: make([][]int32, f.m), uVal: make([][]float64, f.m),
 		// transient scratch is shared (single-threaded, sequential solves);
 		// only the factor data above needs an independent copy
-		z: f.z, spike: f.spike, blk: f.blk, colBuf: f.colBuf,
+		z: f.z, spike: f.spike, colBuf: f.colBuf,
+		bRow: f.bRow, bVal: f.bVal, bacc: f.bacc, bmark: f.bmark, bTouch: f.bTouch,
 		wRowCol: f.wRowCol, wRowVal: f.wRowVal, wColRows: f.wColRows, wBuck: f.wBuck,
 		wRowUsed: f.wRowUsed, wColUsed: f.wColUsed, wMrk: f.wMrk, wAcc: f.wAcc, wPcols: f.wPcols,
 	}
@@ -55,8 +57,14 @@ type ftLU struct {
 	nUpd    int       // column updates since the last (re)factorize
 	z       []float64 // solve scratch
 	spike   []float64 // replaceColumn scratch (pooled)
-	blk     []float64 // trailing-block dense scratch (pooled)
 	colBuf  []float64 // dense entering-column scatter (pivot wiring)
+
+	// sparse Hessenberg column-update scratch (pooled)
+	bRow   [][]int32
+	bVal   [][]float64
+	bacc   []float64
+	bmark  []bool
+	bTouch []int32
 
 	// factorize working scratch, reused across in-place rebuilds
 	wRowCol, wColRows, wBuck [][]int32
@@ -99,8 +107,10 @@ func newFTLUSparse(m int, colRow [][]int32, colVal [][]float64) *ftLU {
 		uCol: make([][]int32, m), uVal: make([][]float64, m),
 		prow: make([]int, m), pcol: make([]int, m),
 		rinvrow: make([]int, m), rinvcol: make([]int, m),
-		z: make([]float64, m), spike: make([]float64, m), blk: make([]float64, ftBlockCap*ftBlockCap),
-		colBuf:   make([]float64, m),
+		z: make([]float64, m), spike: make([]float64, m),
+		colBuf: make([]float64, m),
+		bRow:   make([][]int32, m), bVal: make([][]float64, m),
+		bacc:   make([]float64, m), bmark: make([]bool, m), bTouch: make([]int32, 0, m),
 		wRowCol:  make([][]int32, m), wRowVal: make([][]float64, m),
 		wColRows: make([][]int32, m), wBuck: make([][]int32, m+1),
 		wRowUsed: make([]bool, m), wColUsed: make([]bool, m), wMrk: make([]bool, m),
@@ -363,9 +373,6 @@ func (f *ftLU) replaceColumn(col int, a []float64) bool {
 		}
 	}
 	p := f.rinvcol[col]
-	if m-p > ftBlockCap { // large trailing block: refactorize is cheaper
-		return false
-	}
 
 	for s := 0; s < p; s++ { // rows above p: renumber columns
 		uc, uv := f.uCol[s], f.uVal[s]
@@ -389,59 +396,66 @@ func (f *ftLU) replaceColumn(col int, a []float64) bool {
 	}
 
 	bm := m - p
-	d := f.blk[:bm*bm]
-	for i := range d {
-		d[i] = 0
-	}
+	// Sparse upper-Hessenberg block, local coords [0..bm-1]: old U rows p..m-1,
+	// columns shifted left one (dropping the pivot col), spike w in last col.
+	brow, bval := f.bRow, f.bVal
+	fill := 0
 	for i := 0; i < bm; i++ {
 		s := p + i
-		d[i*bm+i] = f.udiag[s]
+		rc, rv := brow[i][:0], bval[i][:0]
+		if i > 0 { // old diagonal becomes the Hessenberg subdiagonal
+			rc, rv = append(rc, int32(i-1)), append(rv, f.udiag[s])
+		}
 		for k, j := range f.uCol[s] {
-			d[i*bm+(int(j)-p)] = f.uVal[s][k]
+			rc, rv = append(rc, int32(int(j)-p-1)), append(rv, f.uVal[s][k])
 		}
-	}
-	for i := 0; i < bm; i++ { // column shift inside block, spike last
-		for j := 0; j < bm-1; j++ {
-			d[i*bm+j] = d[i*bm+j+1]
+		if w[s] != 0 {
+			rc, rv = append(rc, int32(bm-1)), append(rv, w[s])
 		}
-		d[i*bm+(bm-1)] = w[p+i]
+		brow[i], bval[i] = rc, rv
+		fill += len(rc)
 	}
-	// Hessenberg LU with partial pivoting: swaps + elims recorded interleaved
-	// into the R-file are the block's pivoted Lblk^-1 (|mult| <= 1, stable).
+	// Sparse Hessenberg LU with partial pivoting; swaps+elims record the block's
+	// pivoted Lblk^-1 into the R-file (|mult| <= 1, stable).
 	for j := 0; j < bm-1; j++ {
-		if math.Abs(d[(j+1)*bm+j]) > math.Abs(d[j*bm+j]) {
-			for c := 0; c < bm; c++ {
-				d[j*bm+c], d[(j+1)*bm+c] = d[(j+1)*bm+c], d[j*bm+c]
-			}
+		dj := valAt(brow[j], bval[j], j)
+		sj := valAt(brow[j+1], bval[j+1], j)
+		if math.Abs(sj) > math.Abs(dj) {
+			brow[j], brow[j+1] = brow[j+1], brow[j]
+			bval[j], bval[j+1] = bval[j+1], bval[j]
+			dj, sj = sj, dj
 			f.rlist = append(f.rlist, ftR{r: p + j, s: p + j + 1, swap: true})
 		}
-		diag := d[j*bm+j]
-		if math.Abs(diag) < 1e-12 {
+		if math.Abs(dj) < 1e-12 {
 			return false
 		}
-		sub := d[(j+1)*bm+j]
-		if sub == 0 {
+		if sj == 0 {
 			continue
 		}
-		mult := sub / diag
-		for c := j; c < bm; c++ {
-			d[(j+1)*bm+c] -= mult * d[j*bm+c]
+		mult := sj / dj
+		nl := f.rowCombine(j+1, j, mult) // row_{j+1} -= mult*row_j over cols>=j
+		fill += nl
+		if fill > ftFillCap*bm { // pathological fill: refactorize instead
+			return false
 		}
 		f.rlist = append(f.rlist, ftR{r: p + j + 1, s: p + j, mult: mult})
 	}
-	if math.Abs(d[(bm-1)*bm+(bm-1)]) < 1e-12 {
+	if math.Abs(valAt(brow[bm-1], bval[bm-1], bm-1)) < 1e-12 {
 		return false
 	}
-	for i := 0; i < bm; i++ { // re-sparsify trailing rows
+	for i := 0; i < bm; i++ { // re-sparsify trailing rows back into U
 		s := p + i
-		f.udiag[s] = d[i*bm+i]
 		nc, nv := f.uCol[s][:0], f.uVal[s][:0]
-		for j := i + 1; j < bm; j++ {
-			if v := d[i*bm+j]; v != 0 {
-				nc = append(nc, int32(p+j))
-				nv = append(nv, v)
+		diag := 0.0
+		for k, c := range brow[i] {
+			switch cc := int(c); {
+			case cc == i:
+				diag = bval[i][k]
+			case cc > i:
+				nc, nv = append(nc, int32(p+cc)), append(nv, bval[i][k])
 			}
 		}
+		f.udiag[s] = diag
 		f.uCol[s], f.uVal[s] = nc, nv
 	}
 	for j := p; j < m-1; j++ {
@@ -451,4 +465,47 @@ func (f *ftLU) replaceColumn(col int, a []float64) bool {
 	f.pcol[m-1], f.rinvcol[col] = col, m-1
 	f.nUpd++
 	return true
+}
+
+// valAt returns the entry at local column c in a sparse Hessenberg row (0 if absent).
+func valAt(cols []int32, vals []float64, c int) float64 {
+	for k, cc := range cols {
+		if int(cc) == c {
+			return vals[k]
+		}
+	}
+	return 0
+}
+
+// rowCombine does brow[dst] -= mult*brow[src] over cols >= src via a dense
+// accumulator; returns the new nnz of the dst row.
+func (f *ftLU) rowCombine(dst, src int, mult float64) int {
+	acc, mark, touch := f.bacc, f.bmark, f.bTouch[:0]
+	dc, dv := f.bRow[dst], f.bVal[dst]
+	for k, c := range dc {
+		acc[c], mark[c] = dv[k], true
+		touch = append(touch, c)
+	}
+	sc, sv := f.bRow[src], f.bVal[src]
+	for k, c := range sc {
+		if int(c) < src {
+			continue
+		}
+		if !mark[c] {
+			mark[c] = true
+			touch = append(touch, c)
+		}
+		acc[c] -= mult * sv[k]
+	}
+	nc, nv := dc[:0], dv[:0]
+	for _, c := range touch {
+		v := acc[c]
+		acc[c], mark[c] = 0, false
+		if v != 0 {
+			nc, nv = append(nc, c), append(nv, v)
+		}
+	}
+	f.bRow[dst], f.bVal[dst] = nc, nv
+	f.bTouch = touch[:0]
+	return len(nc)
 }

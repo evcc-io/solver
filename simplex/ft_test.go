@@ -148,6 +148,69 @@ func TestFTReplaceColumn(t *testing.T) {
 	}
 }
 
+// TestFTReplaceColumnLarge exercises the sparse Hessenberg update on blocks far
+// past the old dense cap, checking ftran/btran against the rebuilt basis.
+func TestFTReplaceColumnLarge(t *testing.T) {
+	rng := rand.New(rand.NewSource(11))
+	for _, m := range []int{100, 300, 400} {
+		a := make([]float64, m*m)
+		for i := range a {
+			if rng.Float64() < 0.04 {
+				a[i] = rng.NormFloat64()
+			}
+		}
+		for d := range m {
+			a[d*m+d] += float64(2 * m)
+		}
+		f := newFTLU(m, a)
+		if f == nil {
+			t.Fatalf("m=%d: singular factor", m)
+		}
+		for upd := 0; upd < 40; upd++ {
+			col := rng.Intn(m) // early cols force a large trailing block
+			nv := make([]float64, m)
+			for i := range nv {
+				if rng.Float64() < 0.04 {
+					nv[i] = rng.NormFloat64()
+				}
+			}
+			nv[col] += float64(2 * m)
+			ok := f.replaceColumn(col, nv)
+			for r := range m {
+				a[col*m+r] = nv[r]
+			}
+			if !ok { // refactorize path: rebuild from the updated reference
+				if f = newFTLU(m, a); f == nil {
+					t.Fatalf("m=%d upd=%d: refactorize singular", m, upd)
+				}
+				continue
+			}
+			x := make([]float64, m)
+			for i := range x {
+				x[i] = rng.NormFloat64()
+			}
+			b := ftMatVec(m, a, x)
+			f.ftran(b)
+			for i := range m {
+				if math.Abs(b[i]-x[i]) > 1e-5*(1+math.Abs(x[i])) {
+					t.Fatalf("ftran m=%d upd=%d i=%d: got %g want %g", m, upd, i, b[i], x[i])
+				}
+			}
+			y := make([]float64, m)
+			for i := range y {
+				y[i] = rng.NormFloat64()
+			}
+			c := ftMatVecT(m, a, y)
+			f.btran(c)
+			for i := range m {
+				if math.Abs(c[i]-y[i]) > 1e-5*(1+math.Abs(y[i])) {
+					t.Fatalf("btran m=%d upd=%d i=%d: got %g want %g", m, upd, i, c[i], y[i])
+				}
+			}
+		}
+	}
+}
+
 // TestFTLUSolve checks ftran/btran against a known x on random nonsingular B.
 func TestFTLUSolve(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
