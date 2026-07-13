@@ -78,7 +78,9 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 - **Branching**: CBC reliability branching (pseudocosts, `numberBeforeTrust`=10,
   capped strong-branch probes, `maxStrong`=5, CBC score) + strong-branch fixing.
 - **Heuristics**: MIP-start completion, pivot-budgeted 1-opt polish, face
-  walk, RENS, objective feasibility pump, rounding dive, RINS as a
+  walk, RENS with a node-capped sub-MIP fallback on the integral-fixed
+  neighborhood (CBC mini branch and bound), objective feasibility pump
+  (pivot-budgeted), rounding dive, RINS as a
   node-capped sub-MIP on the agree-fixed neighborhood (CbcHeuristicRINS),
   run per new incumbent; time-boxed bursts.
 - **Anti-degeneracy**: EXPAND ratio test, full Bland's after a degenerate
@@ -98,13 +100,22 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   and pass the golden suite.
 - **DSE dual is ~4× CBC wall** on the hardest case (pivot counts already 4–33×
   down toward CBC's).
-- **Node-local in-tree cuts**: CBC generates locally-valid cuts throughout the
-  search (probing/Gomory per subtree, with local row lifecycle); cbcgo's
-  in-tree rounds cover the globally-valid families only. That, plus 020's
-  heuristic pivot spend (faceWalk + strong-branch probes are ~80% of its
-  pivots and resist capping — three budget variants measured wall-negative),
-  is the remaining 020 tree gap — see Benchmarks. Node re-solves themselves
-  are already cheap: 12.6 pivots/node vs CBC's 53 iterations/node.
+- **Node-local in-tree cuts implemented but gated** (`CBC_LOCALCUTS=1`): GMI
+  cuts from a node's basis are stored as free rows (vacuous globally) and
+  activated per subtree via bound overrides on their logical variables — the
+  full local lifecycle without LP row add/remove. Correct, but net-negative
+  on 020 (degenerate node grind) until CBC-style cut-effectiveness pruning
+  lands; the globally-valid in-tree round stays on.
+- **Fixed-column elimination implemented but gated** (`CBC_ELIMFIX=1`):
+  LB==UB columns fold into row bounds with exact primal/dual postsolve
+  (020: −364 cols, 021: −643). Objectives verified exact; measured 021 2.9s
+  → 1.7s but 018/020 regress via a feasibility-pump grind on the scaled
+  reduced model — gated until single-solve preemption exists. Deeper
+  CglPreProcess pieces (doubleton substitution, duplicates) remain missing.
+- **020 heuristic pivot spend**: faceWalk + strong-branch probes are ~80% of
+  its pivots and resist capping (five reorder/budget variants measured
+  wall-negative — the walk's vertex path pins the good tree). Node re-solves
+  themselves are already cheap: 12.6 pivots/node vs CBC's 53 iterations/node.
 - **Gap semantics**: default absolute gap is 1e-5, mirroring CBC's default
   cutoff increment (`CbcCutoffIncrement`); `-allow`/`-ratio` override it.
 - **No multi-threaded search** (`-threads` accepted, ignored); **`-mips` warm
