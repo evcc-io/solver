@@ -48,7 +48,7 @@ func (m *Model) probingCuts(x []float64, deadline time.Time) int {
 				wl[k], wu[k] = p.Cols[k].LB, p.Cols[k].UB
 			}
 			wl[j], wu[j] = float64(side), float64(side)
-			if !propagate(p, wl, wu) {
+			if !propagate(p, wl, wu, nil) {
 				// side infeasible: the binary is fixed the other way
 				v := 1 - float64(side)
 				p.Cols[j].LB, p.Cols[j].UB = v, v
@@ -122,7 +122,7 @@ func (m *Model) probingCutsNode(x, lb0, ub0 []float64, deadline time.Time) int {
 			copy(wl, lb0)
 			copy(wu, ub0)
 			wl[j], wu[j] = float64(side), float64(side)
-			if !propagate(p, wl, wu) {
+			if !propagate(p, wl, wu, nil) {
 				// side infeasible under the node bounds: local fixing row
 				if side == 1 {
 					p.AddRow("", []int{j}, []float64{1}, problem.LE, 0)

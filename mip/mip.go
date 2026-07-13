@@ -96,6 +96,7 @@ type Model struct {
 
 	// scratch for node-level bound propagation (propagatedChild)
 	propLB, propUB, propL0, propU0 []float64
+	propSc                         propScratch
 
 	// debug-only pivot attribution per heuristic (SOLVER_DEBUG)
 	dbgFW, dbgFP, dbgRINS, dbgDive, dbgNodeCold int64
@@ -936,7 +937,7 @@ func (m *Model) propagatedChild(nd *node, st *simplex.State, ov boundOverride, b
 	l0, u0 := m.propL0[:n], m.propU0[:n]
 	copy(l0, lb)
 	copy(u0, ub)
-	if !propagate(m.P, lb, ub) {
+	if !propagate(m.P, lb, ub, &m.propSc) {
 		return nil
 	}
 	extra := make([]boundOverride, 0, 8)

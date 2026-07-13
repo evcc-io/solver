@@ -199,20 +199,45 @@ func setCoef(p *problem.Problem, ri, k int, v float64) {
 
 // propagate tightens the working bounds via a row worklist run to fixpoint
 // (order-independent: bounds only shrink); false when a row is infeasible.
-func propagate(p *problem.Problem, lb, ub []float64) bool {
+// propScratch pools propagate's membership flags + FIFO ring so the per-node
+// propagatedChild path allocates nothing; nil scratch allocates locally.
+type propScratch struct {
+	inQ  []bool
+	ring []int
+}
+
+func propagate(p *problem.Problem, lb, ub []float64, sc *propScratch) bool {
 	inf := problem.Inf
 	nr := len(p.Rows)
-	inQ := make([]bool, nr)
-	queue := make([]int, nr)
-	for ri := range queue {
-		queue[ri] = ri
+	var inQ []bool
+	var ring []int
+	if sc != nil {
+		if cap(sc.inQ) < nr {
+			sc.inQ, sc.ring = make([]bool, nr), make([]int, nr)
+		}
+		inQ, ring = sc.inQ[:nr], sc.ring[:nr]
+		for i := range inQ {
+			inQ[i] = false
+		}
+	} else {
+		inQ, ring = make([]bool, nr), make([]int, nr)
+	}
+	// FIFO ring over row indices, starts full; inQ dedups so at most nr rows
+	// are queued at once, making a cap-nr ring exact (no reslice reallocation)
+	for ri := range ring {
+		ring[ri] = ri
 		inQ[ri] = true
 	}
+	head, count := 0, nr
 	// the 1e-9 improvement floor guarantees termination; the cap only
 	// guards zeno chains, and a capped exit is still a valid tightening
-	for done := 0; len(queue) > 0 && done < 64*nr; done++ {
-		ri := queue[0]
-		queue = queue[1:]
+	for done := 0; count > 0 && done < 64*nr; done++ {
+		ri := ring[head]
+		head++
+		if head == nr {
+			head = 0
+		}
+		count--
 		inQ[ri] = false
 		r := &p.Rows[ri]
 		rlb, rub := r.Bounds()
@@ -309,7 +334,12 @@ func propagate(p *problem.Problem, lb, ub []float64) bool {
 				for _, rr := range p.Cols[j].Idx {
 					if !inQ[rr] {
 						inQ[rr] = true
-						queue = append(queue, rr)
+						tail := head + count
+						if tail >= nr {
+							tail -= nr
+						}
+						ring[tail] = rr
+						count++
 					}
 				}
 			}
@@ -350,8 +380,8 @@ func probe(p *problem.Problem, deadline time.Time) int {
 		copy(ub1, base[n:])
 		ub0[j] = 0
 		lb1[j] = 1
-		feas0 := propagate(p, lb0, ub0)
-		feas1 := propagate(p, lb1, ub1)
+		feas0 := propagate(p, lb0, ub0, nil)
+		feas1 := propagate(p, lb1, ub1, nil)
 		switch {
 		case !feas0 && !feas1:
 			return nFix + nStr // infeasible problem: leave it to the LP to report
