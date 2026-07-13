@@ -79,12 +79,13 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   globally-valid cut families with cold-restarted open nodes.
 - **Branching**: CBC reliability branching (pseudocosts, `numberBeforeTrust`=10,
   capped strong-branch probes, `maxStrong`=5, CBC score) + strong-branch fixing.
-- **Heuristics**: MIP-start completion, pivot-budgeted 1-opt polish, face
-  walk, RENS with a node-capped sub-MIP fallback on the integral-fixed
-  neighborhood (CBC mini branch and bound), objective feasibility pump
-  (pivot-budgeted), rounding dive, RINS as a
-  node-capped sub-MIP on the agree-fixed neighborhood (CbcHeuristicRINS),
-  run per new incumbent; time-boxed bursts.
+- **Heuristics** (reduced-sub-problem first, as CBC's mini branch and bound):
+  RENS — integral-fix + single-shot rounding + node-capped sub-MIP on the
+  integral-fixed neighborhood — leads each burst, faceWalk is the fallback;
+  RINS as a node-capped sub-MIP on the agree-fixed neighborhood
+  (CbcHeuristicRINS), run per new incumbent; MIP-start completion,
+  pivot-budgeted 1-opt polish and feasibility pump, rounding dive;
+  time-boxed, pivot-capped bursts.
 - **Anti-degeneracy**: EXPAND ratio test, full Bland's after a degenerate
   streak, Clp bound perturbation in cold solves.
 - **CLI**: PuLP's flags (`-max`/`-sec`/`-ratio`/`-allow`/`-maxNodes`/`-solve`/
@@ -115,10 +116,10 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   hot-start/heuristic iteration caps. This is what made fixed-column
   elimination shippable: single degenerate LP grinds (018: 192k pivots in
   one pump projection) now fail fast instead of eating the budget.
-- **020 heuristic pivot spend**: faceWalk + strong-branch probes are ~80% of
-  its pivots and resist capping (five reorder/budget variants measured
-  wall-negative — the walk's vertex path pins the good tree). Node re-solves
-  themselves are already cheap: 12.6 pivots/node vs CBC's 53 iterations/node.
+- **020 heuristic pivot spend**: strong-branch probes are now the top
+  consumer (82k of 205k pivots; faceWalk dropped 200k→41k once RENS-first
+  landed). Node re-solves themselves are cheap: 8.6 pivots/node vs CBC's 53
+  iterations/node.
   Remaining CglPreProcess gaps: bound-transferring doubletons and duplicate
   rows/cols (implied-free substitution ships; the evcc bounds usually bind,
   so main models substitute few columns while heuristic sub-MIPs substitute
