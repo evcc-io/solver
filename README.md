@@ -130,10 +130,25 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   tree lottery (one refactorize interval loses its proof), so defaults stay
   byte-identical. Probes also skip solution extraction (312MB of the 020
   alloc profile was probe-side arrays nobody read).
-  Remaining CglPreProcess gaps: bound-transferring doubletons and duplicate
-  rows/cols (implied-free substitution ships; the evcc bounds usually bind,
-  so main models substitute few columns while heuristic sub-MIPs substitute
-  hundreds).
+- **Gap-scheduled diving** (CBC runs heuristics only while the gap is open):
+  cbcgo used to burst diving heuristics at every 256th node unconditionally.
+  On 020 the lone mid-tree burst fired with the incumbent already within 0.02
+  of the optimum, found nothing, and cost ~26k pivots down the full
+  rens→faceWalk→fpump→dive chain. Gating the burst on the open-gap condition
+  skips it: 020 208k→183k pivots, 12.9→10.9s, **tree identical** (774 nodes),
+  robustness 5/5.
+- **Presolve reduction gap is CoinPresolve column elimination, not
+  doubletons.** A structural census of the golden models finds **0 duplicate
+  rows, 0 duplicate columns, 0 equality doubletons** (every equality row has
+  3+ nonzeros; the abundant 2-term rows are all inequalities) — matching real
+  CBC, which prints 0 substitutions. Yet CBC reduces 020 to 1375 rows / 1399
+  cols where cbcgo reaches 2032 / 2421. The ~1000-column gap is 260 free
+  columns + 721 continuous singletons (the `rowBlocks&&colBlocks` case).
+  Free-column removal ships opt-in (`CBC_FREECOL=1`, CoinPresolve empty-column
+  removal): optimum-preserving and ~2× on 018 (31746→13917 pivots), but the
+  perturbed model re-rolls 020's proof-fragile tree (774→3400 nodes), so it
+  stays off by default. Fixing (105 = CBC's 105) and big-M coefficient
+  strengthening (301 ≈ CBC's 304, `Cgl0010I`-style) already match and ship on.
 - **Gap semantics**: default absolute gap is 1e-5, mirroring CBC's default
   cutoff increment (`CbcCutoffIncrement`); `-allow`/`-ratio` override it.
 - **No multi-threaded search** (`-threads` accepted, ignored); **`-mips` warm
@@ -156,7 +171,7 @@ Wall-clock, nodes, objective:
 |---|---|---|---|
 | 018 | 4.9s, 18291.45 | **0.34s, 7 nodes, 18291.4519** | 0.04s, 0 nodes, 18291.4519 |
 | 021 | 5.8s, **8.6901 (wrong)** | **3.2s, 3 nodes, 8.70087** | 0.09s, 0 nodes, 8.70083 |
-| 020 | 60s, **−140 (garbage)** | **12.6s, 774 nodes, 0.55835 proven** | 3.6s, 833 nodes, 0.55835 |
+| 020 | 60s, **−140 (garbage)** | **10.9s, 774 nodes, 0.55835 proven** | 3.6s, 833 nodes, 0.55835 |
 
 Tree robustness — nodes (and wall) as solve roundoff is perturbed via the
 refactorize interval `CBC_MAXETAS` ∈ {24, 32, 48, 64, 100}:
@@ -165,12 +180,12 @@ refactorize interval `CBC_MAXETAS` ∈ {24, 32, 48, 64, 100}:
 |---|---|---|---|
 | 018 | 27–336 nodes, 0.3–6.4s | **7–10 nodes, 0.20–0.65s** | 0 nodes |
 | 021 | 3–291 nodes, 2.6–31s | **3 nodes every run, 2.7–5.7s** | 0 nodes |
-| 020 | never proven | **proven 5/5, 10.1–26.2s** | 833 nodes, 3.6s |
+| 020 | never proven | **proven 5/5, 10.3–24.6s** | 833 nodes, 3.6s |
 
 Probing coefficient strengthening lifts 018's pre-cut root bound from 18092
 to 18291.44 and stops node counts swinging with roundoff; fixed-column
 elimination (020: −364 cols), equality-chain substitution and per-solve
-pivot caps take 020 from 59.8s to 12.6s with every refactorize interval
+pivot caps plus gap-scheduled diving take 020 from 59.8s to 10.9s with every refactorize interval
 proving. 020 root parity: preprocessing fixes 105 = CBC's 105
 (~350 rows strengthened vs CBC's 501), root cut bound within 1% of CBC's
 closed distance (−0.664 vs −0.658 from −0.885). The remaining ~4× on 020 is
