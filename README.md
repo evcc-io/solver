@@ -74,7 +74,8 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   pivot-budgeted rounds; slack cuts dropped before the tree.
 - **Branch & bound**: best-first + depth-first plunging, warm child bases,
   node bound propagation, reduced-cost fixing per incumbent, SOS1/2, one
-  restart inheriting cuts/fixings/probes.
+  restart inheriting cuts/fixings/probes; periodic in-tree rounds of the
+  globally-valid cut families with cold-restarted open nodes.
 - **Branching**: CBC reliability branching (pseudocosts, `numberBeforeTrust`=10,
   capped strong-branch probes, `maxStrong`=5, CBC score) + strong-branch fixing.
 - **Heuristics**: MIP-start completion, 1-opt polish, face walk, RENS,
@@ -119,9 +120,14 @@ throughput — engine constants, not correctness.
   are all on by default and pass the golden suite.
 - **DSE dual is ~4× CBC wall** on the hardest case (pivot counts already 4–33×
   down toward CBC's).
-- **020 wall-clock**: proven, but ~15× CBC (57s vs 3.6s; 1.9k vs 833 nodes) —
-  the residual gap is node throughput, and one refactorize interval still
-  times out (residual tree variance on the hardest case).
+- **020 wall-clock**: proven, but ~15× CBC (48–92s vs 3.6s; 1.7–3.7k vs 833
+  nodes; 3/5 refactorize intervals prove within 120s, the misses end within
+  2e-4 of optimum). Root parity is there — preprocessing fixes match CBC
+  (105=105) and the root cut bound lands within 1% of CBC's closed distance
+  (−0.664 vs −0.658 from −0.885). The residual tree gap is CBC's *locally
+  valid* in-tree cuts (its 020 tree accumulates ~950 node-local probing cuts;
+  cbcgo's in-tree rounds are global-family only, which separate nothing new
+  after the root) plus per-node LP cost.
 - **Gap semantics**: default absolute gap is 1e-5, mirroring CBC's default
   cutoff increment (`CbcCutoffIncrement`); `-allow`/`-ratio` override it.
 - **No multi-threaded search** (`-threads` accepted, ignored); **`-mips` warm

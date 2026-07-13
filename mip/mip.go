@@ -443,6 +443,7 @@ func (m *Model) Solve() Result {
 	var rootObj float64 // root LP data for reduced-cost fixing
 	var rootX, rootRC []float64
 	diveTries := 0
+	lastTreeCut, treeCutRounds := 0, 0
 	rinsFails := 0
 	newIncumbent := func(obj float64, x, rowAct, rc, price []float64) {
 		bestInternal = obj
@@ -519,6 +520,32 @@ func (m *Model) Solve() Result {
 				backtrack = nil
 			}
 
+			// in-tree global cut rounds (CBC generates cuts during search):
+			// the CGL families derive from original rows + global bounds, so
+			// their cuts are valid tree-wide; rebuild and cold-restart the
+			// open nodes on the tightened LP.
+			if cglEnabled && treeCutRounds < 8 && nodeCount-lastTreeCut >= 256 {
+				lastTreeCut = nodeCount
+				if n := m.knapsackCoverCuts(x) + m.cliqueCuts(x) + m.zeroHalfCuts(x) +
+					m.flowCoverCuts(x) + m.liftProjectCuts(x); n > 0 {
+					treeCutRounds++
+					debugf("treecuts: +%d rows at node %d (round %d)", n, nodeCount, treeCutRounds)
+					stats := m.LP.Stats
+					m.rebuildLP()
+					m.LP.Stats = stats
+					m.LP.Deadline = deadline
+					m.live = nil
+					for _, h := range *pq {
+						h.parentState = nil
+					}
+					nd.parentState = nil
+					nd.brCol = -1 // avoid double pseudocost credit on re-solve
+					if backtrack != nil {
+						backtrack.parentState = nil
+					}
+					continue // re-solve this node on the tightened LP
+				}
+			}
 			branchCol, sosIdx, sosSplit := m.findBranch(x)
 			if branchCol < 0 && sosIdx < 0 {
 				newIncumbent(obj, x, rowAct, rc, price)
