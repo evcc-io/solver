@@ -16,6 +16,12 @@ var cglEnabled = os.Getenv("CBC_CGL") != "0"
 // CBC-style cut-effectiveness pruning; off until that lands.
 var localCutsEnabled = os.Getenv("CBC_LOCALCUTS") == "1"
 
+// crunchEnabled (CBC_CRUNCH=1) probes on a row-subset LP (Clp crunch):
+// exact bounds, ~25% fewer probe rows on the golden cases, but the changed
+// probe roundoff re-rolls 020's tree lottery — opt-in until trees are freer
+// of basin sensitivity.
+var crunchEnabled = os.Getenv("CBC_CRUNCH") == "1"
+
 // coverItem is a knapsack element with its complemented LP value.
 type coverItem struct {
 	k    int

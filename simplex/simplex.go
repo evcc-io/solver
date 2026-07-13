@@ -547,6 +547,9 @@ func (lp *LP) WarmSolveExtended(prev *State, prevM int) (Status, *State, float64
 func (lp *LP) SetProbe(cap int) { lp.probeMode, lp.IterCap = true, cap }
 func (lp *LP) ClearProbe()      { lp.probeMode, lp.IterCap = false, 0 }
 
+// Probing reports probe mode: callers can skip work a probe discards.
+func (lp *LP) Probing() bool { return lp.probeMode }
+
 // SetIterCap bounds pivots per solve without probe semantics (0 = off):
 // heuristic solves use it so a degenerate grind returns IterLimit instead of
 // burning the budget (CBC caps heuristic/hot-start iterations the same way).

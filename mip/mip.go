@@ -253,9 +253,9 @@ func (m *Model) Solve() Result {
 	var preSolved *simplex.State
 	var preSolvedPivots int64
 	if len(m.MIPStart) == len(m.P.Cols) && len(m.P.SOSs) == 0 {
-		preBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+		preBase := m.totalPivots()
 		if status, st, _ := m.LP.ColdSolve(); status == simplex.Optimal {
-			preSolvedPivots = m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - preBase
+			preSolvedPivots = m.totalPivots() - preBase
 			rx, _, rrc, _ := m.LP.Solution(st)
 			robj := m.LP.InternalObjective(st)
 			// polishing the trivial start measured as pure waste: it burned
@@ -303,7 +303,7 @@ func (m *Model) Solve() Result {
 		// pivots are speed-invariant work units: budgeting rounds by pivots
 		// keeps the cut set deterministic across engine speed changes; the
 		// wall-clock box stays as a safety cap only
-		pivots := func() int64 { return m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual }
+		pivots := func() int64 { return m.totalPivots() }
 		cutBase := pivots()
 		if preSolved != nil {
 			cutBase -= preSolvedPivots // the reused solve's work stays on the ledger
@@ -406,7 +406,7 @@ func (m *Model) Solve() Result {
 			}
 			added := gmi + prb + mir + cgl
 			debugf("cuts: round %d added %d rows (gmi %d, probing %d, mir %d, bound %g, pivots %d)",
-				round, added, gmi, prb, mir, obj, m.LP.Stats.Phase1+m.LP.Stats.Phase2+m.LP.Stats.Dual)
+				round, added, gmi, prb, mir, obj, m.totalPivots())
 			if added == 0 {
 				break
 			}
@@ -502,9 +502,9 @@ func (m *Model) Solve() Result {
 			// DSE only for deep node re-solves; root stays canonical so the
 			// incumbent heuristics find their target (CBC solves those separately)
 			m.LP.SuspendDSE(nd.depth == 0)
-			ndBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+			ndBase := m.totalPivots()
 			status, x, rowAct, rc, price, obj, endState := m.solveNode(nd)
-			m.dbgNodePiv += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - ndBase
+			m.dbgNodePiv += m.totalPivots() - ndBase
 			m.dbgNodeN++
 			m.LP.SuspendDSE(true)
 			nodeCount++
@@ -753,9 +753,9 @@ func (m *Model) Solve() Result {
 							m.LP.Deadline = pd
 						}
 					}
-					fpBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+					fpBase := m.totalPivots()
 					keep(m.feasibilityPump(nd, x, endState))
-					m.dbgFP += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - fpBase
+					m.dbgFP += m.totalPivots() - fpBase
 					m.LP.Deadline = burstDL
 				}
 				// reduced-sub-problem RENS first (CBC's mini branch and bound:
@@ -763,18 +763,18 @@ func (m *Model) Solve() Result {
 				// back when the neighborhood misses
 				keep(m.rensImprove(nd, x, endState))
 				if !ok {
-					fwBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+					fwBase := m.totalPivots()
 					keep(m.faceWalk(nd, x, endState, obj, cutoff))
-					m.dbgFW += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - fwBase
+					m.dbgFW += m.totalPivots() - fwBase
 				}
 				if !ok {
-					fpBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+					fpBase := m.totalPivots()
 					keep(m.feasibilityPump(nd, x, endState))
-					m.dbgFP += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - fpBase
+					m.dbgFP += m.totalPivots() - fpBase
 					if !ok {
-						dvBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+						dvBase := m.totalPivots()
 						keep(m.diveForIncumbent(nd, x, endState))
-						m.dbgDive += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - dvBase
+						m.dbgDive += m.totalPivots() - dvBase
 					}
 				}
 				m.LP.SetIterCap(0)
@@ -791,7 +791,7 @@ func (m *Model) Solve() Result {
 			// a function of (incumbent, LP) and repeats are mostly redundant
 			if hasIncumbent && nodeCount%(64<<min(rinsFails, 3)) == 0 && bestInternal != m.rinsLastObj {
 				m.rinsLastObj = bestInternal
-				rnBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+				rnBase := m.totalPivots()
 				m.LP.SetIterCap(2*m.LP.NumRows() + 200)
 				if hObj, hx, hAct, hRC, hPrice, ok := m.rinsImprove(nd, x, endState); ok && m.improves(hObj, bestInternal) {
 					rinsFails = 0
@@ -805,7 +805,7 @@ func (m *Model) Solve() Result {
 					rinsFails++
 				}
 				m.LP.SetIterCap(0)
-				m.dbgRINS += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - rnBase
+				m.dbgRINS += m.totalPivots() - rnBase
 			}
 			nd, backtrack = near, far
 		}
@@ -828,7 +828,7 @@ func (m *Model) Solve() Result {
 	}
 	proven := hasIncumbent && !m.improves(remaining, bestInternal)
 	debugf("mip exit: nodes=%d pivots=%d best=%g remaining=%g proven=%v stopped=%v proofLost=%v heap=%d elapsed=%v",
-		nodeCount, m.LP.Stats.Phase1+m.LP.Stats.Phase2+m.LP.Stats.Dual, bestInternal, remaining, proven, stopped, proofLost, pq.Len(), time.Since(t0).Round(time.Millisecond))
+		nodeCount, m.totalPivots(), bestInternal, remaining, proven, stopped, proofLost, pq.Len(), time.Since(t0).Round(time.Millisecond))
 	debugf("pivot split: facewalk %d, fpump %d, dive %d, rins %d, coldfallbacks %d, node %d/%d, sb %d/%d",
 		m.dbgFW, m.dbgFP, m.dbgDive, m.dbgRINS, m.dbgNodeCold, m.dbgNodePiv, m.dbgNodeN, m.dbgSBPiv, m.dbgSBN)
 
@@ -887,7 +887,7 @@ func (m *Model) baseBound(idx int) (float64, float64) {
 // heurOver reports whether the shared heuristic pivot budget is spent; every
 // heuristic dive/walk/pump loop checks it (CBC budgets heuristics the same way).
 func (m *Model) heurOver() bool {
-	return m.heurStop > 0 && m.LP.Stats.Phase1+m.LP.Stats.Phase2+m.LP.Stats.Dual > m.heurStop
+	return m.heurStop > 0 && m.totalPivots() > m.heurStop
 }
 
 // improves reports whether an internal-scale bound/objective candidate is
@@ -955,6 +955,15 @@ func childNodeMulti(parent *node, parentState *simplex.State, extra []boundOverr
 	return &node{overrides: ovs, parentState: parentState, bound: math.Max(parent.bound, bound), depth: parent.depth + 1, brCol: -1}
 }
 
+// lpPivots sums every engine's pivots on one LP (primal phases, canonical
+// dual, DSE dual): the attribution counters must not miss dual2/probe work.
+func lpPivots(lp *simplex.LP) int64 {
+	s := &lp.Stats
+	return s.Phase1 + s.Phase2 + s.Dual + s.Dual2
+}
+
+func (m *Model) totalPivots() int64 { return lpPivots(m.LP) }
+
 // solveNode diffs m.live against nd.overrides (touching only changed
 // columns), solves, and leaves bounds live as nd.overrides for next time.
 func (m *Model) solveNode(nd *node) (status simplex.Status, x, rowAct, rc, price []float64, internalObj float64, endState *simplex.State) {
@@ -1002,8 +1011,10 @@ func (m *Model) solveNode(nd *node) (status simplex.Status, x, rowAct, rc, price
 		status, endState, _ = m.LP.ColdSolve()
 	}
 	if status == simplex.Optimal {
-		x, rowAct, rc, price = m.LP.Solution(endState)
 		internalObj = m.LP.InternalObjective(endState)
+		if !m.LP.Probing() { // a probe reads only the objective
+			x, rowAct, rc, price = m.LP.Solution(endState)
+		}
 	}
 	return status, x, rowAct, rc, price, internalObj, endState
 }
@@ -1042,10 +1053,10 @@ func (m *Model) feasibilityPump(nd *node, x []float64, endState *simplex.State) 
 	var prev []float64
 	// pivot-budgeted like CBC's pump (iteration-capped): a projection loop
 	// that grinds past this is cycling on a degenerate face, not converging
-	fpBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+	fpBase := m.totalPivots()
 	fpBudget := int64(10 * m.LP.NumRows())
 	for iter := range 50 {
-		if m.LP.Stats.Phase1+m.LP.Stats.Phase2+m.LP.Stats.Dual-fpBase > fpBudget {
+		if m.totalPivots()-fpBase > fpBudget {
 			return fail()
 		}
 		if m.heurOver() {
@@ -1384,13 +1395,13 @@ func (m *Model) polishIncumbent(nd *node, obj float64, x []float64, deadline tim
 	defer func() { m.LP.Deadline = saved }()
 	// pivot-budgeted on top of the time box: each flip is one small LP, so a
 	// between-flip check binds tightly (1-opt must stay cheap vs the tree)
-	polBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+	polBase := m.totalPivots()
 	polBudget := int64(3 * m.LP.NumRows())
 	for j, c := range m.P.Cols {
 		if !flippable[j] {
 			continue
 		}
-		if m.LP.Stats.Phase1+m.LP.Stats.Phase2+m.LP.Stats.Dual-polBase > polBudget {
+		if m.totalPivots()-polBase > polBudget {
 			break
 		}
 		if !box.IsZero() && time.Now().After(box) {
@@ -1635,6 +1646,25 @@ func (m *Model) chooseBranch(nd *node, x []float64, endState *simplex.State, obj
 	defer func() { m.LP.Deadline = saved }()
 	m.LP.SetProbe(strongProbeCap)
 	defer m.LP.ClearProbe()
+	// Clp crunch (CBC solveFromHotStart's smallModel): probes solve a
+	// row-subset LP with the provably-can't-bind rows dropped — the same
+	// bounds and infeasibility verdicts at a fraction of the per-pivot cost
+	var clp *simplex.LP
+	var cst *simplex.State
+	crunched := false
+	if crunchEnabled {
+		clp, cst, crunched = m.LP.CrunchProbe(endState)
+	}
+	if crunched {
+		clp.SetProbe(strongProbeCap)
+		clp.SuspendDSE(true) // canonical dual: probe bounds match the full-LP path
+		defer func() {       // probe pivots surface in the main counters
+			m.LP.Stats.Phase1 += clp.Stats.Phase1
+			m.LP.Stats.Phase2 += clp.Stats.Phase2
+			m.LP.Stats.Dual += clp.Stats.Dual
+			m.LP.Stats.Dual2 += clp.Stats.Dual2
+		}()
+	}
 
 	var fixed []boundOverride
 	probed := 0
@@ -1643,23 +1673,40 @@ func (m *Model) chooseBranch(nd *node, x []float64, endState *simplex.State, obj
 			continue // trust the pseudocost; no probe
 		}
 		probed++
-		sbBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+		sbBase := m.totalPivots()
+		if crunched {
+			sbBase = lpPivots(clp)
+		}
 		m.dbgSBN++
 		lb, ub := m.nodeBound(nd, cd.j)
 		floorV := math.Floor(x[cd.j])
 		dead := [2]bool{}
 		sides := [2][2]float64{{lb, floorV}, {floorV + 1, ub}}
 		for s, b := range sides {
-			ovs := make([]boundOverride, len(nd.overrides)+1)
-			copy(ovs, nd.overrides)
-			ovs[len(ovs)-1] = boundOverride{cd.j, b[0], b[1]}
-			child := &node{overrides: ovs, parentState: endState, bound: nd.bound, depth: nd.depth + 1}
 			probeDeadline := time.Now().Add(80 * time.Millisecond)
-			if saved.IsZero() || probeDeadline.Before(saved) {
-				m.LP.Deadline = probeDeadline
+			var status simplex.Status
+			var cObj float64
+			if crunched {
+				clp.Deadline = probeDeadline
+				if !saved.IsZero() && saved.Before(probeDeadline) {
+					clp.Deadline = saved
+				}
+				clp.SetBound(cd.j, b[0], b[1])
+				pStatus, pEnd, _ := clp.WarmSolve(cst.Clone(), []int{cd.j})
+				if status = pStatus; pStatus == simplex.Optimal {
+					cObj = clp.InternalObjective(pEnd)
+				}
+			} else {
+				ovs := make([]boundOverride, len(nd.overrides)+1)
+				copy(ovs, nd.overrides)
+				ovs[len(ovs)-1] = boundOverride{cd.j, b[0], b[1]}
+				child := &node{overrides: ovs, parentState: endState, bound: nd.bound, depth: nd.depth + 1}
+				if saved.IsZero() || probeDeadline.Before(saved) {
+					m.LP.Deadline = probeDeadline
+				}
+				status, _, _, _, _, cObj, _ = m.solveNode(child)
+				m.LP.Deadline = saved
 			}
-			status, _, _, _, _, cObj, _ := m.solveNode(child)
-			m.LP.Deadline = saved
 			switch status {
 			case simplex.Optimal:
 				m.psRecord(cd.j, b[0] == floorV+1, cd.frac, cObj-obj)
@@ -1670,7 +1717,12 @@ func (m *Model) chooseBranch(nd *node, x []float64, endState *simplex.State, obj
 				dead[s] = true // side prunes outright
 			}
 		}
-		m.dbgSBPiv += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - sbBase
+		if crunched {
+			clp.SetBound(cd.j, lb, ub)
+			m.dbgSBPiv += lpPivots(clp) - sbBase
+		} else {
+			m.dbgSBPiv += m.totalPivots() - sbBase
+		}
 		if dead[0] != dead[1] {
 			surv := sides[0]
 			if dead[0] {
