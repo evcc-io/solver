@@ -77,8 +77,10 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   globally-valid cut families with cold-restarted open nodes.
 - **Branching**: CBC reliability branching (pseudocosts, `numberBeforeTrust`=10,
   capped strong-branch probes, `maxStrong`=5, CBC score) + strong-branch fixing.
-- **Heuristics**: MIP-start completion, 1-opt polish, face walk, RENS,
-  objective feasibility pump, rounding dive, RINS-lite; time-boxed bursts.
+- **Heuristics**: MIP-start completion, pivot-budgeted 1-opt polish, face
+  walk, RENS, objective feasibility pump, rounding dive, RINS as a
+  node-capped sub-MIP on the agree-fixed neighborhood (CbcHeuristicRINS),
+  run per new incumbent; time-boxed bursts.
 - **Anti-degeneracy**: EXPAND ratio test, full Bland's after a degenerate
   streak, Clp bound perturbation in cold solves.
 - **CLI**: PuLP's flags (`-max`/`-sec`/`-ratio`/`-allow`/`-maxNodes`/`-solve`/
@@ -98,9 +100,11 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   down toward CBC's).
 - **Node-local in-tree cuts**: CBC generates locally-valid cuts throughout the
   search (probing/Gomory per subtree, with local row lifecycle); cbcgo's
-  in-tree rounds cover the globally-valid families only. This plus per-node LP
-  cost (~215 vs CBC's ~53 pivots/node) is the remaining 020 tree gap — see
-  Benchmarks.
+  in-tree rounds cover the globally-valid families only. That, plus 020's
+  heuristic pivot spend (faceWalk + strong-branch probes are ~80% of its
+  pivots and resist capping — three budget variants measured wall-negative),
+  is the remaining 020 tree gap — see Benchmarks. Node re-solves themselves
+  are already cheap: 12.6 pivots/node vs CBC's 53 iterations/node.
 - **Gap semantics**: default absolute gap is 1e-5, mirroring CBC's default
   cutoff increment (`CbcCutoffIncrement`); `-allow`/`-ratio` override it.
 - **No multi-threaded search** (`-threads` accepted, ignored); **`-mips` warm
@@ -123,7 +127,7 @@ Wall-clock, nodes, objective:
 |---|---|---|---|
 | 018 | 4.9s, 18291.45 | **0.14s, 7 nodes, 18291.4519** | 0.04s, 0 nodes, 18291.4519 |
 | 021 | 5.8s, **8.6901 (wrong)** | **3.0s, 3 nodes, 8.70087** | 0.09s, 0 nodes, 8.70083 |
-| 020 | 60s, **−140 (garbage)** | **62s, 1.9k nodes, 0.55835 proven** | 3.6s, 833 nodes, 0.55835 |
+| 020 | 60s, **−140 (garbage)** | **59s, 1.9k nodes, 0.55835 proven** | 3.6s, 833 nodes, 0.55835 |
 
 Tree robustness — nodes (and wall) as solve roundoff is perturbed via the
 refactorize interval `CBC_MAXETAS` ∈ {24, 32, 48, 64, 100}:
@@ -132,7 +136,7 @@ refactorize interval `CBC_MAXETAS` ∈ {24, 32, 48, 64, 100}:
 |---|---|---|---|
 | 018 | 27–336 nodes, 0.3–6.4s | **6–8 nodes, 0.14–0.21s** | 0 nodes |
 | 021 | 3–291 nodes, 2.6–31s | **3 nodes every run, 2.9–5.5s** | 0 nodes |
-| 020 | never proven | **proven 3/5 (48–92s); misses end ≤2e-4 off** | 833 nodes, 3.6s |
+| 020 | never proven | **proven 4/5 (45–94s); miss ends 1.5e-5 off** | 833 nodes, 3.6s |
 
 Probing coefficient strengthening lifts 018's pre-cut root bound from 18092
 to 18291.44 and stops node counts swinging with roundoff. 020 root parity:
