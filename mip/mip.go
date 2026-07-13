@@ -713,7 +713,11 @@ func (m *Model) Solve() Result {
 				}
 			}
 			closeGap := hasIncumbent && bestInternal-obj < 0.1*math.Max(1, math.Abs(bestInternal))
-			if diveTries < 8 && branchCol >= 0 && !(nodeCount == 1 && closeGap) && (nodeCount == 1 || nodeCount%256 == 0) {
+			// gap-scheduled diving (CBC runs heuristics only while the gap is
+			// open): once the incumbent is within 10% of the node bound, a dive
+			// burst almost never improves it — on 020 the lone mid-tree burst was
+			// barren and cost ~26k pivots. Root still runs (no incumbent yet)
+			if diveTries < 8 && branchCol >= 0 && !closeGap && (nodeCount == 1 || nodeCount%256 == 0) {
 				diveTries++
 				// box the heuristic burst: dives must never eat the tree's time.
 				// The root burst gets more — success there ends the whole solve
