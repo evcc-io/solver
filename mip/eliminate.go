@@ -19,17 +19,20 @@ const (
 	elimTight elimKind = iota // cost pins the row: x = (b - rest)/a
 	elimFixed                 // row never blocks: x sits at its bound
 	elimConst                 // LB==UB (probing/presolve fixed): x = val everywhere
+	elimSub                   // implied-free continuous col substituted via an EQ row
 )
 
 type elimRecord struct {
 	col, row int
 	kind     elimKind
 	a        float64   // column's coefficient in its row
-	b        float64   // elimTight: row bound the column pins
+	b        float64   // elimTight/elimSub: row bound the column pins
 	val      float64   // elimFixed/elimConst: fixed value
 	obj      float64   // cost at elimination time (dual postsolve shift)
-	rows     []int     // elimConst: every row containing the column
-	coefs    []float64 // elimConst: matching coefficients
+	rows     []int     // elimConst: every row containing the column;
+	coefs    []float64 // elimSub: the pivot row's OTHER entries (col ids)
+	subRows  []int     // elimSub: the column's other rows (pre-substitution)
+	subCoefs []float64 // elimSub: matching coefficients
 }
 
 // reduction maps a reduced problem back to the caller's original one.
@@ -37,6 +40,7 @@ type reduction struct {
 	orig    *problem.Problem
 	records []elimRecord // in elimination order; postsolve walks it backwards
 	colMap  []int        // original col index -> reduced index, -1 if eliminated
+	rowMap  []int        // original row -> reduced row, -1 if dropped (elimSub only)
 }
 
 // eliminateSingletons returns a reduced copy of p (p itself is untouched)
@@ -357,6 +361,23 @@ func (red *reduction) expand(res *Result) {
 		}
 	}
 	act, price := res.RowActivity, res.RowPrice
+	if red.rowMap != nil {
+		// substitution reductions drop rows: remap the reduced-row arrays
+		// back onto the original row space before the records replay
+		nr := len(red.orig.Rows)
+		fa, fp := make([]float64, nr), make([]float64, nr)
+		for ri, qi := range red.rowMap {
+			if qi >= 0 {
+				if qi < len(act) {
+					fa[ri] = act[qi]
+				}
+				if qi < len(price) {
+					fp[ri] = price[qi]
+				}
+			}
+		}
+		act, price = fa, fp
+	}
 	if len(act) <= maxRow {
 		act = append(act, make([]float64, maxRow+1-len(act))...)
 	}
@@ -385,6 +406,24 @@ func (red *reduction) expand(res *Result) {
 				r -= rec.coefs[k] * price[ri]
 			}
 			rc[rec.col] = r
+		case elimSub:
+			// x_j = (b - rest)/a from the pivot equality row
+			v := rec.b
+			for k, jj := range rec.rows {
+				v -= rec.coefs[k] * x[jj]
+			}
+			v /= rec.a
+			x[rec.col] = math.Min(math.Max(v, c.LB), c.UB)
+			act[rec.row] = rec.b
+			// each rewritten row lost (cj/a)*pivot: restore its activity, and
+			// the dropped row's dual comes from stationarity wrt x_j
+			y := rec.obj
+			for k, rr := range rec.subRows {
+				act[rr] += rec.subCoefs[k] / rec.a * rec.b
+				y -= rec.subCoefs[k] * price[rr]
+			}
+			price[rec.row] = y / rec.a
+			rc[rec.col] = 0
 		}
 	}
 	obj := 0.0
@@ -393,4 +432,217 @@ func (red *reduction) expand(res *Result) {
 	}
 	res.X, res.ReducedCost, res.Obj = x, rc, obj
 	res.RowActivity, res.RowPrice = act, price
+}
+
+// subEnabled gates implied-free doubleton/chain substitution (CBC's
+// CglPreProcess substitutes continuous vars out of equality chains).
+var subEnabled = os.Getenv("CBC_SUBST") != "0"
+
+// substituteChains substitutes implied-free continuous columns out of
+// equality rows (CBC CglPreProcess): x_j = (b - rest)/a drops the column and
+// the row, folding the expression into every other row containing x_j. The
+// evcc SoC chains collapse this way. Returns (nil, nil) when nothing applies.
+func substituteChains(p *problem.Problem) (*problem.Problem, *reduction) {
+	if !subEnabled || len(p.SOSs) != 0 {
+		return nil, nil
+	}
+	inf := problem.Inf
+	nr, n := len(p.Rows), len(p.Cols)
+	wIdx := make([][]int, nr)
+	wCoef := make([][]float64, nr)
+	rlb := make([]float64, nr)
+	rub := make([]float64, nr)
+	for ri := range p.Rows {
+		r := &p.Rows[ri]
+		wIdx[ri] = append([]int(nil), r.Idx...)
+		wCoef[ri] = append([]float64(nil), r.Coef...)
+		rlb[ri], rub[ri] = r.Bounds()
+	}
+	obj := make([]float64, n)
+	colRows := make([][]int, n) // lazy: entries may be stale after rewrites
+	for j := range p.Cols {
+		obj[j] = p.Cols[j].Obj
+	}
+	for ri := range wIdx {
+		for _, j := range wIdx[ri] {
+			colRows[j] = append(colRows[j], ri)
+		}
+	}
+	deadRow := make([]bool, nr)
+	elim := make([]bool, n)
+	var records []elimRecord
+
+	coefIn := func(ri, j int) (float64, bool) {
+		for k, jj := range wIdx[ri] {
+			if jj == j {
+				return wCoef[ri][k], true
+			}
+		}
+		return 0, false
+	}
+
+	for pass := 0; pass < 8; pass++ {
+		changed := false
+		for j := range n {
+			c := &p.Cols[j]
+			if elim[j] || c.Integer {
+				continue
+			}
+			// pick the sparsest live EQ row containing j with a stable pivot
+			bestR, bestLen := -1, 1<<30
+			var bestA float64
+			for _, ri := range colRows[j] {
+				if deadRow[ri] || rlb[ri] != rub[ri] || rlb[ri] <= -inf {
+					continue
+				}
+				a, ok := coefIn(ri, j)
+				if !ok || math.Abs(a) < 1e-7 {
+					continue
+				}
+				maxAbs := 0.0
+				for _, v := range wCoef[ri] {
+					maxAbs = math.Max(maxAbs, math.Abs(v))
+				}
+				if math.Abs(a) < 0.01*maxAbs || len(wIdx[ri]) > 8 {
+					continue // unstable pivot or dense row: fill not worth it
+				}
+				if l := len(wIdx[ri]); l < bestLen {
+					bestR, bestLen, bestA = ri, l, a
+				}
+			}
+			if bestR < 0 {
+				continue
+			}
+			ri, a, b := bestR, bestA, rlb[bestR]
+			// implied-free test: the row + sibling bounds already confine x_j
+			// inside its own bounds, so dropping the column loses nothing
+			omin, omax := 0.0, 0.0
+			okBounds := true
+			for k, jj := range wIdx[ri] {
+				if jj == j {
+					continue
+				}
+				ak := wCoef[ri][k]
+				lo, hi := p.Cols[jj].LB, p.Cols[jj].UB
+				if lo <= -inf || hi >= inf {
+					okBounds = false
+					break
+				}
+				if ak > 0 {
+					omin += ak * lo
+					omax += ak * hi
+				} else {
+					omin += ak * hi
+					omax += ak * lo
+				}
+			}
+			if !okBounds {
+				continue
+			}
+			implLo, implHi := (b-omax)/a, (b-omin)/a
+			if a < 0 {
+				implLo, implHi = implHi, implLo
+			}
+			scale := math.Max(1, math.Max(math.Abs(implLo), math.Abs(implHi)))
+			if implLo < c.LB-1e-9*scale || implHi > c.UB+1e-9*scale {
+				continue // bounds would bind: substitution would lose them
+			}
+			// record BEFORE rewriting: j's other rows with pre-substitution coefs
+			rec := elimRecord{col: j, row: ri, kind: elimSub, a: a, b: b, obj: obj[j]}
+			for k, jj := range wIdx[ri] {
+				if jj != j {
+					rec.rows = append(rec.rows, jj) // col ids of the pivot row
+					rec.coefs = append(rec.coefs, wCoef[ri][k])
+				}
+			}
+			seen := map[int]bool{}
+			for _, rr := range colRows[j] {
+				if rr == ri || deadRow[rr] || seen[rr] {
+					continue
+				}
+				seen[rr] = true
+				cj, ok := coefIn(rr, j)
+				if !ok || cj == 0 {
+					continue
+				}
+				rec.subRows = append(rec.subRows, rr)
+				rec.subCoefs = append(rec.subCoefs, cj)
+			}
+			// rewrite every other row containing j: row -= (cj/a) * pivot row
+			for si, rr := range rec.subRows {
+				lam := rec.subCoefs[si] / a
+				acc := map[int]float64{}
+				for k, jj := range wIdx[rr] {
+					acc[jj] = wCoef[rr][k]
+				}
+				for k, jj := range wIdx[ri] {
+					acc[jj] -= lam * wCoef[ri][k]
+				}
+				delete(acc, j)
+				nIdx := wIdx[rr][:0]
+				nCoef := wCoef[rr][:0]
+				for jj, v := range acc {
+					if math.Abs(v) > 1e-12 {
+						nIdx = append(nIdx, jj)
+						nCoef = append(nCoef, v)
+						colRows[jj] = append(colRows[jj], rr) // lazy fill index
+					}
+				}
+				wIdx[rr], wCoef[rr] = nIdx, nCoef
+				if rlb[rr] > -inf {
+					rlb[rr] -= lam * b
+				}
+				if rub[rr] < inf {
+					rub[rr] -= lam * b
+				}
+			}
+			// fold the cost through the substitution
+			if f := obj[j] / a; f != 0 {
+				for k, jj := range rec.rows {
+					obj[jj] -= f * rec.coefs[k]
+				}
+			}
+			records = append(records, rec)
+			deadRow[ri], elim[j], changed = true, true, true
+		}
+		if !changed {
+			break
+		}
+	}
+	if len(records) == 0 {
+		return nil, nil
+	}
+	debugf("substitute: %d continuous cols + eq rows removed of %d/%d", len(records), n, nr)
+
+	q := problem.New()
+	q.Name, q.ObjSense = p.Name, p.ObjSense
+	colMap := make([]int, n)
+	for j := range p.Cols {
+		if elim[j] {
+			colMap[j] = -1
+			continue
+		}
+		c := &p.Cols[j]
+		colMap[j] = q.AddCol(c.Name, c.LB, c.UB, obj[j], c.Integer, nil, nil)
+	}
+	rowMap := make([]int, nr)
+	for ri := range p.Rows {
+		if deadRow[ri] {
+			rowMap[ri] = -1
+			continue
+		}
+		idx := make([]int, 0, len(wIdx[ri]))
+		coef := make([]float64, 0, len(wIdx[ri]))
+		for k, jj := range wIdx[ri] {
+			if colMap[jj] >= 0 {
+				idx = append(idx, colMap[jj])
+				coef = append(coef, wCoef[ri][k])
+			}
+		}
+		r := &p.Rows[ri]
+		nri := q.AddRow(r.Name, idx, coef, r.Sense, r.RHS)
+		rowMap[ri] = nri
+		setRowBounds(&q.Rows[nri], rlb[ri], rub[ri])
+	}
+	return q, &reduction{orig: p, records: records, colMap: colMap, rowMap: rowMap}
 }

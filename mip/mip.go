@@ -89,6 +89,7 @@ type Model struct {
 	MIPStart      []float64       // optional structural start point; ints get fixed
 	SkipProbing   bool            // restart passes re-derive identical probe facts
 	red           *reduction      // singleton elimination; nil when none applied
+	subRed        *reduction      // equality-chain substitution; nil when none applied
 	live          []boundOverride // bounds currently applied to LP; see solveNode
 	rcTouched     []int           // columns tightened by reducedCostFix
 	bestXSnapshot []float64       // incumbent X for the RINS neighborhood
@@ -183,7 +184,10 @@ func SolveRelaxation(p *problem.Problem) Result {
 
 func (m *Model) Solve() Result {
 	t0 := time.Now()
-	// restart calls pass an original-space MIP start; map it down
+	// restart calls pass an original-space MIP start; map it down the chain
+	if m.subRed != nil && len(m.MIPStart) == len(m.subRed.orig.Cols) {
+		m.MIPStart = m.subRed.shrinkX(m.MIPStart)
+	}
 	if m.red != nil && len(m.MIPStart) == len(m.red.orig.Cols) {
 		m.MIPStart = m.red.shrinkX(m.MIPStart)
 	}
@@ -219,6 +223,14 @@ func (m *Model) Solve() Result {
 		if q, keep := dropRedundantRows(m.P, true); q != nil {
 			m.rrKeep, m.rrRows = keep, m.P.Rows
 			m.P = q
+		}
+		// substitute implied-free continuous cols out of equality chains
+		// (CglPreProcess), then singleton elimination on the smaller model
+		if q, red := substituteChains(m.P); red != nil {
+			m.P, m.subRed = q, red
+			if len(m.MIPStart) == len(red.orig.Cols) {
+				m.MIPStart = red.shrinkX(m.MIPStart)
+			}
 		}
 		if q, red := eliminateSingletons(m.P); red != nil {
 			m.P, m.red = q, red
@@ -588,7 +600,16 @@ func (m *Model) Solve() Result {
 				locBase := len(m.P.Rows)
 				nLoc := 0
 				if localCutsEnabled {
-					nLoc = m.gomoryCuts(endState)
+					// node-local probing implication cuts (CBC's in-tree default:
+					// cheap 1-2 element rows, no degenerate grind) derived under
+					// the node bounds, plus node-basis GMI
+					nc := len(m.P.Cols)
+					ndLB, ndUB := make([]float64, nc), make([]float64, nc)
+					for j := range nc {
+						ndLB[j], ndUB[j] = m.LP.Bound(j)
+					}
+					nLoc = m.probingCutsNode(x, ndLB, ndUB, m.LP.Deadline)
+					nLoc += m.gomoryCuts(endState)
 				}
 				if nGlob+nLoc > 0 {
 					treeCutRounds++
@@ -842,6 +863,9 @@ func (m *Model) Solve() Result {
 	}
 	if m.red != nil {
 		m.red.expand(&res)
+	}
+	if m.subRed != nil {
+		m.subRed.expand(&res)
 	}
 	if m.rrKeep != nil {
 		expandRows(&res, m.rrKeep, m.rrRows)

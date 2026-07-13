@@ -98,6 +98,77 @@ func (m *Model) probingCuts(x []float64, deadline time.Time) int {
 	return added
 }
 
+// probingCutsNode probes fractional binaries under the NODE bounds (lb0/ub0)
+// and adds implication rows valid only in that subtree (CBC probes at every
+// node); an infeasible side becomes a local fixing row, not a global change.
+func (m *Model) probingCutsNode(x, lb0, ub0 []float64, deadline time.Time) int {
+	p := m.P
+	n := len(p.Cols)
+	inf := problem.Inf
+	wl, wu := make([]float64, n), make([]float64, n)
+	added := 0
+	for j := range n {
+		if added >= 2*maxCutsPer || (!deadline.IsZero() && time.Now().After(deadline)) {
+			break
+		}
+		if !p.Cols[j].Integer || lb0[j] != 0 || ub0[j] != 1 {
+			continue
+		}
+		f := x[j]
+		if f < intTol || f > 1-intTol {
+			continue
+		}
+		for side := range 2 {
+			copy(wl, lb0)
+			copy(wu, ub0)
+			wl[j], wu[j] = float64(side), float64(side)
+			if !propagate(p, wl, wu) {
+				// side infeasible under the node bounds: local fixing row
+				if side == 1 {
+					p.AddRow("", []int{j}, []float64{1}, problem.LE, 0)
+				} else {
+					p.AddRow("", []int{j}, []float64{1}, problem.GE, 1)
+				}
+				added++
+				break
+			}
+			for k := range n {
+				if k == j || added >= 2*maxCutsPer {
+					continue
+				}
+				l0, u0 := lb0[k], ub0[k]
+				scale := math.Max(1, math.Max(math.Abs(l0), math.Abs(u0)))
+				slack := 1e-7 * scale
+				minTight := 1e-4 * scale
+				vtol := 1e-6 * scale
+				if u0 < inf && wu[k] < u0-minTight {
+					ub := wu[k] + slack
+					d := u0 - ub
+					if side == 1 && x[k]+d*f > u0+vtol {
+						p.AddRow("", []int{k, j}, []float64{1, d}, problem.LE, u0)
+						added++
+					} else if side == 0 && x[k]-d*f > ub+vtol {
+						p.AddRow("", []int{k, j}, []float64{1, -d}, problem.LE, ub)
+						added++
+					}
+				}
+				if l0 > -inf && wl[k] > l0+minTight {
+					lb := wl[k] - slack
+					d := lb - l0
+					if side == 1 && x[k]-d*f < l0-vtol {
+						p.AddRow("", []int{k, j}, []float64{1, -d}, problem.GE, l0)
+						added++
+					} else if side == 0 && x[k]+d*f < lb-vtol {
+						p.AddRow("", []int{k, j}, []float64{1, d}, problem.GE, lb)
+						added++
+					}
+				}
+			}
+		}
+	}
+	return added
+}
+
 // dropSlackCuts removes cut rows (index >= orig) with slack at the root:
 // inactive cuts only bloat node re-solves (CBC keeps active cuts only).
 func dropSlackCuts(p *problem.Problem, orig int, rowAct []float64) int {
