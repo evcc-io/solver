@@ -449,6 +449,9 @@ func (m *Model) Solve() Result {
 	var rootX, rootRC []float64
 	diveTries := 0
 	lastTreeCut, treeCutRounds := 0, 0
+	pendCutActs, pendCutBase, localCutFails := 0, 0, 0
+	var pendCutNode *node
+	pendCutPre := 0.0
 	rinsFails := 0
 	newIncumbent := func(obj float64, x, rowAct, rc, price []float64) {
 		bestInternal = obj
@@ -528,6 +531,50 @@ func (m *Model) Solve() Result {
 				backtrack = nil
 			}
 
+			// cut-effectiveness check (CBC prunes ineffective cuts): the batch
+			// must lift this node's bound, else it is retracted wholesale;
+			// accepted batches drop the cuts that don't bind at the new optimum
+			if pendCutActs > 0 && nd != pendCutNode {
+				pendCutActs = 0 // owner pruned before re-solve: rows stay vacuous
+			}
+			if pendCutActs > 0 {
+				nActs := pendCutActs
+				pendCutActs = 0
+				if obj < pendCutPre+math.Max(1e-9, 1e-7*math.Abs(pendCutPre)) {
+					// no bound gain: retract the local rows and activations
+					truncateRows(m.P, pendCutBase)
+					stats := m.LP.Stats
+					m.rebuildLP()
+					m.LP.Stats = stats
+					m.LP.Deadline = deadline
+					m.live = nil
+					nd.overrides = nd.overrides[:len(nd.overrides)-nActs]
+					for _, h := range *pq {
+						h.parentState = nil
+					}
+					nd.parentState = nil
+					if localCutFails++; localCutFails >= 2 {
+						treeCutRounds = 8 // this model rejects local cuts: stop
+					}
+					debugf("treecuts: retracted %d local rows (no bound gain, fails %d)", nActs, localCutFails)
+					continue // re-solve clean
+				}
+				// keep only the binding cuts active (effectiveness pruning)
+				keepActs := nd.overrides[:len(nd.overrides)-nActs]
+				dropped := 0
+				for _, ov := range nd.overrides[len(nd.overrides)-nActs:] {
+					ri := ov.idx - len(m.P.Cols)
+					slack := math.Min(rowAct[ri]-ov.lb, ov.ub-rowAct[ri])
+					if slack <= 1e-6 {
+						keepActs = append(keepActs, ov)
+					} else {
+						dropped++ // row stays (vacuous NR); activation dies
+					}
+				}
+				nd.overrides = keepActs
+				debugf("treecuts: batch kept, bound %g -> %g, %d of %d cuts binding", pendCutPre, obj, nActs-dropped, nActs)
+			}
+
 			// in-tree LOCAL cuts (CBC generates cuts throughout the search):
 			// GMI cuts from this node's basis are valid only under its bounds,
 			// so the rows are stored free (NR: vacuous for every other node and
@@ -540,7 +587,7 @@ func (m *Model) Solve() Result {
 					m.flowCoverCuts(x) + m.liftProjectCuts(x)
 				locBase := len(m.P.Rows)
 				nLoc := 0
-				if localCutsEnabled { // needs cut-effectiveness pruning to be net-positive
+				if localCutsEnabled {
 					nLoc = m.gomoryCuts(endState)
 				}
 				if nGlob+nLoc > 0 {
@@ -564,6 +611,9 @@ func (m *Model) Solve() Result {
 					nd.parentState = nil
 					nd.brCol = -1 // avoid double pseudocost credit on re-solve
 					nd.overrides = append(nd.overrides, acts...)
+					if len(acts) > 0 {
+						pendCutActs, pendCutBase, pendCutPre, pendCutNode = len(acts), locBase, obj, nd
+					}
 					if backtrack != nil {
 						backtrack.parentState = nil
 					}
@@ -658,6 +708,10 @@ func (m *Model) Solve() Result {
 					}
 				}
 				m.LP.Deadline = burstDL
+				// per-SOLVE pivot cap (CBC caps heuristic iterations): a warm
+				// heuristic LP takes tens of pivots; a grind past 2m+200 is a
+				// degenerate cycle and returns IterLimit = heuristic failure
+				m.LP.SetIterCap(2*m.LP.NumRows() + 200)
 				cutoff := math.Inf(1)
 				if hasIncumbent {
 					cutoff = bestInternal
@@ -702,6 +756,7 @@ func (m *Model) Solve() Result {
 						m.dbgDive += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - dvBase
 					}
 				}
+				m.LP.SetIterCap(0)
 				m.LP.Deadline = savedDL
 				if ok && (!hasIncumbent || m.improves(hObj, bestInternal)) {
 					debugf("dive: incumbent %g -> %g", bestInternal, hObj)
@@ -716,6 +771,7 @@ func (m *Model) Solve() Result {
 			if hasIncumbent && nodeCount%(64<<min(rinsFails, 3)) == 0 && bestInternal != m.rinsLastObj {
 				m.rinsLastObj = bestInternal
 				rnBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+				m.LP.SetIterCap(2*m.LP.NumRows() + 200)
 				if hObj, hx, hAct, hRC, hPrice, ok := m.rinsImprove(nd, x, endState); ok && m.improves(hObj, bestInternal) {
 					rinsFails = 0
 					debugf("rins: improved %g -> %g", bestInternal, hObj)
@@ -727,6 +783,7 @@ func (m *Model) Solve() Result {
 				} else {
 					rinsFails++
 				}
+				m.LP.SetIterCap(0)
 				m.dbgRINS += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - rnBase
 			}
 			nd, backtrack = near, far

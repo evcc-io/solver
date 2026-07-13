@@ -154,7 +154,11 @@ func (lp *LP) dual2Run(st *State) dual2Result {
 		reprice()
 	}
 
-	for iter := range dual2Cap {
+	cap2 := dual2Cap
+	if lp.IterCap > 0 && lp.IterCap < cap2 {
+		cap2 = lp.IterCap // per-solve heuristic cap (see SetIterCap)
+	}
+	for iter := range cap2 {
 		if iter%64 == 0 && !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
 			return dual2Bail
 		}

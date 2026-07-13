@@ -547,6 +547,11 @@ func (lp *LP) WarmSolveExtended(prev *State, prevM int) (Status, *State, float64
 func (lp *LP) SetProbe(cap int) { lp.probeMode, lp.IterCap = true, cap }
 func (lp *LP) ClearProbe()      { lp.probeMode, lp.IterCap = false, 0 }
 
+// SetIterCap bounds pivots per solve without probe semantics (0 = off):
+// heuristic solves use it so a degenerate grind returns IterLimit instead of
+// burning the budget (CBC caps heuristic/hot-start iterations the same way).
+func (lp *LP) SetIterCap(cap int) { lp.IterCap = cap }
+
 // dualPivotCap bounds dual pivots per re-solve; a degenerate dual bails to
 // the primal run instead of grinding forever.
 const dualPivotCap = 1024
@@ -1084,7 +1089,7 @@ func (lp *LP) run(st *State) Status {
 	ubChecked := false // verified an unbounded ray against a fresh factorization
 	lp.xtol = xtolInit
 	for iter := 0; ; iter++ {
-		if iter > maxIter {
+		if iter > maxIter || (lp.IterCap > 0 && iter >= lp.IterCap) {
 			return IterLimit
 		}
 		if iter%1024 == 0 && !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {

@@ -9,8 +9,9 @@ import (
 	"cbcgo/problem"
 )
 
-// elimFixEnabled gates fixed-column (LB==UB) elimination — dev, see above.
-var elimFixEnabled = os.Getenv("CBC_ELIMFIX") == "1"
+// elimFixEnabled gates fixed-column (LB==UB) elimination (on by default,
+// as CBC's CglPreProcess; CBC_ELIMFIX=0 disables).
+var elimFixEnabled = os.Getenv("CBC_ELIMFIX") != "0"
 
 type elimKind byte
 
@@ -60,10 +61,8 @@ func eliminateSingletons(p *problem.Problem) (*problem.Problem, *reduction) {
 	nTight, nFixed, nConst := 0, 0, 0
 
 	// constant columns first (LB==UB, e.g. probing-fixed binaries): fold
-	// a*val into every containing row's bounds and drop the column. Sound and
-	// CBC-faithful (CglPreProcess removes fixed columns), but gated: the
-	// reduced model re-rolls the heuristic/cut vertex lottery on the golden
-	// suite (021 1.7x faster, 018/020 slower via a pump/dive grind).
+	// a*val into every containing row's bounds and drop the column, with
+	// exact primal/dual postsolve (CglPreProcess removes fixed columns).
 	for j := range p.Cols {
 		if !elimFixEnabled {
 			break
@@ -330,21 +329,40 @@ func (red *reduction) shrinkX(x []float64) []float64 {
 // expand rewrites a reduced-space Result in the original column space,
 // reconstructing eliminated columns, duals and the pinned row activities.
 func (red *reduction) expand(res *Result) {
-	if res.X == nil {
+	if res.X == nil && !res.HasIncumbent {
 		return
 	}
 	n := len(red.orig.Cols)
 	x := make([]float64, n)
 	rc := make([]float64, n)
 	for j, nj := range red.colMap {
-		if nj >= 0 {
+		if nj >= 0 && nj < len(res.X) {
 			x[j] = res.X[nj]
 			if nj < len(res.ReducedCost) {
 				rc[j] = res.ReducedCost[nj]
 			}
 		}
 	}
+	// an all-columns-eliminated solve has nil activity/price slices; the
+	// records still index reduced rows, so size them to the largest reference
+	maxRow := -1
+	for i := range red.records {
+		rec := &red.records[i]
+		if rec.kind == elimConst {
+			for _, ri := range rec.rows {
+				maxRow = max(maxRow, ri)
+			}
+		} else {
+			maxRow = max(maxRow, rec.row)
+		}
+	}
 	act, price := res.RowActivity, res.RowPrice
+	if len(act) <= maxRow {
+		act = append(act, make([]float64, maxRow+1-len(act))...)
+	}
+	if len(price) <= maxRow {
+		price = append(price, make([]float64, maxRow+1-len(price))...)
+	}
 	for i := len(red.records) - 1; i >= 0; i-- {
 		rec := &red.records[i]
 		c := &red.orig.Cols[rec.col]
@@ -374,4 +392,5 @@ func (red *reduction) expand(res *Result) {
 		obj += red.orig.Cols[j].Obj * x[j]
 	}
 	res.X, res.ReducedCost, res.Obj = x, rc, obj
+	res.RowActivity, res.RowPrice = act, price
 }

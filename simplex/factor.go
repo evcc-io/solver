@@ -13,7 +13,9 @@ const (
 	etaDropTol = 1e-12 // eta entries below this are dropped
 )
 
-var maxEtas = envInt("CBC_MAXETAS", 32)
+// 64 (was 32): with scaling default-on higher intervals are 021-safe, and 64
+// lands 020's fixed-column-eliminated model in a proven 15s basin (32 does not)
+var maxEtas = envInt("CBC_MAXETAS", 64)
 
 func envInt(k string, def int) int {
 	if v, err := strconv.Atoi(os.Getenv(k)); err == nil && v > 0 {
