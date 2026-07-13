@@ -116,10 +116,20 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   hot-start/heuristic iteration caps. This is what made fixed-column
   elimination shippable: single degenerate LP grinds (018: 192k pivots in
   one pump projection) now fail fast instead of eating the budget.
-- **020 heuristic pivot spend**: strong-branch probes are now the top
-  consumer (82k of 205k pivots; faceWalk dropped 200k→41k once RENS-first
-  landed). Node re-solves themselves are cheap: 8.6 pivots/node vs CBC's 53
-  iterations/node.
+- **Strong-branch probe cost is at CBC's *share*, not CBC's *wall***: real
+  CBC 2.10.3 on 020 runs 2032 probes / 55k hot-start iterations (27/probe,
+  56% of all its simplex work); cbcgo runs 1022 probes / 82k pivots
+  (80/probe, 50% of total) — the probe *economics* match, the absolute gap
+  is per-pivot engine constants. Every CBC hot-start mechanism was built and
+  measured on 020: DSE/perturbed probe duals (+0.7s), probe stall-exit
+  (weak pseudocost seeds, tree 774→1567 nodes), higher probe caps (pure
+  degenerate grind), pre-probe refactorize (neutral), and Clp's crunch —
+  which ships opt-in (`CBC_CRUNCH=1`): probes solve a row-subset LP with
+  provably-redundant rows dropped (~24% of 020's rows, bounds exactly equal;
+  021 probe pivots 128→28), but the changed probe roundoff re-rolls 020's
+  tree lottery (one refactorize interval loses its proof), so defaults stay
+  byte-identical. Probes also skip solution extraction (312MB of the 020
+  alloc profile was probe-side arrays nobody read).
   Remaining CglPreProcess gaps: bound-transferring doubletons and duplicate
   rows/cols (implied-free substitution ships; the evcc bounds usually bind,
   so main models substitute few columns while heuristic sub-MIPs substitute
