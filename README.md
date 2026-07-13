@@ -54,10 +54,9 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 - **Scaling** (on by default, as Clp; `CBC_SCALE=0` disables): Clp geometric
   row/column scaling, source-matched to `ClpPackedMatrix::scale` / `ClpSimplex`
   — internal to the LP, with bounds/solution/duals/tableau unscaled at the
-  boundary. Like Clp, a well-conditioned matrix is left unscaled (byte-identical),
-  so scaling only bites on ill-conditioned models like the evcc big-M cases (1e6
-  coefficient range): 018 ~29× faster, 021 5.8× and now matches CBC's optimum
-  exactly, 020 proven (see Benchmarks).
+  boundary. Like Clp, a well-conditioned matrix is left unscaled
+  (byte-identical); it bites on ill-conditioned models like the evcc big-M
+  cases (see [Benchmarks](#benchmarks-evcc-golden-cases-apple-m4)).
 - **Factorization**: singleton triangularization + sparse-LU kernel,
   product-form (eta) updates, periodic refactorize; no dense inverse;
   int32-compacted arenas, per-LP scratch. True Forrest-Tomlin (`simplex/ft.go`,
@@ -85,10 +84,40 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 - **CLI**: PuLP's flags (`-max`/`-sec`/`-ratio`/`-allow`/`-maxNodes`/`-solve`/
   `-initialSolve`/`-solution`); unknown flags tolerated.
 
+## Missing vs. real CBC
+
+- **Forrest-Tomlin gated off** (`CBC_FT=1`): the only gated feature not on by
+  default. Its old 2–79× regression was a Bartels-Golub-style trailing-block
+  update growing the R-file by Θ(m−p) ops per pivot; rewritten as true FT
+  (single sparse row-spike elimination, O(nnz(row)) R-ops) it reaches per-pivot
+  parity with the eta path (021: 50µs vs 52µs), but whole-solve still tends to
+  land in larger node basins on the golden suite. Scaling, the extra cut
+  families (`CBC_CGL`) and the DSE dual (`CBC_DUAL2`) are all on by default
+  and pass the golden suite.
+- **DSE dual is ~4× CBC wall** on the hardest case (pivot counts already 4–33×
+  down toward CBC's).
+- **Node-local in-tree cuts**: CBC generates locally-valid cuts throughout the
+  search (probing/Gomory per subtree, with local row lifecycle); cbcgo's
+  in-tree rounds cover the globally-valid families only. This plus per-node LP
+  cost (~215 vs CBC's ~53 pivots/node) is the remaining 020 tree gap — see
+  Benchmarks.
+- **Gap semantics**: default absolute gap is 1e-5, mirroring CBC's default
+  cutoff increment (`CbcCutoffIncrement`); `-allow`/`-ratio` override it.
+- **No multi-threaded search** (`-threads` accepted, ignored); **`-mips` warm
+  start** parsed but not wired; **format gaps** (free MPS only, no `OBJSENSE`,
+  no negative-`UP` — PuLP never exercises these).
+- **Two failing PuLP tests**: `test_measuring_solving_time` (16.5k-var
+  bin-packing, incumbent within 10s) and `test_infeasible` (expects CBC's exact
+  tie-breaking on a degenerate infeasible LP — not a correctness bug).
+
 ## Benchmarks (evcc golden cases, Apple M4)
 
-Defaults on both solvers, wall-clock + objective; real CBC 2.10.3 for
-reference.
+The evcc battery-optimizer models: 1e6-range big-M coefficients make them
+ill-conditioned; the two levers are Clp scaling and CglProbing coefficient
+strengthening (both on by default, as CBC/Clp). Reference solver: real CBC
+2.10.3 (PuLP's bundled binary), defaults on both sides.
+
+Wall-clock, nodes, objective:
 
 | case | main (pre-rewrite) | this branch | real CBC |
 |---|---|---|---|
@@ -105,44 +134,11 @@ refactorize interval `CBC_MAXETAS` ∈ {24, 32, 48, 64, 100}:
 | 021 | 3–291 nodes, 2.6–31s | **3 nodes every run, 2.9–5.5s** | 0 nodes |
 | 020 | never proven | **proven 3/5 (48–92s); misses end ≤2e-4 off** | 833 nodes, 3.6s |
 
-The 1e6-range big-M coefficients make these models ill-conditioned; the two
-levers are Clp scaling and CglProbing coefficient strengthening (both on by
-default, as CBC/Clp) — strengthening lifts 018's pre-cut root bound from
-18092 to 18291.44 and stops node counts swinging with roundoff. 020 root
-parity: preprocessing fixes 105 = CBC's 105, root cut bound within 1% of
-CBC's closed distance (−0.664 vs −0.658 from −0.885). Remaining wall gap vs
-CBC is root-closing power (CBC finishes 018/021 at 0 nodes) and 020 tree
-cost — engine constants and node-local cuts, not correctness.
-
-## Missing vs. real CBC
-
-- **Forrest-Tomlin gated off** (`CBC_FT=1`): the only gated feature not on by
-  default. Its old 2–79× regression was a Bartels-Golub-style trailing-block
-  update growing the R-file by Θ(m−p) ops per pivot; rewritten as true FT
-  (single sparse row-spike elimination, O(nnz(row)) R-ops) it reaches per-pivot
-  parity with the eta path (021: 50µs vs 52µs). Whole-solve can still lose on
-  the golden suite because tiny solve-roundoff differences land B&B in a
-  different (larger) node basin — measured chaos, not an FT defect: the eta
-  path swings the same way across refactorize intervals (021: 3 nodes/2.7s at
-  `CBC_MAXETAS=16` vs 131 nodes/31s at 24). Stays off until branching/
-  degeneracy handling stops amplifying solve roundoff into node-count swings.
-  Scaling, the extra cut families (`CBC_CGL`) and the DSE dual (`CBC_DUAL2`)
-  are all on by default and pass the golden suite.
-- **DSE dual is ~4× CBC wall** on the hardest case (pivot counts already 4–33×
-  down toward CBC's).
-- **020 wall-clock**: proven, but ~15× CBC (48–92s vs 3.6s; 1.7–3.7k vs 833
-  nodes; 3/5 refactorize intervals prove within 120s, the misses end within
-  2e-4 of optimum). Root parity is there — preprocessing fixes match CBC
-  (105=105) and the root cut bound lands within 1% of CBC's closed distance
-  (−0.664 vs −0.658 from −0.885). The residual tree gap is CBC's *locally
-  valid* in-tree cuts (its 020 tree accumulates ~950 node-local probing cuts;
-  cbcgo's in-tree rounds are global-family only, which separate nothing new
-  after the root) plus per-node LP cost.
-- **Gap semantics**: default absolute gap is 1e-5, mirroring CBC's default
-  cutoff increment (`CbcCutoffIncrement`); `-allow`/`-ratio` override it.
-- **No multi-threaded search** (`-threads` accepted, ignored); **`-mips` warm
-  start** parsed but not wired; **format gaps** (free MPS only, no `OBJSENSE`,
-  no negative-`UP` — PuLP never exercises these).
-- **Two failing PuLP tests**: `test_measuring_solving_time` (16.5k-var
-  bin-packing, incumbent within 10s) and `test_infeasible` (expects CBC's exact
-  tie-breaking on a degenerate infeasible LP — not a correctness bug).
+Probing coefficient strengthening lifts 018's pre-cut root bound from 18092
+to 18291.44 and stops node counts swinging with roundoff. 020 root parity:
+preprocessing fixes 105 = CBC's 105 (~350 rows strengthened vs CBC's 501),
+root cut bound within 1% of CBC's closed distance (−0.664 vs −0.658 from
+−0.885). The remaining wall gap vs CBC is root-closing power (CBC ends
+018/021 at 0 nodes via CglPreProcess + pump/mini-B&B) and 020 tree cost
+(CBC's ~950 node-local probing cuts and ~4× cheaper node re-solves) — engine
+constants and local-cut architecture, not correctness.
