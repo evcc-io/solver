@@ -57,7 +57,7 @@ func TestProbeStrengthenSound(t *testing.T) {
 			p.AddCol("b", 0, 1, rng.NormFloat64(), true, nil, nil)
 		}
 		for i := 0; i < nc; i++ {
-			p.AddCol("x", 0, 1 + 4*rng.Float64(), rng.NormFloat64(), false, nil, nil)
+			p.AddCol("x", 0, 1+4*rng.Float64(), rng.NormFloat64(), false, nil, nil)
 		}
 		n := nb + nc
 		nr := 2 + rng.Intn(5)
