@@ -758,14 +758,14 @@ func (m *Model) Solve() Result {
 					m.dbgFP += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - fpBase
 					m.LP.Deadline = burstDL
 				}
-				// faceWalk stays the primary (its vertex path is load-bearing:
-				// four reorderings measured wall-negative on the golden cases);
-				// the failure fallbacks below are reduced-sub-problem solves
-				fwBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
-				keep(m.faceWalk(nd, x, endState, obj, cutoff))
-				m.dbgFW += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - fwBase
+				// reduced-sub-problem RENS first (CBC's mini branch and bound:
+				// the substituted sub-MIP clones are small now); faceWalk falls
+				// back when the neighborhood misses
+				keep(m.rensImprove(nd, x, endState))
 				if !ok {
-					keep(m.rensImprove(nd, x, endState))
+					fwBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+					keep(m.faceWalk(nd, x, endState, obj, cutoff))
+					m.dbgFW += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - fwBase
 				}
 				if !ok {
 					fpBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
