@@ -3,7 +3,7 @@ package simplex
 import (
 	"math"
 	"os"
-	"sort"
+	"slices"
 	"time"
 )
 
@@ -38,14 +38,6 @@ type dual2Cand struct {
 	rd    float64 // reduced-cost slack in dir (clamped >= 0)
 	ratio float64
 }
-
-// dual2CandByRatio: concrete sort.Interface for the DSE ratio test (skips
-// sort.Slice reflection; identical pdqsort order).
-type dual2CandByRatio []dual2Cand
-
-func (s dual2CandByRatio) Len() int           { return len(s) }
-func (s dual2CandByRatio) Less(i, j int) bool { return s[i].ratio < s[j].ratio }
-func (s dual2CandByRatio) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 // dual2Run is a complete bounded dual simplex modeled on ClpSimplexDual:
 // DSE pricing, Harris ratio test with bound flips, run to optimality.
@@ -246,7 +238,15 @@ func (lp *LP) dual2Run(st *State) dual2Result {
 				cands = append(cands, dual2Cand{j, dir, at, rd, rd / at})
 			}
 		}
-		sort.Sort(dual2CandByRatio(cands))
+		slices.SortFunc(cands, func(a, b dual2Cand) int {
+			switch {
+			case a.ratio < b.ratio:
+				return -1
+			case a.ratio > b.ratio:
+				return 1
+			}
+			return 0
+		})
 
 		// bound-flipping walk, then a Harris window: the largest pivot
 		// entry inside the first blocker's relaxed ratio wins

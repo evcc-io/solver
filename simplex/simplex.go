@@ -7,7 +7,7 @@ package simplex
 import (
 	"math"
 	"os"
-	"sort"
+	"slices"
 	"time"
 
 	"cbcgo/problem"
@@ -689,7 +689,15 @@ func (lp *LP) dualRun(st *State) {
 			}
 		}
 		ws.cands = cands
-		sort.Sort(dualCandByRatio(cands))
+		slices.SortFunc(cands, func(a, b dualCand) int {
+			switch {
+			case a.ratio < b.ratio:
+				return -1
+			case a.ratio > b.ratio:
+				return 1
+			}
+			return 0
+		})
 
 		// dual long step (Clp "dual with flips"): boxed candidates that
 		// can't absorb the violation get flipped; the overshooter pivots
@@ -803,15 +811,6 @@ type dualCand struct {
 	dir   float64
 	ratio float64
 }
-
-// dualCandByRatio sorts entering candidates by ascending ratio. Concrete
-// sort.Interface (not sort.Slice) so the per-pivot ratio-test sort skips
-// reflection — same pdqsort, same comparator, byte-identical order.
-type dualCandByRatio []dualCand
-
-func (s dualCandByRatio) Len() int           { return len(s) }
-func (s dualCandByRatio) Less(i, j int) bool { return s[i].ratio < s[j].ratio }
-func (s dualCandByRatio) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 // enterDirs lists the directions a nonbasic variable may enter the basis in.
 func enterDirs(s varStat) []float64 {
