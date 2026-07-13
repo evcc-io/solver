@@ -87,22 +87,32 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 
 ## Benchmarks (evcc golden cases, Apple M4)
 
-Objective + wall-clock; CBC's optima shown for reference.
+Defaults on both solvers, wall-clock + objective; real CBC 2.10.3 for
+reference.
 
-| case | main (pre-rewrite) | this branch | CBC |
+| case | main (pre-rewrite) | this branch | real CBC |
 |---|---|---|---|
-| 018 | 4.9s, 18291.45 | **0.14s, 18291.4519** | 0.04s, 18291.4519 |
-| 021 | 5.8s, **8.6901 (wrong)** | **2.9s, 8.70087** | 0.09s, 8.70083 |
-| 020 | 60s, **−140 (garbage)** | **57s, 0.55835, proven** | 3.6s, 0.55835 |
+| 018 | 4.9s, 18291.45 | **0.14s, 7 nodes, 18291.4519** | 0.04s, 0 nodes, 18291.4519 |
+| 021 | 5.8s, **8.6901 (wrong)** | **3.0s, 3 nodes, 8.70087** | 0.09s, 0 nodes, 8.70083 |
+| 020 | 60s, **−140 (garbage)** | **62s, 1.9k nodes, 0.55835 proven** | 3.6s, 833 nodes, 0.55835 |
+
+Tree robustness — nodes (and wall) as solve roundoff is perturbed via the
+refactorize interval `CBC_MAXETAS` ∈ {24, 32, 48, 64, 100}:
+
+| case | before strengthening | after | real CBC (any seed) |
+|---|---|---|---|
+| 018 | 27–336 nodes, 0.3–6.4s | **6–8 nodes, 0.14–0.21s** | 0 nodes |
+| 021 | 3–291 nodes, 2.6–31s | **3 nodes every run, 2.9–5.5s** | 0 nodes |
+| 020 | never proven | **proven 3/5 (48–92s); misses end ≤2e-4 off** | 833 nodes, 3.6s |
 
 The 1e6-range big-M coefficients make these models ill-conditioned; the two
 levers are Clp scaling and CglProbing coefficient strengthening (both on by
-default, as CBC/Clp). Strengthening also stabilized the tree: node counts no
-longer swing with solve roundoff (018 6–8 nodes, 021 3 nodes across all
-refactorize intervals; before 27–336 and 3–291). 020 is proven optimal for
-the first time (CBC needs 833 nodes, cbcgo ~1.9k). Remaining wall gap vs CBC
-is root-closing power (CBC finishes 018/021 at 0 nodes) and 020 node
-throughput — engine constants, not correctness.
+default, as CBC/Clp) — strengthening lifts 018's pre-cut root bound from
+18092 to 18291.44 and stops node counts swinging with roundoff. 020 root
+parity: preprocessing fixes 105 = CBC's 105, root cut bound within 1% of
+CBC's closed distance (−0.664 vs −0.658 from −0.885). Remaining wall gap vs
+CBC is root-closing power (CBC finishes 018/021 at 0 nodes) and 020 tree
+cost — engine constants and node-local cuts, not correctness.
 
 ## Missing vs. real CBC
 
