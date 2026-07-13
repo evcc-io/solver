@@ -188,6 +188,21 @@ elimination (020: −364 cols), equality-chain substitution and per-solve
 pivot caps plus gap-scheduled diving take 020 from 59.8s to 10.9s with every refactorize interval
 proving. 020 root parity: preprocessing fixes 105 = CBC's 105
 (~350 rows strengthened vs CBC's 501), root cut bound within 1% of CBC's
-closed distance (−0.664 vs −0.658 from −0.885). The remaining ~4× on 020 is
-CBC's node-local probing cuts and cheaper per-iteration engine — local-cut
-quality and engine constants, not correctness.
+closed distance (−0.664 vs −0.658 from −0.885).
+
+**Why 020 is ~3× CBC's wall, decomposed.** The tree is already at parity —
+774 nodes vs CBC's 833. The 10.9s-vs-3.6s gap factors cleanly into pivot
+*volume* × per-pivot *cost*: cbcgo runs 182619 pivots at 59.7 µs each, CBC
+99465 iterations at 36.2 µs — **1.84× volume × 1.65× per-pivot = 3.03×**, the
+observed wall ratio. The per-pivot 1.65× is the Go sparse-triangular-solve
+(memory-bound `s -= cv[k]·y[r]` gather; ~45% of the solve is the dual BTRAN)
+vs Clp's C++ kernel — a codegen floor, not an algorithm gap. The volume 1.84×
+is strong-branch probes (82k pivots, 40/probe on these 1e6-conditioned models
+vs CBC's 27) plus barren mid-tree dives that seed nothing but are load-bearing
+for the fragile tree. Every volume-cutting lever was measured and re-rolls
+020's roundoff-fragile tree: faceWalk pivot budget → timeout, `CBC_CRUNCH`
+row-subset probes → 846 nodes (slower), `CBC_FREECOL` → 3400 nodes, probe
+stall-exit / higher caps / DSE probes → all worse. The tree-safe wins that
+ship (gap-scheduled diving, concrete-sort ratio test, pooled propagate) took
+020 from 12.6s to 10.9s without moving a single node. Reaching CBC's 3.6s
+needs a C++-class kernel, not a correctness or search-quality fix.
