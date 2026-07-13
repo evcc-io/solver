@@ -11,6 +11,11 @@ import (
 // zero-half — all sound; gated as measured low-value here). Component 4.
 var cglEnabled = os.Getenv("CBC_CGL") != "0"
 
+// localCutsEnabled gates in-tree node-local GMI cuts (dev): correct via
+// NR-row + subtree activation, but measured net-negative on 020 without
+// CBC-style cut-effectiveness pruning; off until that lands.
+var localCutsEnabled = os.Getenv("CBC_LOCALCUTS") == "1"
+
 // coverItem is a knapsack element with its complemented LP value.
 type coverItem struct {
 	k    int

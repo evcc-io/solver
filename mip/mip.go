@@ -528,16 +528,31 @@ func (m *Model) Solve() Result {
 				backtrack = nil
 			}
 
-			// in-tree global cut rounds (CBC generates cuts during search):
-			// the CGL families derive from original rows + global bounds, so
-			// their cuts are valid tree-wide; rebuild and cold-restart the
-			// open nodes on the tightened LP.
+			// in-tree LOCAL cuts (CBC generates cuts throughout the search):
+			// GMI cuts from this node's basis are valid only under its bounds,
+			// so the rows are stored free (NR: vacuous for every other node and
+			// for propagation/heuristics) and activated for this subtree via
+			// bound overrides on their logical variables, which children
+			// inherit; the CGL families (globally valid) join the same batch.
 			if cglEnabled && treeCutRounds < 8 && nodeCount-lastTreeCut >= 256 {
 				lastTreeCut = nodeCount
-				if n := m.knapsackCoverCuts(x) + m.cliqueCuts(x) + m.zeroHalfCuts(x) +
-					m.flowCoverCuts(x) + m.liftProjectCuts(x); n > 0 {
+				nGlob := m.knapsackCoverCuts(x) + m.cliqueCuts(x) + m.zeroHalfCuts(x) +
+					m.flowCoverCuts(x) + m.liftProjectCuts(x)
+				locBase := len(m.P.Rows)
+				nLoc := 0
+				if localCutsEnabled { // needs cut-effectiveness pruning to be net-positive
+					nLoc = m.gomoryCuts(endState)
+				}
+				if nGlob+nLoc > 0 {
 					treeCutRounds++
-					debugf("treecuts: +%d rows at node %d (round %d)", n, nodeCount, treeCutRounds)
+					acts := make([]boundOverride, 0, nLoc)
+					for ri := locBase; ri < len(m.P.Rows); ri++ {
+						r := &m.P.Rows[ri]
+						rlb, rub := r.Bounds()
+						r.Sense, r.HasRange = problem.NR, false
+						acts = append(acts, boundOverride{len(m.P.Cols) + ri, rlb, rub})
+					}
+					debugf("treecuts: +%d local gmi, +%d global rows at node %d (round %d)", nLoc, nGlob, nodeCount, treeCutRounds)
 					stats := m.LP.Stats
 					m.rebuildLP()
 					m.LP.Stats = stats
@@ -548,6 +563,7 @@ func (m *Model) Solve() Result {
 					}
 					nd.parentState = nil
 					nd.brCol = -1 // avoid double pseudocost credit on re-solve
+					nd.overrides = append(nd.overrides, acts...)
 					if backtrack != nil {
 						backtrack.parentState = nil
 					}
@@ -667,11 +683,14 @@ func (m *Model) Solve() Result {
 					m.dbgFP += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - fpBase
 					m.LP.Deadline = burstDL
 				}
+				// faceWalk stays the primary (its vertex path is load-bearing:
+				// four reorderings measured wall-negative on the golden cases);
+				// the failure fallbacks below are reduced-sub-problem solves
 				fwBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
 				keep(m.faceWalk(nd, x, endState, obj, cutoff))
 				m.dbgFW += m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual - fwBase
 				if !ok {
-					keep(m.rensImprove(nd, x))
+					keep(m.rensImprove(nd, x, endState))
 				}
 				if !ok {
 					fpBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
@@ -773,6 +792,17 @@ func (m *Model) Solve() Result {
 	return res
 }
 
+// baseBound returns an override target's un-overridden bounds: column bounds
+// for structurals, row bounds for logical (row-slack) variables — vacuous for
+// local-cut rows, which are stored free and activated per subtree.
+func (m *Model) baseBound(idx int) (float64, float64) {
+	if n := len(m.P.Cols); idx >= n {
+		return m.P.Rows[idx-n].Bounds()
+	}
+	c := &m.P.Cols[idx]
+	return c.LB, c.UB
+}
+
 // heurOver reports whether the shared heuristic pivot budget is spent; every
 // heuristic dive/walk/pump loop checks it (CBC budgets heuristics the same way).
 func (m *Model) heurOver() bool {
@@ -812,6 +842,9 @@ func (m *Model) propagatedChild(nd *node, st *simplex.State, ov boundOverride, b
 		lb[j], ub[j] = m.P.Cols[j].LB, m.P.Cols[j].UB
 	}
 	for _, o := range nd.overrides {
+		if o.idx >= n {
+			continue // local-cut activation on a logical var: not a column bound
+		}
 		lb[o.idx], ub[o.idx] = o.lb, o.ub
 	}
 	lb[ov.idx], ub[ov.idx] = ov.lb, ov.ub
@@ -852,7 +885,7 @@ func (m *Model) solveNode(nd *node) (status simplex.Status, x, rowAct, rc, price
 		idx := m.live[i].idx
 		// a column overridden twice down a branch reverts to the still-active
 		// prefix override, not to the original problem bounds
-		lb, ub := m.P.Cols[idx].LB, m.P.Cols[idx].UB
+		lb, ub := m.baseBound(idx)
 		for j := common - 1; j >= 0; j-- {
 			if m.live[j].idx == idx {
 				lb, ub = m.live[j].lb, m.live[j].ub
@@ -926,7 +959,14 @@ func (m *Model) feasibilityPump(nd *node, x []float64, endState *simplex.State) 
 	st := endState.Clone()
 	curX := x
 	var prev []float64
+	// pivot-budgeted like CBC's pump (iteration-capped): a projection loop
+	// that grinds past this is cycling on a degenerate face, not converging
+	fpBase := m.LP.Stats.Phase1 + m.LP.Stats.Phase2 + m.LP.Stats.Dual
+	fpBudget := int64(10 * m.LP.NumRows())
 	for iter := range 50 {
+		if m.LP.Stats.Phase1+m.LP.Stats.Phase2+m.LP.Stats.Dual-fpBase > fpBudget {
+			return fail()
+		}
 		if m.heurOver() {
 			return fail()
 		}
@@ -1063,23 +1103,7 @@ func (m *Model) rinsImprove(nd *node, x []float64, st *simplex.State) (obj float
 	if nInt == 0 || nFix < nInt/2 {
 		return 0, nil, nil, nil, nil, false // neighborhood too large
 	}
-	sub := New(q)
-	sub.subMIP = true
-	sub.MIPStart = append([]float64(nil), best...)
-	sub.Limits = Limits{GapRel: m.Limits.GapRel, GapAbs: m.Limits.GapAbs,
-		MaxNodes: 50, MaxTime: time.Second}
-	if m.Limits.MaxTime > 0 {
-		if t := m.Limits.MaxTime / 16; t < sub.Limits.MaxTime {
-			sub.Limits.MaxTime = t
-		}
-	}
-	res := sub.Solve()
-	if !res.HasIncumbent {
-		return 0, nil, nil, nil, nil, false
-	}
-	// complete globally (not under nd): the neighborhood winner is a global
-	// point; a node-bound completion could reject it spuriously
-	return m.completePoint(&node{brCol: -1}, res.X, st)
+	return m.solveNeighborhood(q, st)
 }
 
 // cloneProblem deep-copies rows/cols/SOS for an independent sub-MIP solve.
@@ -1176,20 +1200,23 @@ func (m *Model) faceWalk(nd *node, x []float64, st *simplex.State, faceObj, cuto
 
 // rensImprove (CBC RENS) fixes integers already integral in the node LP and
 // dives the rest — incumbent-independent, so it can escape a poisoned start
-func (m *Model) rensImprove(nd *node, x []float64) (obj float64, dx, rowAct, rc, price []float64, ok bool) {
+func (m *Model) rensImprove(nd *node, x []float64, st *simplex.State) (obj float64, dx, rowAct, rc, price []float64, ok bool) {
 	ovs := make([]boundOverride, len(nd.overrides), len(nd.overrides)+len(m.P.Cols))
 	copy(ovs, nd.overrides)
+	nInt, nFix := 0, 0
 	for j, c := range m.P.Cols {
 		if !c.Integer {
 			continue
 		}
+		nInt++
 		v := math.Round(x[j])
 		if math.Abs(x[j]-v) > intTol {
-			continue // fractional: leave free for the dive
+			continue // fractional: left free for the sub-MIP
 		}
 		lb, ub := m.LP.Bound(j)
 		v = math.Max(lb, math.Min(ub, v))
 		ovs = append(ovs, boundOverride{j, v, v})
+		nFix++
 	}
 	child := &node{overrides: ovs, bound: nd.bound, depth: nd.depth + 1}
 	status, cx, _, _, _, _, cState := m.solveNode(child)
@@ -1208,7 +1235,41 @@ func (m *Model) rensImprove(nd *node, x []float64) (obj float64, dx, rowAct, rc,
 	if rStatus, rx, rAct, rRC, rPrice, rObj, _ := m.solveNode(rchild); rStatus == simplex.Optimal {
 		return rObj, rx, rAct, rRC, rPrice, true
 	}
-	return m.diveForIncumbent(child, cx, cState)
+	// the rounded completion failed: solve the integral-fixed neighborhood as
+	// a node-capped sub-MIP (CBC RENS / mini branch and bound), not a dive
+	if m.subMIP || nInt == 0 || nFix < nInt/2 {
+		return m.diveForIncumbent(child, cx, cState)
+	}
+	q := cloneProblem(m.P)
+	for _, ov := range ovs {
+		if ov.idx < len(q.Cols) && ov.lb == ov.ub {
+			q.Cols[ov.idx].LB, q.Cols[ov.idx].UB = ov.lb, ov.ub
+		}
+	}
+	return m.solveNeighborhood(q, st)
+}
+
+// solveNeighborhood solves q (a reduced clone) as a node-capped sub-MIP and
+// completes the winner on the main LP (CBC's mini branch and bound).
+func (m *Model) solveNeighborhood(q *problem.Problem, st *simplex.State) (obj float64, dx, rowAct, rc, price []float64, ok bool) {
+	sub := New(q)
+	sub.subMIP = true
+	if m.bestXSnapshot != nil {
+		sub.MIPStart = append([]float64(nil), m.bestXSnapshot...)
+	}
+	sub.Limits = Limits{GapRel: m.Limits.GapRel, GapAbs: m.Limits.GapAbs,
+		MaxNodes: 50, MaxTime: time.Second}
+	if m.Limits.MaxTime > 0 {
+		if t := m.Limits.MaxTime / 16; t < sub.Limits.MaxTime {
+			sub.Limits.MaxTime = t
+		}
+	}
+	res := sub.Solve()
+	if !res.HasIncumbent {
+		return 0, nil, nil, nil, nil, false
+	}
+	// complete globally: the neighborhood winner is a global point
+	return m.completePoint(&node{brCol: -1}, res.X, st)
 }
 
 // polishIncumbent 1-opt flips each binary and LP-completes the rest
@@ -1300,7 +1361,7 @@ func (m *Model) diveForIncumbent(nd *node, x []float64, endState *simplex.State)
 	cur, curX, curState := nd, x, endState
 	fixed := make([]bool, len(m.P.Cols))
 	for _, ov := range cur.overrides {
-		if ov.lb == ov.ub {
+		if ov.idx < len(fixed) && ov.lb == ov.ub {
 			fixed[ov.idx] = true
 		}
 	}

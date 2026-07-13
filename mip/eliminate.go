@@ -4,24 +4,31 @@ package mip
 
 import (
 	"math"
+	"os"
 
 	"cbcgo/problem"
 )
+
+// elimFixEnabled gates fixed-column (LB==UB) elimination — dev, see above.
+var elimFixEnabled = os.Getenv("CBC_ELIMFIX") == "1"
 
 type elimKind byte
 
 const (
 	elimTight elimKind = iota // cost pins the row: x = (b - rest)/a
 	elimFixed                 // row never blocks: x sits at its bound
+	elimConst                 // LB==UB (probing/presolve fixed): x = val everywhere
 )
 
 type elimRecord struct {
 	col, row int
 	kind     elimKind
-	a        float64 // column's coefficient in its row
-	b        float64 // elimTight: row bound the column pins
-	val      float64 // elimFixed: fixed value
-	obj      float64 // cost at elimination time (dual postsolve shift)
+	a        float64   // column's coefficient in its row
+	b        float64   // elimTight: row bound the column pins
+	val      float64   // elimFixed/elimConst: fixed value
+	obj      float64   // cost at elimination time (dual postsolve shift)
+	rows     []int     // elimConst: every row containing the column
+	coefs    []float64 // elimConst: matching coefficients
 }
 
 // reduction maps a reduced problem back to the caller's original one.
@@ -50,7 +57,38 @@ func eliminateSingletons(p *problem.Problem) (*problem.Problem, *reduction) {
 	}
 	elim := make([]bool, len(p.Cols))
 	var records []elimRecord
-	nTight, nFixed := 0, 0
+	nTight, nFixed, nConst := 0, 0, 0
+
+	// constant columns first (LB==UB, e.g. probing-fixed binaries): fold
+	// a*val into every containing row's bounds and drop the column. Sound and
+	// CBC-faithful (CglPreProcess removes fixed columns), but gated: the
+	// reduced model re-rolls the heuristic/cut vertex lottery on the golden
+	// suite (021 1.7x faster, 018/020 slower via a pump/dive grind).
+	for j := range p.Cols {
+		if !elimFixEnabled {
+			break
+		}
+		c := &p.Cols[j]
+		if c.LB != c.UB {
+			continue
+		}
+		v := c.LB
+		rows := append([]int(nil), c.Idx...)
+		coefs := append([]float64(nil), c.Coef...)
+		for k, ri := range rows {
+			a := coefs[k]
+			if rlb[ri] > -inf {
+				rlb[ri] -= a * v
+			}
+			if rub[ri] < inf {
+				rub[ri] -= a * v
+			}
+			touched[ri] = true
+		}
+		records = append(records, elimRecord{col: j, kind: elimConst, val: v, obj: obj[j], rows: rows, coefs: coefs})
+		elim[j] = true
+		nConst++
+	}
 
 	// folding a cost onto row siblings can re-classify them, so iterate
 	for changed := true; changed; {
@@ -134,7 +172,7 @@ func eliminateSingletons(p *problem.Problem) (*problem.Problem, *reduction) {
 	if len(records) == 0 {
 		return nil, nil
 	}
-	debugf("eliminate: %d singleton cols removed (%d tight, %d fixed) of %d", len(records), nTight, nFixed, len(p.Cols))
+	debugf("eliminate: %d cols removed (%d const, %d tight, %d fixed) of %d", len(records), nConst, nTight, nFixed, len(p.Cols))
 
 	q := problem.New()
 	q.Name, q.ObjSense = p.Name, p.ObjSense
@@ -321,6 +359,14 @@ func (red *reduction) expand(res *Result) {
 			x[rec.col] = rec.val
 			act[rec.row] += rec.a * rec.val
 			rc[rec.col] = rec.obj - rec.a*price[rec.row]
+		case elimConst:
+			x[rec.col] = rec.val
+			r := rec.obj
+			for k, ri := range rec.rows {
+				act[ri] += rec.coefs[k] * rec.val
+				r -= rec.coefs[k] * price[ri]
+			}
+			rc[rec.col] = r
 		}
 	}
 	obj := 0.0
