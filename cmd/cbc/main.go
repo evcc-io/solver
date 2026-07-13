@@ -56,7 +56,9 @@ func run(args []string) error {
 	var solutionFile, mipsFile string
 	maximize := false
 	lpOnly := false
-	limits := mip.Limits{GapRel: 1e-9, GapAbs: 1e-9}
+	// GapAbs 1e-5 = CBC's default cutoff increment (CbcCutoffIncrement):
+	// nodes within 1e-5 of the incumbent are pruned, as real CBC does
+	limits := mip.Limits{GapRel: 1e-9, GapAbs: 1e-5}
 
 	rest := args[1:]
 	for i := 0; i < len(rest); i++ {

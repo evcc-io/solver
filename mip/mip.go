@@ -143,7 +143,8 @@ func cbcScore(estUp, estDn float64, hasIncumbent bool) float64 {
 
 func New(p *problem.Problem) *Model {
 	presolve(p)
-	return &Model{P: p, LP: simplex.Build(p), Limits: Limits{GapRel: 1e-9, GapAbs: 1e-9}}
+	// GapAbs 1e-5 mirrors CBC's default cutoff increment (CbcCutoffIncrement)
+	return &Model{P: p, LP: simplex.Build(p), Limits: Limits{GapRel: 1e-9, GapAbs: 1e-5}}
 }
 
 // rebuildLP rebuilds the LP with DSE suspended: cuts/root run on the canonical
@@ -199,8 +200,15 @@ func (m *Model) Solve() Result {
 		if m.Limits.MaxTime > 0 {
 			probeDeadline = time.Now().Add(m.Limits.MaxTime / 6)
 		}
-		probe(m.P, probeDeadline)
-		presolve(m.P)
+		// multi-pass, as CBC's CglPreProcess: each strengthening pass exposes
+		// further fixes/strengthenings until quiet (CBC default: 4 passes)
+		for pass := 0; pass < 4; pass++ {
+			changed := probe(m.P, probeDeadline)
+			presolve(m.P)
+			if changed == 0 {
+				break
+			}
+		}
 		// CBC CglPreProcess applied uniformly (as CBC/Clp do), not gated on the
 		// relaxation: strengthening (presolve) + forcing/redundant-row removal.
 		if q, keep := dropRedundantRows(m.P, true); q != nil {

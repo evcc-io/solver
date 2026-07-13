@@ -57,17 +57,20 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   boundary. Like Clp, a well-conditioned matrix is left unscaled (byte-identical),
   so scaling only bites on ill-conditioned models like the evcc big-M cases (1e6
   coefficient range): 018 ~29× faster, 021 5.8× and now matches CBC's optimum
-  exactly, 020 near-proven (see Benchmarks).
+  exactly, 020 proven (see Benchmarks).
 - **Factorization**: singleton triangularization + sparse-LU kernel,
   product-form (eta) updates, periodic refactorize; no dense inverse;
   int32-compacted arenas, per-LP scratch. True Forrest-Tomlin (`simplex/ft.go`,
   `CBC_FT=1`): row-spike update, O(nnz) R-file, per-pivot parity with the eta
   path on the large cases; off by default (see below).
 - **Presolve**: activity-based bound tightening to fixpoint, big-M binary
-  coefficient tightening, CglProbing binary probing, singleton-column
-  elimination (exact postsolve).
+  coefficient tightening, multi-pass CglProbing binary probing with
+  probing-propagated coefficient strengthening (CBC's Cgl0003I "strengthened
+  rows": one-sided big-M rows tighten against each probe side's implied
+  activity), singleton-column elimination (exact postsolve).
 - **Cuts**: root Gomory (GMI) with hygiene + numeric retraction, CglProbing
-  implication cuts, TwoMIR-lite and single-row MIR on large instances;
+  implication cuts, knapsack cover, clique, zero-half, flow cover, c-MIR
+  (Marchand-Wolsey), TwoMIR-lite and single-row MIR on large instances;
   pivot-budgeted rounds; slack cuts dropped before the tree.
 - **Branch & bound**: best-first + depth-first plunging, warm child bases,
   node bound propagation, reduced-cost fixing per incumbent, SOS1/2, one
@@ -85,18 +88,20 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 
 Objective + wall-clock; CBC's optima shown for reference.
 
-| case | main (pre-rewrite) | this branch (scaling default) | CBC |
+| case | main (pre-rewrite) | this branch | CBC |
 |---|---|---|---|
-| 018 | 4.9s, 18291.45 | **0.3s, 18291.46** | correct |
-| 021 | 5.8s, **8.6901 (wrong)** | **2.6s, 8.70087** | 8.70087 |
-| 020 | 60s, **−140 (garbage)** | 60s, **0.558**, gap 6e-4 | 0.5583 |
+| 018 | 4.9s, 18291.45 | **0.14s, 18291.4519** | 0.04s, 18291.4519 |
+| 021 | 5.8s, **8.6901 (wrong)** | **2.9s, 8.70087** | 0.09s, 8.70083 |
+| 020 | 60s, **−140 (garbage)** | **57s, 0.55835, proven** | 3.6s, 0.55835 |
 
-The 1e6-range big-M coefficients make these models ill-conditioned; scaling
-(on by default, as Clp) is the lever — correct on all three and far faster
-than main, which is both slower and unsound here. Proving 020 is the remaining
-perf gap. Hot-path FTRAN/BTRAN is sparse-gather bound (compute, not GC/locality
-— measured: `GOGC=off` moves wall <0.5%), so further speed is algorithmic
-(scaling, Forrest-Tomlin), not micro-optimization.
+The 1e6-range big-M coefficients make these models ill-conditioned; the two
+levers are Clp scaling and CglProbing coefficient strengthening (both on by
+default, as CBC/Clp). Strengthening also stabilized the tree: node counts no
+longer swing with solve roundoff (018 6–8 nodes, 021 3 nodes across all
+refactorize intervals; before 27–336 and 3–291). 020 is proven optimal for
+the first time (CBC needs 833 nodes, cbcgo ~1.9k). Remaining wall gap vs CBC
+is root-closing power (CBC finishes 018/021 at 0 nodes) and 020 node
+throughput — engine constants, not correctness.
 
 ## Missing vs. real CBC
 
@@ -114,8 +119,11 @@ perf gap. Hot-path FTRAN/BTRAN is sparse-gather bound (compute, not GC/locality
   are all on by default and pass the golden suite.
 - **DSE dual is ~4× CBC wall** on the hardest case (pivot counts already 4–33×
   down toward CBC's).
-- **Proving 020** is the open perf gap (incumbent ≈ CBC under scaling; proof
-  needs CBC-quality node throughput / degeneracy handling).
+- **020 wall-clock**: proven, but ~15× CBC (57s vs 3.6s; 1.9k vs 833 nodes) —
+  the residual gap is node throughput, and one refactorize interval still
+  times out (residual tree variance on the hardest case).
+- **Gap semantics**: default absolute gap is 1e-5, mirroring CBC's default
+  cutoff increment (`CbcCutoffIncrement`); `-allow`/`-ratio` override it.
 - **No multi-threaded search** (`-threads` accepted, ignored); **`-mips` warm
   start** parsed but not wired; **format gaps** (free MPS only, no `OBJSENSE`,
   no negative-`UP` — PuLP never exercises these).

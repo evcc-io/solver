@@ -319,13 +319,15 @@ func propagate(p *problem.Problem, lb, ub []float64) bool {
 }
 
 // probe tentatively fixes each binary both ways (CglProbing-style): an
-// infeasible side fixes the binary; otherwise merged implied bounds apply.
-// Effort is time-boxed: partial results are valid tightenings.
-func probe(p *problem.Problem, deadline time.Time) {
-	nFix, nTight, nProbed := 0, 0, 0
+// infeasible side fixes the binary; otherwise merged implied bounds apply and
+// one-sided rows are coefficient-strengthened from the propagated activities.
+// Effort is time-boxed: partial results are valid tightenings. Returns the
+// number of model changes (fixes + strengthened coefficients).
+func probe(p *problem.Problem, deadline time.Time) int {
+	nFix, nTight, nProbed, nStr := 0, 0, 0, 0
 	t0 := time.Now()
 	defer func() {
-		debugf("probe: %d binaries probed, %d fixed, %d bounds tightened in %v", nProbed, nFix, nTight, time.Since(t0))
+		debugf("probe: %d binaries probed, %d fixed, %d bounds tightened, %d coefs strengthened in %v", nProbed, nFix, nTight, nStr, time.Since(t0))
 	}()
 	n := len(p.Cols)
 	base := make([]float64, 2*n)
@@ -339,7 +341,7 @@ func probe(p *problem.Problem, deadline time.Time) {
 			continue
 		}
 		if !deadline.IsZero() && time.Now().After(deadline) {
-			return
+			return nFix + nStr
 		}
 		nProbed++
 		copy(lb0, base[:n])
@@ -352,7 +354,7 @@ func probe(p *problem.Problem, deadline time.Time) {
 		feas1 := propagate(p, lb1, ub1)
 		switch {
 		case !feas0 && !feas1:
-			return // infeasible problem: leave it to the LP to report
+			return nFix + nStr // infeasible problem: leave it to the LP to report
 		case !feas0:
 			p.Cols[j].LB = 1
 			base[j] = 1
@@ -362,6 +364,7 @@ func probe(p *problem.Problem, deadline time.Time) {
 			base[n+j] = 0
 			nFix++
 		default:
+			nStr += strengthenFromProbe(p, j, lb0, ub0, lb1, ub1)
 			// merged implied bounds only for integer columns: continuous
 			// merges compound propagation drift into a collapse cascade
 			for i := range n {
@@ -381,4 +384,87 @@ func probe(p *problem.Problem, deadline time.Time) {
 			}
 		}
 	}
+	return nFix + nStr
+}
+
+// rowPos returns j's position in row r's index list, or -1.
+func rowPos(r *problem.Row, j int) int {
+	for k, jj := range r.Idx {
+		if jj == j {
+			return k
+		}
+	}
+	return -1
+}
+
+// strengthenFromProbe tightens binary j's coefficient in one-sided rows using
+// the probing-propagated activities of both sides (CglProbing Cgl0003I).
+// Integer-feasible points are preserved; only the LP relaxation tightens.
+func strengthenFromProbe(p *problem.Problem, j int, lb0, ub0, lb1, ub1 []float64) int {
+	inf := problem.Inf
+	nStr := 0
+	c := &p.Cols[j]
+	for _, ri := range c.Idx {
+		r := &p.Rows[ri]
+		rlb, rub := r.Bounds()
+		pureLE := rub < inf && rlb == -inf
+		pureGE := rlb > -inf && rub == inf
+		if !pureLE && !pureGE {
+			continue
+		}
+		kk := rowPos(r, j)
+		if kk < 0 || r.Coef[kk] == 0 {
+			continue
+		}
+		// activity range of the whole row under one probing side's bounds
+		act := func(lb, ub []float64) (lo, hi float64) {
+			for k, jj := range r.Idx {
+				ak := r.Coef[k]
+				l, u := lb[jj], ub[jj]
+				if l <= -inf {
+					l = math.Inf(-1)
+				}
+				if u >= inf {
+					u = math.Inf(1)
+				}
+				alo, ahi := ak*l, ak*u
+				if ak < 0 {
+					alo, ahi = ahi, alo
+				}
+				lo += alo
+				hi += ahi
+			}
+			return lo, hi
+		}
+		if pureLE {
+			tol := 1e-7 * math.Max(1, math.Abs(rub))
+			if _, hi0 := act(lb0, ub0); !math.IsInf(hi0, 1) && hi0 < rub-tol {
+				// x_j=0 side slack by delta: shift a_j and the rhs down together
+				delta := rub - hi0
+				setCoef(p, ri, kk, r.Coef[kk]-delta)
+				r.RHS -= delta
+				nStr++
+				continue
+			}
+			if _, hi1 := act(lb1, ub1); !math.IsInf(hi1, 1) && hi1 < rub-tol {
+				// x_j=1 side slack: raise a_j so that side just reaches the rhs
+				setCoef(p, ri, kk, r.Coef[kk]+(rub-hi1))
+				nStr++
+			}
+		} else {
+			tol := 1e-7 * math.Max(1, math.Abs(rlb))
+			if lo0, _ := act(lb0, ub0); !math.IsInf(lo0, -1) && lo0 > rlb+tol {
+				delta := lo0 - rlb
+				setCoef(p, ri, kk, r.Coef[kk]+delta)
+				r.RHS += delta
+				nStr++
+				continue
+			}
+			if lo1, _ := act(lb1, ub1); !math.IsInf(lo1, -1) && lo1 > rlb+tol {
+				setCoef(p, ri, kk, r.Coef[kk]-(lo1-rlb))
+				nStr++
+			}
+		}
+	}
+	return nStr
 }
