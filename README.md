@@ -66,7 +66,8 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   coefficient tightening, multi-pass CglProbing binary probing with
   probing-propagated coefficient strengthening (CBC's Cgl0003I "strengthened
   rows": one-sided big-M rows tighten against each probe side's implied
-  activity), singleton-column elimination (exact postsolve).
+  activity), fixed-column (LB==UB) elimination and singleton-column
+  elimination (both with exact primal/dual postsolve).
 - **Cuts**: root Gomory (GMI) with hygiene + numeric retraction, CglProbing
   implication cuts, knapsack cover, clique, zero-half, flow cover, c-MIR
   (Marchand-Wolsey), TwoMIR-lite and single-row MIR on large instances;
@@ -103,19 +104,22 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 - **Node-local in-tree cuts implemented but gated** (`CBC_LOCALCUTS=1`): GMI
   cuts from a node's basis are stored as free rows (vacuous globally) and
   activated per subtree via bound overrides on their logical variables — the
-  full local lifecycle without LP row add/remove. Correct, but net-negative
-  on 020 (degenerate node grind) until CBC-style cut-effectiveness pruning
-  lands; the globally-valid in-tree round stays on.
-- **Fixed-column elimination implemented but gated** (`CBC_ELIMFIX=1`):
-  LB==UB columns fold into row bounds with exact primal/dual postsolve
-  (020: −364 cols, 021: −643). Objectives verified exact; measured 021 2.9s
-  → 1.7s but 018/020 regress via a feasibility-pump grind on the scaled
-  reduced model — gated until single-solve preemption exists. Deeper
-  CglPreProcess pieces (doubleton substitution, duplicates) remain missing.
+  full local lifecycle without LP row add/remove — with CBC-style
+  effectiveness pruning (a batch that doesn't lift the node bound is
+  retracted; kept batches drop non-binding cuts; two failures disable local
+  cuts for the model). With pruning it proves 020 (57s, 1.1k nodes — was a
+  timeout unpruned) but still loses to the 16s default, so it stays opt-in.
+- **Per-solve pivot caps**: heuristic windows cap every LP at 2m+200 pivots
+  (`SetIterCap`, honored by the primal loop and the DSE dual) — CBC's
+  hot-start/heuristic iteration caps. This is what made fixed-column
+  elimination shippable: single degenerate LP grinds (018: 192k pivots in
+  one pump projection) now fail fast instead of eating the budget.
 - **020 heuristic pivot spend**: faceWalk + strong-branch probes are ~80% of
   its pivots and resist capping (five reorder/budget variants measured
   wall-negative — the walk's vertex path pins the good tree). Node re-solves
   themselves are already cheap: 12.6 pivots/node vs CBC's 53 iterations/node.
+  Deeper CglPreProcess pieces (doubleton substitution, duplicate rows/cols)
+  remain missing.
 - **Gap semantics**: default absolute gap is 1e-5, mirroring CBC's default
   cutoff increment (`CbcCutoffIncrement`); `-allow`/`-ratio` override it.
 - **No multi-threaded search** (`-threads` accepted, ignored); **`-mips` warm
@@ -136,24 +140,24 @@ Wall-clock, nodes, objective:
 
 | case | main (pre-rewrite) | this branch | real CBC |
 |---|---|---|---|
-| 018 | 4.9s, 18291.45 | **0.14s, 7 nodes, 18291.4519** | 0.04s, 0 nodes, 18291.4519 |
-| 021 | 5.8s, **8.6901 (wrong)** | **3.0s, 3 nodes, 8.70087** | 0.09s, 0 nodes, 8.70083 |
-| 020 | 60s, **−140 (garbage)** | **59s, 1.9k nodes, 0.55835 proven** | 3.6s, 833 nodes, 0.55835 |
+| 018 | 4.9s, 18291.45 | **0.18s, 8 nodes, 18291.4519** | 0.04s, 0 nodes, 18291.4519 |
+| 021 | 5.8s, **8.6901 (wrong)** | **2.2s, 3 nodes, 8.70087** | 0.09s, 0 nodes, 8.70083 |
+| 020 | 60s, **−140 (garbage)** | **15.6s, 1.2k nodes, 0.55834 proven** | 3.6s, 833 nodes, 0.55835 |
 
 Tree robustness — nodes (and wall) as solve roundoff is perturbed via the
 refactorize interval `CBC_MAXETAS` ∈ {24, 32, 48, 64, 100}:
 
 | case | before strengthening | after | real CBC (any seed) |
 |---|---|---|---|
-| 018 | 27–336 nodes, 0.3–6.4s | **6–8 nodes, 0.14–0.21s** | 0 nodes |
-| 021 | 3–291 nodes, 2.6–31s | **3 nodes every run, 2.9–5.5s** | 0 nodes |
-| 020 | never proven | **proven 4/5 (45–94s); miss ends 1.5e-5 off** | 833 nodes, 3.6s |
+| 018 | 27–336 nodes, 0.3–6.4s | **7–10 nodes, 0.14–0.43s** | 0 nodes |
+| 021 | 3–291 nodes, 2.6–31s | **3 nodes every run, 1.8–20s** | 0 nodes |
+| 020 | never proven | **proven 4/5 (15–32s); one interval times out** | 833 nodes, 3.6s |
 
 Probing coefficient strengthening lifts 018's pre-cut root bound from 18092
-to 18291.44 and stops node counts swinging with roundoff. 020 root parity:
-preprocessing fixes 105 = CBC's 105 (~350 rows strengthened vs CBC's 501),
-root cut bound within 1% of CBC's closed distance (−0.664 vs −0.658 from
-−0.885). The remaining wall gap vs CBC is root-closing power (CBC ends
-018/021 at 0 nodes via CglPreProcess + pump/mini-B&B) and 020 tree cost
-(CBC's ~950 node-local probing cuts and ~4× cheaper node re-solves) — engine
-constants and local-cut architecture, not correctness.
+to 18291.44 and stops node counts swinging with roundoff; fixed-column
+elimination (020: −364 cols, 021: −643) plus per-solve pivot caps take 020
+from 59.8s to 15.6s. 020 root parity: preprocessing fixes 105 = CBC's 105
+(~350 rows strengthened vs CBC's 501), root cut bound within 1% of CBC's
+closed distance (−0.664 vs −0.658 from −0.885). The remaining ~4× on 020 is
+CBC's node-local probing cuts and cheaper per-iteration engine — local-cut
+quality and engine constants, not correctness.
