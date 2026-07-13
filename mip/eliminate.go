@@ -13,6 +13,10 @@ import (
 // as CBC's CglPreProcess; CBC_ELIMFIX=0 disables).
 var elimFixEnabled = os.Getenv("CBC_ELIMFIX") != "0"
 
+// freeColEnabled gates empty-column (no row entries) removal. Off by default:
+// optimum-preserving, but perturbs 020's proof-fragile tree (see the pass).
+var freeColEnabled = os.Getenv("CBC_FREECOL") == "1"
+
 type elimKind byte
 
 const (
@@ -62,7 +66,39 @@ func eliminateSingletons(p *problem.Problem) (*problem.Problem, *reduction) {
 	}
 	elim := make([]bool, len(p.Cols))
 	var records []elimRecord
-	nTight, nFixed, nConst := 0, 0, 0
+	nTight, nFixed, nConst, nFree := 0, 0, 0, 0
+
+	// free columns (no row entries, e.g. left dangling after row drops): the
+	// objective alone decides them, so fix at the cost-optimal finite bound
+	// and drop (CoinPresolve empty-column removal). Optimum-preserving, but the
+	// perturbed model re-rolls 020's proof-fragile tree (774->3400 nodes) even
+	// though it makes 018 ~2x faster — opt-in (CBC_FREECOL=1), like crunch.
+	for j := 0; freeColEnabled && j < len(p.Cols); j++ {
+		if !elimFixEnabled {
+			break
+		}
+		c := &p.Cols[j]
+		if len(c.Idx) != 0 || c.LB == c.UB {
+			continue
+		}
+		cm := obj[j] * p.ObjSense
+		var v float64
+		switch {
+		case cm > 0 && c.LB > -inf:
+			v = c.LB
+		case cm < 0 && c.UB < inf:
+			v = c.UB
+		case cm == 0 && c.LB > -inf:
+			v = c.LB
+		case cm == 0 && c.UB < inf:
+			v = c.UB
+		default:
+			continue // cost pulls toward an infinite bound: solver reports unbounded
+		}
+		records = append(records, elimRecord{col: j, kind: elimConst, val: v, obj: obj[j]})
+		elim[j] = true
+		nFree++
+	}
 
 	// constant columns first (LB==UB, e.g. probing-fixed binaries): fold
 	// a*val into every containing row's bounds and drop the column, with
@@ -175,7 +211,7 @@ func eliminateSingletons(p *problem.Problem) (*problem.Problem, *reduction) {
 	if len(records) == 0 {
 		return nil, nil
 	}
-	debugf("eliminate: %d cols removed (%d const, %d tight, %d fixed) of %d", len(records), nConst, nTight, nFixed, len(p.Cols))
+	debugf("eliminate: %d cols removed (%d const, %d free, %d tight, %d fixed) of %d", len(records), nConst, nFree, nTight, nFixed, len(p.Cols))
 
 	q := problem.New()
 	q.Name, q.ObjSense = p.Name, p.ObjSense
