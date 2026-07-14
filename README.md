@@ -198,9 +198,15 @@ observed wall ratio. The per-pivot 1.65× is the Go sparse-triangular-solve
 (memory-bound `s -= cv[k]·y[r]` gather; ~45% of the solve is the dual BTRAN)
 vs Clp's C++ kernel — a codegen floor, not an algorithm gap. The volume 1.84×
 is strong-branch probes (82k pivots, 40/probe on these 1e6-conditioned models
-vs CBC's 27) plus barren mid-tree dives that seed nothing but are load-bearing
-for the fragile tree. Every volume-cutting lever was measured and re-rolls
-020's roundoff-fragile tree: faceWalk pivot budget → timeout, `CBC_CRUNCH`
+vs CBC's 27) plus the root incumbent dive: faceWalk fires once at the root and
+spends 37711 pivots to find the first feasible point, where CBC's
+DiveCoefficient does it in 706 — a 53× gap. The model forces incremental
+per-variable diving (batch rounding via RENS fails on 020), so faceWalk
+re-solves once per fixed integer; CBC's cheaper (crunched / hot-started)
+re-solves and coefficient selection are exactly the two things that re-roll
+020's roundoff-fragile tree. Every volume-cutting lever was measured and
+re-rolls that tree: faceWalk pivot budget → timeout (loses the root incumbent),
+`CBC_CRUNCH`
 row-subset probes → 846 nodes (slower), `CBC_FREECOL` → 3400 nodes, probe
 stall-exit / higher caps / DSE probes → all worse. The tree-safe wins that
 ship (gap-scheduled diving, concrete-sort ratio test, pooled propagate) took
