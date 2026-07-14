@@ -197,8 +197,8 @@ closed distance (−0.664 vs −0.658 from −0.885).
 observed wall ratio. The per-pivot 1.65× is the Go sparse-triangular-solve
 (memory-bound `s -= cv[k]·y[r]` gather; ~45% of the solve is the dual BTRAN)
 vs Clp's C++ kernel — a codegen floor, not an algorithm gap. The volume 1.84×
-is strong-branch probes (82k pivots, 40/probe on these 1e6-conditioned models
-vs CBC's 27) plus the root incumbent dive: faceWalk fires once at the root and
+is strong-branch probes (81748 pivots vs CBC's 55266 strong-branch iterations,
+1.5×, on these 1e6-conditioned models) plus the root incumbent dive: faceWalk fires once at the root and
 spends 37711 pivots to find the first feasible point, where CBC's
 DiveCoefficient does it in 706 — a 53× gap. The model forces incremental
 per-variable diving (batch rounding via RENS fails on 020), so faceWalk
