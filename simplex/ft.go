@@ -23,7 +23,8 @@ func (f *ftLU) clone() *ftLU {
 		rlist: append([]ftR(nil), f.rlist...),
 		nUpd:  f.nUpd,
 		lPr:   append([]int(nil), f.lPr...),
-		lCol:  make([][]int32, f.m), lVal: make([][]float64, f.m),
+		lFR: append([]int32(nil), f.lFR...), lFV: append([]float64(nil), f.lFV...),
+		lPtr: append([]int32(nil), f.lPtr...),
 		uCol: make([][]int32, f.m), uVal: make([][]float64, f.m),
 		ucRows: make([][]int32, f.m),
 		// transient scratch is shared (single-threaded, sequential solves);
@@ -35,8 +36,6 @@ func (f *ftLU) clone() *ftLU {
 		wColLen: f.wColLen,
 	}
 	for s := range f.m {
-		c.lCol[s] = append([]int32(nil), f.lCol[s]...)
-		c.lVal[s] = append([]float64(nil), f.lVal[s]...)
 		c.uCol[s] = append([]int32(nil), f.uCol[s]...)
 		c.uVal[s] = append([]float64(nil), f.uVal[s]...)
 		c.ucRows[s] = append([]int32(nil), f.ucRows[s]...)
@@ -48,8 +47,9 @@ func (f *ftLU) clone() *ftLU {
 // keyed by stable orig rows, U by stable basis cols; "step" order remaps freely.
 type ftLU struct {
 	m       int
-	lCol    [][]int32   // factorize step s -> orig rows eliminated at s
-	lVal    [][]float64 // matching L multipliers
+	lFR     []int32     // flat L: step s eliminated rows, range [lPtr[s],lPtr[s+1])
+	lFV     []float64   // matching L multipliers (contiguous, cache-friendly)
+	lPtr    []int32     // step s -> start offset into lFR/lFV (len m+1)
 	lPr     []int       // factorize step s -> its pivot orig row (immutable)
 	udiag   []float64   // udiag[s] = U[s][s]
 	uCol    [][]int32   // step-row s -> basis cols c with rinvcol[c] > s
@@ -106,7 +106,6 @@ func newFTLU(m int, a []float64) *ftLU {
 func newFTLUSparse(m int, colRow [][]int32, colVal [][]float64) *ftLU {
 	f := &ftLU{
 		m: m, udiag: make([]float64, m),
-		lCol: make([][]int32, m), lVal: make([][]float64, m),
 		lPr:  make([]int, m),
 		uCol: make([][]int32, m), uVal: make([][]float64, m),
 		ucRows: make([][]int32, m),
@@ -131,13 +130,13 @@ func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 	m := f.m
 	f.rlist = f.rlist[:0]
 	f.nUpd = 0
+	f.lFR, f.lFV, f.lPtr = f.lFR[:0], f.lFV[:0], f.lPtr[:0]
 	rowCol, rowVal, colRows := f.wRowCol, f.wRowVal, f.wColRows
 	buckets := f.wBuck
 	rowUsed, colUsed, mark, acc := f.wRowUsed, f.wColUsed, f.wMrk, f.wAcc
 	for r := range m {
 		rowCol[r], rowVal[r], colRows[r] = rowCol[r][:0], rowVal[r][:0], colRows[r][:0]
 		rowUsed[r], colUsed[r], mark[r], acc[r] = false, false, false, 0
-		f.lCol[r], f.lVal[r] = f.lCol[r][:0], f.lVal[r][:0]
 		f.uCol[r], f.uVal[r] = f.uCol[r][:0], f.uVal[r][:0]
 		f.ucRows[r] = f.ucRows[r][:0]
 		buckets[r] = buckets[r][:0]
@@ -159,6 +158,7 @@ func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 	}
 	minL := 0
 	for step := range m {
+		f.lPtr = append(f.lPtr, int32(len(f.lFR)))
 		// pivot row: shortest active row (via buckets)
 		pr := -1
 		for minL <= m {
@@ -238,8 +238,8 @@ func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 				continue
 			}
 			mult := hit / pv
-			f.lCol[step] = append(f.lCol[step], int32(rr))
-			f.lVal[step] = append(f.lVal[step], mult)
+			f.lFR = append(f.lFR, int32(rr))
+			f.lFV = append(f.lFV, mult)
 			rc, rv := rowCol[rr], rowVal[rr]
 			w := 0
 			for k, c := range rc {
@@ -281,6 +281,7 @@ func (f *ftLU) rebuild(colRow [][]int32, colVal [][]float64) bool {
 			acc[c] = 0
 		}
 	}
+	f.lPtr = append(f.lPtr, int32(len(f.lFR)))
 	copy(f.lPr, f.prow) // L stays keyed by factorize-time pivot rows
 	f.buildURows(rowCol, rowVal)
 	return true
@@ -309,9 +310,8 @@ func (f *ftLU) forwardLR(b []float64) {
 		if v == 0 {
 			continue
 		}
-		lc, lv := f.lCol[s], f.lVal[s]
-		for k, r := range lc {
-			b[r] -= lv[k] * v
+		for k := f.lPtr[s]; k < f.lPtr[s+1]; k++ {
+			b[f.lFR[k]] -= f.lFV[k] * v
 		}
 	}
 	for _, op := range f.rlist {
@@ -362,9 +362,8 @@ func (f *ftLU) btran(c []float64) {
 	for s := m - 1; s >= 0; s-- { // L^-T back by column
 		pr := f.lPr[s]
 		v := z[pr]
-		lc, lv := f.lCol[s], f.lVal[s]
-		for k, r := range lc {
-			v -= lv[k] * z[r]
+		for k := f.lPtr[s]; k < f.lPtr[s+1]; k++ {
+			v -= f.lFV[k] * z[f.lFR[k]]
 		}
 		z[pr] = v
 		c[pr] = v
