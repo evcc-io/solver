@@ -8,14 +8,14 @@ import "math"
 // per-step multiplier columns, U upper stored as per-step rows.
 type sparseLU struct {
 	k         int
-	rowPerm   []int32 // step -> kernel-local row
-	colPerm   []int32 // step -> kernel-local col
-	stepOfRow []int32 // kernel-local row -> step
+	rowPerm   []int32   // step -> kernel-local row
+	colPerm   []int32   // step -> kernel-local col
+	stepOfRow []int32   // kernel-local row -> step
 	lFlatIdx  []int32   // flat L: step s multipliers in [lPtr[s],lPtr[s+1])
 	lFlatVal  []float64 // matching L values, kernel-local row ids
 	lPtr      []int32   // step -> start offset into lFlat* (len k+1)
 	uDiag     []float64
-	uFlatIdx  []int32   // flat U: step s entries in [uPtr[s],uPtr[s+1])
+	uFlatIdx  []int32 // flat U: step s entries in [uPtr[s],uPtr[s+1])
 	uFlatVal  []float64
 	uPtr      []int32 // step -> start offset into uFlat* (len k+1)
 	work      []float64

@@ -23,7 +23,7 @@ func (f *ftLU) clone() *ftLU {
 		rlist: append([]ftR(nil), f.rlist...),
 		nUpd:  f.nUpd,
 		lPr:   append([]int(nil), f.lPr...),
-		lFR: append([]int32(nil), f.lFR...), lFV: append([]float64(nil), f.lFV...),
+		lFR:   append([]int32(nil), f.lFR...), lFV: append([]float64(nil), f.lFV...),
 		lPtr: append([]int32(nil), f.lPtr...),
 		uCol: make([][]int32, f.m), uVal: make([][]float64, f.m),
 		ucRows: make([][]int32, f.m),
@@ -47,12 +47,12 @@ func (f *ftLU) clone() *ftLU {
 // keyed by stable orig rows, U by stable basis cols; "step" order remaps freely.
 type ftLU struct {
 	m       int
-	lFR     []int32     // flat L: step s eliminated rows, range [lPtr[s],lPtr[s+1])
-	lFV     []float64   // matching L multipliers (contiguous, cache-friendly)
-	lPtr    []int32     // step s -> start offset into lFR/lFV (len m+1)
-	lPr     []int       // factorize step s -> its pivot orig row (immutable)
-	udiag   []float64   // udiag[s] = U[s][s]
-	uCol    [][]int32   // step-row s -> basis cols c with rinvcol[c] > s
+	lFR     []int32   // flat L: step s eliminated rows, range [lPtr[s],lPtr[s+1])
+	lFV     []float64 // matching L multipliers (contiguous, cache-friendly)
+	lPtr    []int32   // step s -> start offset into lFR/lFV (len m+1)
+	lPr     []int     // factorize step s -> its pivot orig row (immutable)
+	udiag   []float64 // udiag[s] = U[s][s]
+	uCol    [][]int32 // step-row s -> basis cols c with rinvcol[c] > s
 	uVal    [][]float64
 	ucRows  [][]int32 // basis col -> orig rows whose U row may hold it (lazy)
 	prow    []int     // prow[step] = orig row
