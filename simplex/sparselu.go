@@ -8,14 +8,16 @@ import "math"
 // per-step multiplier columns, U upper stored as per-step rows.
 type sparseLU struct {
 	k         int
-	rowPerm   []int32 // step -> kernel-local row
-	colPerm   []int32 // step -> kernel-local col
-	stepOfRow []int32 // kernel-local row -> step
-	lIdx      [][]int32
-	lVal      [][]float64 // L[row, step] multipliers, rows in kernel-local ids
+	rowPerm   []int32   // step -> kernel-local row
+	colPerm   []int32   // step -> kernel-local col
+	stepOfRow []int32   // kernel-local row -> step
+	lFlatIdx  []int32   // flat L: step s multipliers in [lPtr[s],lPtr[s+1])
+	lFlatVal  []float64 // matching L values, kernel-local row ids
+	lPtr      []int32   // step -> start offset into lFlat* (len k+1)
 	uDiag     []float64
-	uIdx      [][]int32 // U[step, step'] entries, step' > step
-	uVal      [][]float64
+	uFlatIdx  []int32 // flat U: step s entries in [uPtr[s],uPtr[s+1])
+	uFlatVal  []float64
+	uPtr      []int32 // step -> start offset into uFlat* (len k+1)
 	work      []float64
 }
 
@@ -88,11 +90,9 @@ func luFactorize(k int, colIdx [][]int32, colVal [][]float64, w *luWS) *sparseLU
 		rowPerm:   make([]int32, k),
 		colPerm:   make([]int32, k),
 		stepOfRow: make([]int32, k),
-		lIdx:      make([][]int32, k),
-		lVal:      make([][]float64, k),
 		uDiag:     make([]float64, k),
-		uIdx:      make([][]int32, k),
-		uVal:      make([][]float64, k),
+		lPtr:      make([]int32, k+1),
+		uPtr:      make([]int32, k+1),
 		work:      make([]float64, k),
 	}
 
@@ -143,13 +143,12 @@ func luFactorize(k int, colIdx [][]int32, colVal [][]float64, w *luWS) *sparseLU
 				touched = append(touched, c)
 			}
 		}
-		uIdx := make([]int32, len(touched))
-		uVal := make([]float64, len(touched))
-		for t, c := range touched {
-			uIdx[t] = c // remapped to steps after the loop
-			uVal[t] = acc[c]
+		lu.lPtr[step] = int32(len(lu.lFlatIdx))
+		lu.uPtr[step] = int32(len(lu.uFlatIdx))
+		for _, c := range touched {
+			lu.uFlatIdx = append(lu.uFlatIdx, c) // remapped to steps below
+			lu.uFlatVal = append(lu.uFlatVal, acc[c])
 		}
-		lu.uIdx[step], lu.uVal[step] = uIdx, uVal
 
 		// eliminate the pivot column from every remaining row
 		for rr := range k {
@@ -167,8 +166,8 @@ func luFactorize(k int, colIdx [][]int32, colVal [][]float64, w *luWS) *sparseLU
 				continue
 			}
 			mult := hit / pv
-			lu.lIdx[step] = append(lu.lIdx[step], int32(rr))
-			lu.lVal[step] = append(lu.lVal[step], mult)
+			lu.lFlatIdx = append(lu.lFlatIdx, int32(rr))
+			lu.lFlatVal = append(lu.lFlatVal, mult)
 
 			// rewrite the row in place: the write index never passes the
 			// read index, and fill-in only appends after the scan
@@ -205,10 +204,10 @@ func luFactorize(k int, colIdx [][]int32, colVal [][]float64, w *luWS) *sparseLU
 			acc[c] = 0
 		}
 	}
-	for s := range k {
-		for t, c := range lu.uIdx[s] {
-			lu.uIdx[s][t] = colPos[c]
-		}
+	lu.lPtr[k] = int32(len(lu.lFlatIdx))
+	lu.uPtr[k] = int32(len(lu.uFlatIdx))
+	for t := range lu.uFlatIdx {
+		lu.uFlatIdx[t] = colPos[lu.uFlatIdx[t]]
 	}
 	return lu
 }
@@ -222,15 +221,15 @@ func (lu *sparseLU) solve(v []float64) {
 		ys := v[lu.rowPerm[s]]
 		y[s] = ys
 		if ys != 0 {
-			for t, rr := range lu.lIdx[s] {
-				v[rr] -= lu.lVal[s][t] * ys
+			for t := lu.lPtr[s]; t < lu.lPtr[s+1]; t++ {
+				v[lu.lFlatIdx[t]] -= lu.lFlatVal[t] * ys
 			}
 		}
 	}
 	for s := k - 1; s >= 0; s-- {
 		x := y[s]
-		for t, cs := range lu.uIdx[s] {
-			x -= lu.uVal[s][t] * y[cs]
+		for t := lu.uPtr[s]; t < lu.uPtr[s+1]; t++ {
+			x -= lu.uFlatVal[t] * y[lu.uFlatIdx[t]]
 		}
 		y[s] = x / lu.uDiag[s]
 	}
@@ -249,16 +248,16 @@ func (lu *sparseLU) solveT(w []float64) {
 		x := w[lu.colPerm[s]] / lu.uDiag[s]
 		y[s] = x
 		if x != 0 {
-			for t, cs := range lu.uIdx[s] {
-				w[lu.colPerm[cs]] -= lu.uVal[s][t] * x
+			for t := lu.uPtr[s]; t < lu.uPtr[s+1]; t++ {
+				w[lu.colPerm[lu.uFlatIdx[t]]] -= lu.uFlatVal[t] * x
 			}
 		}
 	}
 	// L^T backward, gathering from later steps
 	for s := k - 1; s >= 0; s-- {
 		x := y[s]
-		for t, rr := range lu.lIdx[s] {
-			x -= lu.lVal[s][t] * y[lu.stepOfRow[rr]]
+		for t := lu.lPtr[s]; t < lu.lPtr[s+1]; t++ {
+			x -= lu.lFlatVal[t] * y[lu.stepOfRow[lu.lFlatIdx[t]]]
 		}
 		y[s] = x
 	}

@@ -2,9 +2,50 @@ package simplex
 
 import (
 	"encoding/gob"
+	"math/rand"
 	"os"
 	"testing"
 )
+
+// synthKernel builds a random diagonally-dominant sparse k*k kernel as sparse
+// columns; representative of a mid-size refactorized basis block.
+func synthKernel(k int, density float64) ([][]int32, [][]float64) {
+	rng := rand.New(rand.NewSource(7))
+	colIdx := make([][]int32, k)
+	colVal := make([][]float64, k)
+	for c := range k {
+		for r := range k {
+			if r == c {
+				colIdx[c] = append(colIdx[c], int32(r))
+				colVal[c] = append(colVal[c], float64(k))
+			} else if rng.Float64() < density {
+				colIdx[c] = append(colIdx[c], int32(r))
+				colVal[c] = append(colVal[c], rng.NormFloat64())
+			}
+		}
+	}
+	return colIdx, colVal
+}
+
+// BenchmarkLUFactorizeSynth: self-contained factor + solve + solveT on a
+// synthetic kernel; -benchmem tracks the per-factorize allocation count.
+func BenchmarkLUFactorizeSynth(b *testing.B) {
+	const k = 300
+	colIdx, colVal := synthKernel(k, 0.03)
+	w := &luWS{}
+	v := make([]float64, k)
+	for b.Loop() {
+		lu := luFactorize(k, colIdx, colVal, w)
+		if lu == nil {
+			b.Fatal("singular")
+		}
+		for j := range v {
+			v[j] = float64(j%17) - 8
+		}
+		lu.solve(v)
+		lu.solveT(v)
+	}
+}
 
 func loadKernel(b *testing.B) (int, [][]int32, [][]float64) {
 	path := os.Getenv("SOLVER_KERNEL_GOB")
