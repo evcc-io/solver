@@ -22,7 +22,7 @@ import (
 // section: cuts/presolve/threads only affect performance, not the answer.
 var valueOnlyFlags = map[string]bool{
 	"presolve": true, "gomory": true, "knapsack": true, "probing": true,
-	"cuts": true, "threads": true, "strong": true, "timemode": true,
+	"cuts": true, "strong": true, "timemode": true,
 	"printingoptions": true,
 }
 
@@ -56,6 +56,7 @@ func run(args []string) error {
 	var solutionFile, mipsFile string
 	maximize := false
 	lpOnly := false
+	threads := 0
 	// GapAbs 1e-5 = CBC's default cutoff increment (CbcCutoffIncrement):
 	// nodes within 1e-5 of the incumbent are pruned, as real CBC does
 	limits := mip.Limits{GapRel: 1e-9, GapAbs: 1e-5}
@@ -90,6 +91,10 @@ func run(args []string) error {
 		case "allow":
 			if v, err := strconv.ParseFloat(next(), 64); err == nil {
 				limits.GapAbs = v
+			}
+		case "threads":
+			if v, err := strconv.Atoi(next()); err == nil {
+				threads = v
 			}
 		case "maxnodes":
 			if v, err := strconv.Atoi(next()); err == nil {
@@ -138,6 +143,7 @@ func run(args []string) error {
 	} else {
 		model := mip.New(p)
 		model.Limits = limits
+		model.Threads = threads
 		res = model.Solve()
 	}
 

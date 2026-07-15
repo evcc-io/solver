@@ -458,6 +458,19 @@ func (st *State) Clone() *State {
 	return c
 }
 
+// Portable returns a basis-only snapshot without factorization: safe to hand
+// to a structurally identical LP on another goroutine (a factor's solve
+// scratch belongs to the LP that built it). The receiver refactorizes on
+// first use — the same contract as CBC passing CoinWarmStartBasis between
+// threads.
+func (st *State) Portable() *State {
+	return &State{
+		status:  append([]varStat(nil), st.status...),
+		basicOf: append([]int(nil), st.basicOf...),
+		value:   append([]float64(nil), st.value...),
+	}
+}
+
 // WarmSolve resolves from st after bound changes on touched. A touched
 // nonbasic keeps its side when still valid (snap-to-lower mangles the basis).
 func (lp *LP) WarmSolve(st *State, touched []int) (Status, *State, float64) {
@@ -472,6 +485,13 @@ func (lp *LP) PrimalResolve(st *State) Status {
 }
 
 func (lp *LP) warmSolve(st *State, touched []int, preserve bool) (Status, *State, float64) {
+	// a Portable() basis carries no factorization: build one here (falling
+	// back to scratch when the carried basis is singular for this LP)
+	if st.f == nil && st.ft == nil {
+		if !lp.refactorize(st) {
+			return lp.ColdSolve()
+		}
+	}
 	for _, j := range touched {
 		switch {
 		case st.status[j] == basic:

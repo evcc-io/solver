@@ -6,6 +6,7 @@ import (
 	"container/heap"
 	"math"
 	"sort"
+	"sync"
 	"time"
 
 	"fmt"
@@ -86,6 +87,7 @@ type Model struct {
 	P             *problem.Problem
 	LP            *simplex.LP
 	Limits        Limits
+	Threads       int             // parallel tree-search workers; <=1 solves serially
 	MIPStart      []float64       // optional structural start point; ints get fixed
 	SkipProbing   bool            // restart passes re-derive identical probe facts
 	red           *reduction      // singleton elimination; nil when none applied
@@ -106,9 +108,12 @@ type Model struct {
 	subMIP      bool    // this model is a heuristic sub-MIP: no nested sub-solves
 	rinsLastObj float64 // incumbent the last RINS sub-MIP ran against
 
-	// per-column pseudocosts: observed bound gain per unit fraction
+	// per-column pseudocosts: observed bound gain per unit fraction; a
+	// threaded solve shares the arrays across workers, guarded by psMu
+	// (nil for serial solves and sub-MIPs: no locking cost)
 	psUp, psDn   []float64
 	psUpN, psDnN []int
+	psMu         *sync.Mutex
 
 	// continuous-row drop postsolve: keep mask + pre-drop rows for a·x
 	rrKeep []bool
@@ -117,6 +122,10 @@ type Model struct {
 
 // psRecord accumulates one observed branching gain for column j.
 func (m *Model) psRecord(j int, up bool, frac, gain float64) {
+	if m.psMu != nil {
+		m.psMu.Lock()
+		defer m.psMu.Unlock()
+	}
 	if m.psUp == nil {
 		n := len(m.P.Cols)
 		m.psUp, m.psDn = make([]float64, n), make([]float64, n)
@@ -445,60 +454,292 @@ func (m *Model) Solve() Result {
 	}
 
 	mark("cuts+drop done")
-	pq := &nodeHeap{{bound: math.Inf(-1), brCol: -1}}
-	heap.Init(pq)
+	sh := &treeShared{
+		pq:           &nodeHeap{{bound: math.Inf(-1), brCol: -1}},
+		threaded:     m.Threads > 1,
+		deadline:     deadline,
+		bestInternal: math.Inf(1),
+		remaining:    math.Inf(1),
+		rootStatus:   simplex.Optimal,
+	}
+	sh.cond = sync.NewCond(&sh.mu)
+	heap.Init(sh.pq)
+	if haveStart {
+		sh.hasIncumbent = true
+		sh.bestInternal = startObj
+		sh.bestX, sh.bestRowAct, sh.bestRC, sh.bestPrice = startX, startAct, startRC, startPrice
+		m.bestXSnapshot = startX
+	}
 
-	bestInternal := math.Inf(1)
-	var bestX, bestRowAct, bestRC, bestPrice []float64
-	hasIncumbent := false
-	nodeCount := 0
-	rootDone := false
-	rootStatus := simplex.Optimal
-	stopped := false
-	proofLost := false       // an unresolved (IterLimit) node was pruned
-	remaining := math.Inf(1) // best bound among subtrees dropped mid-dive
+	// tree search: one worker per thread over the shared heap (CBC's
+	// opportunistic parallel B&B). Worker 0 is this model; the extra workers
+	// are clones with their own problem copy and LP, sharing the heap, the
+	// incumbent and the pseudocost arrays.
+	workerPivots := int64(0)
+	if sh.threaded {
+		if m.psUp == nil {
+			// preallocate the shared pseudocost arrays so psRecord never
+			// swaps slices mid-search; psMu serializes access
+			n := len(m.P.Cols)
+			m.psUp, m.psDn = make([]float64, n), make([]float64, n)
+			m.psUpN, m.psDnN = make([]int, n), make([]int, n)
+		}
+		m.psMu = &sh.psMu
+		clones := make([]*Model, m.Threads-1)
+		var wg sync.WaitGroup
+		for i := range clones {
+			w := m.workerClone()
+			clones[i] = w
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				w.treeSearch(sh)
+			}()
+		}
+		m.treeSearch(sh)
+		wg.Wait()
+		m.psMu = nil
+		for _, w := range clones {
+			workerPivots += lpPivots(w.LP)
+			m.dbgFW += w.dbgFW
+			m.dbgFP += w.dbgFP
+			m.dbgRINS += w.dbgRINS
+			m.dbgDive += w.dbgDive
+			m.dbgNodeCold += w.dbgNodeCold
+			m.dbgNodePiv += w.dbgNodePiv
+			m.dbgNodeN += w.dbgNodeN
+			m.dbgSBPiv += w.dbgSBPiv
+			m.dbgSBN += w.dbgSBN
+		}
+	} else {
+		m.treeSearch(sh)
+	}
+	pq := sh.pq
+	bestInternal, hasIncumbent := sh.bestInternal, sh.hasIncumbent
+	bestX, bestRowAct, bestRC, bestPrice := sh.bestX, sh.bestRowAct, sh.bestRC, sh.bestPrice
+	nodeCount, stopped, proofLost := sh.nodeCount, sh.stopped, sh.proofLost
+	rootDone, rootStatus, remaining := sh.rootDone, sh.rootStatus, sh.remaining
+	for _, ov := range m.live {
+		m.LP.SetBound(ov.idx, m.P.Cols[ov.idx].LB, m.P.Cols[ov.idx].UB)
+	}
+	m.live = nil
 
-	var rootObj float64 // root LP data for reduced-cost fixing
-	var rootX, rootRC []float64
-	diveTries := 0
+	// the incumbent is proven optimal (within gap) if no unexplored subtree
+	// — on the heap or dropped mid-dive — has a bound that could still beat it
+	if pq.Len() > 0 {
+		remaining = math.Min(remaining, (*pq)[0].bound)
+	}
+	proven := hasIncumbent && !m.improves(remaining, bestInternal)
+	debugf("mip exit: nodes=%d pivots=%d best=%g remaining=%g proven=%v stopped=%v proofLost=%v heap=%d elapsed=%v",
+		nodeCount, m.totalPivots()+workerPivots, bestInternal, remaining, proven, stopped, proofLost, pq.Len(), time.Since(t0).Round(time.Millisecond))
+	debugf("pivot split: facewalk %d, fpump %d, dive %d, rins %d, coldfallbacks %d, node %d/%d, sb %d/%d",
+		m.dbgFW, m.dbgFP, m.dbgDive, m.dbgRINS, m.dbgNodeCold, m.dbgNodePiv, m.dbgNodeN, m.dbgSBPiv, m.dbgSBN)
+
+	res := Result{HasIncumbent: hasIncumbent, NodeCount: nodeCount}
+	switch {
+	case !rootDone && stopped:
+		res.Status = Stopped // out of time before the root was even solved
+	case !rootDone:
+		res.Status = Infeasible
+	case rootStatus == simplex.Unbounded:
+		res.Status = Unbounded
+	case proven:
+		res.Status = Optimal
+	case stopped || proofLost:
+		res.Status = Stopped
+	case hasIncumbent:
+		res.Status = Optimal
+	default:
+		res.Status = Infeasible
+	}
+	if hasIncumbent {
+		res.X = bestX
+		res.RowActivity, res.ReducedCost, res.RowPrice = bestRowAct, bestRC, bestPrice
+		// cut rows are internal: report only the caller's original rows
+		if len(res.RowActivity) > origRows {
+			res.RowActivity = res.RowActivity[:origRows]
+		}
+		if len(res.RowPrice) > origRows {
+			res.RowPrice = res.RowPrice[:origRows]
+		}
+		res.Obj = bestInternal * m.P.ObjSense
+	}
+	if m.red != nil {
+		m.red.expand(&res)
+	}
+	if m.subRed != nil {
+		m.subRed.expand(&res)
+	}
+	if m.rrKeep != nil {
+		expandRows(&res, m.rrKeep, m.rrRows)
+	}
+	return res
+}
+
+// treeShared is the tree-search state one solve shares between its workers;
+// mu guards all of it. With Threads<=1 there is a single worker and every
+// lock is uncontended — the serial search runs through the same code path.
+type treeShared struct {
+	mu   sync.Mutex
+	cond *sync.Cond // wakes idle workers on push / stop / last-worker exit
+	pq   *nodeHeap
+	busy int // workers currently expanding a subtree
+
+	threaded bool
+	deadline time.Time
+
+	bestInternal                         float64
+	bestX, bestRowAct, bestRC, bestPrice []float64
+	hasIncumbent                         bool
+
+	nodeCount          int
+	stopped, proofLost bool
+	remaining          float64 // best bound among subtrees dropped mid-dive
+
+	rootDone      bool
+	rootStatus    simplex.Status
+	rootObj       float64 // root LP data for reduced-cost fixing
+	rootX, rootRC []float64
+
+	diveTries int
+
+	psMu sync.Mutex // guards the pseudocost arrays the workers share
+}
+
+// push queues nd on the shared heap (caller holds sh.mu). Across threads the
+// warm basis travels factorization-free: a factor's solve scratch belongs to
+// the LP that built it, so the receiving worker refactorizes instead (as CBC
+// hands CoinWarmStartBasis between threads).
+func (sh *treeShared) push(nd *node) {
+	if sh.threaded && nd.parentState != nil {
+		nd.parentState = nd.parentState.Portable()
+	}
+	heap.Push(sh.pq, nd)
+	sh.cond.Signal()
+}
+
+// snapshot reads the incumbent for lock-free use during a plunge; a stale
+// (higher) cutoff only prunes less, never wrongly.
+func (sh *treeShared) snapshot() (bool, float64) {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	return sh.hasIncumbent, sh.bestInternal
+}
+
+// tryIncumbent installs a candidate incumbent unless a better one arrived
+// meanwhile, then re-fixes columns on this worker's LP against the tighter
+// cutoff (CBC re-fixes on every improvement).
+func (m *Model) tryIncumbent(sh *treeShared, obj float64, x, rowAct, rc, price []float64) bool {
+	sh.mu.Lock()
+	if sh.hasIncumbent && !m.improves(obj, sh.bestInternal) {
+		sh.mu.Unlock()
+		return false
+	}
+	sh.bestInternal = obj
+	sh.bestX, sh.bestRowAct, sh.bestRC, sh.bestPrice = x, rowAct, rc, price
+	sh.hasIncumbent = true
+	rootX, rootRC, rootObj := sh.rootX, sh.rootRC, sh.rootObj
+	sh.mu.Unlock()
+	m.bestXSnapshot = x
+	if rootX != nil {
+		m.reducedCostFix(rootX, rootRC, rootObj, obj)
+	}
+	return true
+}
+
+// workerClone builds an independent tree-search worker: its own problem copy
+// (reduced-cost fixing mutates column bounds) and its own LP, sharing the
+// read-only MIPStart and the psMu-guarded pseudocost arrays with the parent.
+func (m *Model) workerClone() *Model {
+	w := &Model{
+		P:           cloneProblem(m.P),
+		Limits:      m.Limits,
+		MIPStart:    m.MIPStart,
+		subMIP:      m.subMIP,
+		rinsLastObj: m.rinsLastObj,
+		psUp:        m.psUp,
+		psDn:        m.psDn,
+		psUpN:       m.psUpN,
+		psDnN:       m.psDnN,
+		psMu:        m.psMu,
+	}
+	w.LP = simplex.Build(w.P)
+	w.LP.SuspendDSE(true)
+	w.LP.Deadline = m.LP.Deadline
+	return w
+}
+
+// treeSearch runs one worker's best-first + plunge loop over the shared tree
+// until it is exhausted or the search stops. In-tree cut generation stays
+// serial-only: local cut rows append to this worker's problem and would be
+// dangling row indices for every other worker.
+func (m *Model) treeSearch(sh *treeShared) {
+	deadline := sh.deadline
 	lastTreeCut, treeCutRounds := 0, 0
 	pendCutActs, pendCutBase, localCutFails := 0, 0, 0
 	var pendCutNode *node
 	pendCutPre := 0.0
 	rinsFails := 0
-	newIncumbent := func(obj float64, x, rowAct, rc, price []float64) {
-		bestInternal = obj
-		bestX, bestRowAct, bestRC, bestPrice = x, rowAct, rc, price
-		m.bestXSnapshot = x
-		hasIncumbent = true
-		// re-fix on every improvement: tighter cutoffs fix more columns
-		if rootX != nil {
-			m.reducedCostFix(rootX, rootRC, rootObj, bestInternal)
-		}
-	}
+	fixedAt := math.Inf(1) // cutoff this worker last reduced-cost-fixed at
 
-	if haveStart {
-		newIncumbent(startObj, startX, startAct, startRC, startPrice)
-	}
-
-	for pq.Len() > 0 {
-		if m.Limits.MaxNodes > 0 && nodeCount >= m.Limits.MaxNodes {
-			stopped = true
-			break
+	for {
+		var nd *node
+		sh.mu.Lock()
+		for nd == nil {
+			if sh.stopped {
+				sh.mu.Unlock()
+				return
+			}
+			if sh.pq.Len() > 0 {
+				if m.Limits.MaxNodes > 0 && sh.nodeCount >= m.Limits.MaxNodes {
+					sh.stopped = true
+					sh.cond.Broadcast()
+					sh.mu.Unlock()
+					return
+				}
+				nd = heap.Pop(sh.pq).(*node)
+				if sh.hasIncumbent && !m.improves(nd.bound, sh.bestInternal) {
+					nd = nil // pruned by bound: take the next node
+				}
+				continue
+			}
+			if sh.busy == 0 {
+				sh.mu.Unlock()
+				return
+			}
+			sh.cond.Wait()
 		}
-		nd := heap.Pop(pq).(*node)
-		if hasIncumbent && !m.improves(nd.bound, bestInternal) {
-			continue
-		}
+		sh.busy++
+		sh.mu.Unlock()
 
 		// plunge: dive depth-first, keeping the rounding-nearer child.
 		// backtrack is the current level's untried sibling (try before giving up).
 		var backtrack *node
 		for nd != nil {
+			sh.mu.Lock()
+			stop := sh.stopped
+			hasInc, best := sh.hasIncumbent, sh.bestInternal
+			rootX, rootRC, rootObj := sh.rootX, sh.rootRC, sh.rootObj
+			if hasInc {
+				m.bestXSnapshot = sh.bestX
+			}
+			sh.mu.Unlock()
 			if !deadline.IsZero() && time.Now().After(deadline) {
-				stopped = true
-				remaining = math.Min(remaining, nd.bound)
+				stop = true
+			}
+			if stop {
+				sh.mu.Lock()
+				sh.stopped = true
+				sh.remaining = math.Min(sh.remaining, nd.bound)
+				sh.cond.Broadcast()
+				sh.mu.Unlock()
 				break
+			}
+			// another worker tightened the incumbent: fix columns on this
+			// worker's LP too before solving under looser bounds
+			if hasInc && rootX != nil && best < fixedAt {
+				m.reducedCostFix(rootX, rootRC, rootObj, best)
+				fixedAt = best
 			}
 			// DSE only for deep node re-solves; root stays canonical so the
 			// incumbent heuristics find their target (CBC solves those separately)
@@ -508,24 +749,31 @@ func (m *Model) Solve() Result {
 			m.dbgNodePiv += m.totalPivots() - ndBase
 			m.dbgNodeN++
 			m.LP.SuspendDSE(true)
-			nodeCount++
-			if !rootDone {
-				rootDone = true
-				rootStatus = status
+			sh.mu.Lock()
+			sh.nodeCount++
+			myCount := sh.nodeCount
+			if !sh.rootDone {
+				sh.rootDone = true
+				sh.rootStatus = status
 				if status == simplex.Optimal {
-					rootObj, rootX, rootRC = obj, x, rc
+					sh.rootObj, sh.rootX, sh.rootRC = obj, x, rc
 				}
 			}
+			hasInc, best = sh.hasIncumbent, sh.bestInternal
+			sh.mu.Unlock()
 			if status != simplex.Optimal {
 				// an IterLimit node stays unresolved: prune it and search on,
 				// but optimality can no longer be proven.
 				if status == simplex.IterLimit {
+					sh.mu.Lock()
 					if !deadline.IsZero() && time.Now().After(deadline) {
-						stopped = true
+						sh.stopped = true
+						sh.cond.Broadcast()
 					} else {
-						proofLost = true
+						sh.proofLost = true
 					}
-					remaining = math.Min(remaining, nd.bound)
+					sh.remaining = math.Min(sh.remaining, nd.bound)
+					sh.mu.Unlock()
 					break
 				}
 				nd, backtrack = backtrack, nil
@@ -534,13 +782,15 @@ func (m *Model) Solve() Result {
 			if nd.brCol >= 0 {
 				m.psRecord(nd.brCol, nd.brUp, nd.brFrac, obj-nd.bound)
 			}
-			if hasIncumbent && !m.improves(obj, bestInternal) {
+			if hasInc && !m.improves(obj, best) {
 				nd, backtrack = backtrack, nil
 				continue
 			}
 			// this level solved: the previous level's sibling goes to the heap
 			if backtrack != nil {
-				heap.Push(pq, backtrack)
+				sh.mu.Lock()
+				sh.push(backtrack)
+				sh.mu.Unlock()
 				backtrack = nil
 			}
 
@@ -562,7 +812,7 @@ func (m *Model) Solve() Result {
 					m.LP.Deadline = deadline
 					m.live = nil
 					nd.overrides = nd.overrides[:len(nd.overrides)-nActs]
-					for _, h := range *pq {
+					for _, h := range *sh.pq {
 						h.parentState = nil
 					}
 					nd.parentState = nil
@@ -594,8 +844,10 @@ func (m *Model) Solve() Result {
 			// for propagation/heuristics) and activated for this subtree via
 			// bound overrides on their logical variables, which children
 			// inherit; the CGL families (globally valid) join the same batch.
-			if cglEnabled && treeCutRounds < 8 && nodeCount-lastTreeCut >= 256 {
-				lastTreeCut = nodeCount
+			// Threaded solves skip this: the appended rows exist only in this
+			// worker's problem copy.
+			if cglEnabled && !sh.threaded && treeCutRounds < 8 && myCount-lastTreeCut >= 256 {
+				lastTreeCut = myCount
 				nGlob := m.knapsackCoverCuts(x) + m.cliqueCuts(x) + m.zeroHalfCuts(x) +
 					m.flowCoverCuts(x) + m.liftProjectCuts(x)
 				locBase := len(m.P.Rows)
@@ -621,13 +873,13 @@ func (m *Model) Solve() Result {
 						r.Sense, r.HasRange = problem.NR, false
 						acts = append(acts, boundOverride{len(m.P.Cols) + ri, rlb, rub})
 					}
-					debugf("treecuts: +%d local gmi, +%d global rows at node %d (round %d)", nLoc, nGlob, nodeCount, treeCutRounds)
+					debugf("treecuts: +%d local gmi, +%d global rows at node %d (round %d)", nLoc, nGlob, myCount, treeCutRounds)
 					stats := m.LP.Stats
 					m.rebuildLP()
 					m.LP.Stats = stats
 					m.LP.Deadline = deadline
 					m.live = nil
-					for _, h := range *pq {
+					for _, h := range *sh.pq {
 						h.parentState = nil
 					}
 					nd.parentState = nil
@@ -644,17 +896,19 @@ func (m *Model) Solve() Result {
 			}
 			branchCol, sosIdx, sosSplit := m.findBranch(x)
 			if branchCol < 0 && sosIdx < 0 {
-				newIncumbent(obj, x, rowAct, rc, price)
+				if m.tryIncumbent(sh, obj, x, rowAct, rc, price) {
+					fixedAt = obj
+				}
 				break
 			}
 			// CBC reliability branching at every depth: it self-limits by
 			// only probing columns whose pseudocosts aren't yet trusted.
 			if branchCol >= 0 {
 				sbCut := math.Inf(1)
-				if hasIncumbent {
-					sbCut = bestInternal
+				if hasInc {
+					sbCut = best
 				}
-				sb, fixed := m.chooseBranch(nd, x, endState, obj, sbCut, hasIncumbent)
+				sb, fixed := m.chooseBranch(nd, x, endState, obj, sbCut, hasInc)
 				if len(fixed) > 0 {
 					// probes fathomed sides: fix here and re-solve the
 					// node with the survivors forced (no branch spent)
@@ -705,28 +959,40 @@ func (m *Model) Solve() Result {
 			}
 			// no incumbent yet: caller's MIP start first, then heuristics
 			// (children above already captured their bounds)
-			if !hasIncumbent && nodeCount == 1 && len(m.MIPStart) == len(m.P.Cols) {
+			if !hasInc && myCount == 1 && len(m.MIPStart) == len(m.P.Cols) {
 				if hObj, hx, hAct, hRC, hPrice, ok := m.completePoint(nd, m.MIPStart, endState); ok {
 					debugf("mipstart: accepted obj=%g", hObj)
-					newIncumbent(hObj, hx, hAct, hRC, hPrice)
+					if m.tryIncumbent(sh, hObj, hx, hAct, hRC, hPrice) {
+						fixedAt = hObj
+					}
 				} else {
 					debugf("mipstart: rejected")
 				}
+				hasInc, best = sh.snapshot()
 			}
-			closeGap := hasIncumbent && bestInternal-obj < 0.1*math.Max(1, math.Abs(bestInternal))
+			closeGap := hasInc && best-obj < 0.1*math.Max(1, math.Abs(best))
 			// gap-scheduled diving (CBC runs heuristics only while the gap is
 			// open): once the incumbent is within 10% of the node bound, a dive
 			// burst almost never improves it — on 020 the lone mid-tree burst was
 			// barren and cost ~26k pivots. Root still runs (no incumbent yet)
-			if diveTries < 8 && branchCol >= 0 && !closeGap && (nodeCount == 1 || nodeCount%256 == 0) {
-				diveTries++
+			doDive := branchCol >= 0 && !closeGap && (myCount == 1 || myCount%256 == 0)
+			if doDive {
+				sh.mu.Lock()
+				if sh.diveTries < 8 {
+					sh.diveTries++
+				} else {
+					doDive = false
+				}
+				sh.mu.Unlock()
+			}
+			if doDive {
 				// box the heuristic burst: dives must never eat the tree's time.
 				// The root burst gets more — success there ends the whole solve
 				savedDL := m.LP.Deadline
 				burstDL := savedDL
 				if m.Limits.MaxTime > 0 {
 					div := time.Duration(8)
-					if nodeCount == 1 {
+					if myCount == 1 {
 						div = 3
 					}
 					if hb := time.Now().Add(m.Limits.MaxTime / div); savedDL.IsZero() || hb.Before(savedDL) {
@@ -739,8 +1005,8 @@ func (m *Model) Solve() Result {
 				// degenerate cycle and returns IterLimit = heuristic failure
 				m.LP.SetIterCap(2*m.LP.NumRows() + 200)
 				cutoff := math.Inf(1)
-				if hasIncumbent {
-					cutoff = bestInternal
+				if hasInc {
+					cutoff = best
 				}
 				var hObj float64
 				var hx, hAct, hRC, hPrice []float64
@@ -752,7 +1018,7 @@ func (m *Model) Solve() Result {
 				}
 				// pump FIRST at the root with its own sub-budget so faceWalk
 				// can't starve it (CBC runs the feasibility pump first).
-				if nodeCount == 1 {
+				if myCount == 1 {
 					if m.Limits.MaxTime > 0 {
 						if pd := time.Now().Add(m.Limits.MaxTime / 6); pd.Before(burstDL) {
 							m.LP.Deadline = pd
@@ -784,28 +1050,31 @@ func (m *Model) Solve() Result {
 				}
 				m.LP.SetIterCap(0)
 				m.LP.Deadline = savedDL
-				if ok && (!hasIncumbent || m.improves(hObj, bestInternal)) {
-					debugf("dive: incumbent %g -> %g", bestInternal, hObj)
-					newIncumbent(hObj, hx, hAct, hRC, hPrice)
+				if ok && m.tryIncumbent(sh, hObj, hx, hAct, hRC, hPrice) {
+					debugf("dive: incumbent %g -> %g", best, hObj)
+					fixedAt = hObj
 				}
+				hasInc, best = sh.snapshot()
 			}
 			// RINS-lite: fix integers where incumbent and node LP agree,
 			// LP-complete the rest; accept only strict improvements.
 			// Failures back the frequency off (CBC adaptive frequency)
 			// CBC runs RINS only against a NEW incumbent: the neighborhood is
 			// a function of (incumbent, LP) and repeats are mostly redundant
-			if hasIncumbent && nodeCount%(64<<min(rinsFails, 3)) == 0 && bestInternal != m.rinsLastObj {
-				m.rinsLastObj = bestInternal
+			if hasInc && myCount%(64<<min(rinsFails, 3)) == 0 && best != m.rinsLastObj {
+				m.rinsLastObj = best
 				rnBase := m.totalPivots()
 				m.LP.SetIterCap(2*m.LP.NumRows() + 200)
-				if hObj, hx, hAct, hRC, hPrice, ok := m.rinsImprove(nd, x, endState); ok && m.improves(hObj, bestInternal) {
+				if hObj, hx, hAct, hRC, hPrice, ok := m.rinsImprove(nd, x, endState); ok && m.improves(hObj, best) {
 					rinsFails = 0
-					debugf("rins: improved %g -> %g", bestInternal, hObj)
+					debugf("rins: improved %g -> %g", best, hObj)
 					if pObj, px, pAct, pRC, pPrice, better := m.polishIncumbent(nd, hObj, hx, deadline); better {
 						debugf("polish: rins %g -> %g", hObj, pObj)
 						hObj, hx, hAct, hRC, hPrice = pObj, px, pAct, pRC, pPrice
 					}
-					newIncumbent(hObj, hx, hAct, hRC, hPrice)
+					if m.tryIncumbent(sh, hObj, hx, hAct, hRC, hPrice) {
+						fixedAt = hObj
+					}
 				} else {
 					rinsFails++
 				}
@@ -814,68 +1083,20 @@ func (m *Model) Solve() Result {
 			}
 			nd, backtrack = near, far
 		}
+		sh.mu.Lock()
 		if backtrack != nil {
-			heap.Push(pq, backtrack)
+			sh.push(backtrack)
 		}
+		sh.busy--
+		if sh.busy == 0 {
+			sh.cond.Broadcast()
+		}
+		stopped := sh.stopped
+		sh.mu.Unlock()
 		if stopped {
-			break
+			return
 		}
 	}
-	for _, ov := range m.live {
-		m.LP.SetBound(ov.idx, m.P.Cols[ov.idx].LB, m.P.Cols[ov.idx].UB)
-	}
-	m.live = nil
-
-	// the incumbent is proven optimal (within gap) if no unexplored subtree
-	// — on the heap or dropped mid-dive — has a bound that could still beat it
-	if pq.Len() > 0 {
-		remaining = math.Min(remaining, (*pq)[0].bound)
-	}
-	proven := hasIncumbent && !m.improves(remaining, bestInternal)
-	debugf("mip exit: nodes=%d pivots=%d best=%g remaining=%g proven=%v stopped=%v proofLost=%v heap=%d elapsed=%v",
-		nodeCount, m.totalPivots(), bestInternal, remaining, proven, stopped, proofLost, pq.Len(), time.Since(t0).Round(time.Millisecond))
-	debugf("pivot split: facewalk %d, fpump %d, dive %d, rins %d, coldfallbacks %d, node %d/%d, sb %d/%d",
-		m.dbgFW, m.dbgFP, m.dbgDive, m.dbgRINS, m.dbgNodeCold, m.dbgNodePiv, m.dbgNodeN, m.dbgSBPiv, m.dbgSBN)
-
-	res := Result{HasIncumbent: hasIncumbent, NodeCount: nodeCount}
-	switch {
-	case !rootDone && stopped:
-		res.Status = Stopped // out of time before the root was even solved
-	case !rootDone:
-		res.Status = Infeasible
-	case rootStatus == simplex.Unbounded:
-		res.Status = Unbounded
-	case proven:
-		res.Status = Optimal
-	case stopped || proofLost:
-		res.Status = Stopped
-	case hasIncumbent:
-		res.Status = Optimal
-	default:
-		res.Status = Infeasible
-	}
-	if hasIncumbent {
-		res.X = bestX
-		res.RowActivity, res.ReducedCost, res.RowPrice = bestRowAct, bestRC, bestPrice
-		// cut rows are internal: report only the caller's original rows
-		if len(res.RowActivity) > origRows {
-			res.RowActivity = res.RowActivity[:origRows]
-		}
-		if len(res.RowPrice) > origRows {
-			res.RowPrice = res.RowPrice[:origRows]
-		}
-		res.Obj = bestInternal * m.P.ObjSense
-	}
-	if m.red != nil {
-		m.red.expand(&res)
-	}
-	if m.subRed != nil {
-		m.subRed.expand(&res)
-	}
-	if m.rrKeep != nil {
-		expandRows(&res, m.rrKeep, m.rrRows)
-	}
-	return res
 }
 
 // baseBound returns an override target's un-overridden bounds: column bounds
@@ -1598,6 +1819,10 @@ const (
 // frac, and its observation counts. Unseen directions fall back to |obj| —
 // CBC's initial dynamic pseudocost (costValue).
 func (m *Model) psEstimate(j int, frac float64) (estUp, estDn float64, upN, dnN int) {
+	if m.psMu != nil {
+		m.psMu.Lock()
+		defer m.psMu.Unlock()
+	}
 	if m.psUpN != nil {
 		upN, dnN = m.psUpN[j], m.psDnN[j]
 	}

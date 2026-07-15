@@ -77,6 +77,14 @@ It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
   node bound propagation, reduced-cost fixing per incumbent, SOS1/2, one
   restart inheriting cuts/fixings/probes; periodic in-tree rounds of the
   globally-valid cut families with cold-restarted open nodes.
+- **Threads** (`-threads N`, CBC's opportunistic parallel B&B): N workers over
+  a shared node heap/incumbent/pseudocosts, each with its own problem copy and
+  LP; warm bases cross threads factorization-free (as CBC's CoinWarmStartBasis)
+  and the receiver refactorizes. Serial (`N<=1`) runs the same code path
+  bit-identically. Tree-heavy instances scale near-linearly (8.4x at 8
+  threads on a 90x30 multi-knapsack); dive-dominated trees gain what CBC
+  gains (020: 1.3x at 4 threads vs CBC's 1.25x). In-tree cuts stay
+  serial-only.
 - **Branching**: CBC reliability branching (pseudocosts, `numberBeforeTrust`=10,
   capped strong-branch probes, `maxStrong`=5, CBC score) + strong-branch fixing.
 - **Heuristics** (reduced-sub-problem first, as CBC's mini branch and bound):
