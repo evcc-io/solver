@@ -42,120 +42,173 @@ The PuLP suite needs `python3` (and network on first run):
 `RUN_PULP_TESTS=1 go test ./test/...` or `./scripts/run-pulp-tests.sh`.
 It fails on any failure not listed in `testdata/pulp_known_failures.txt`.
 
-## Implemented (CBC/Clp features and capabilities)
+## Implemented (CBC/Clp features)
 
-- **Formats**: free-format MPS (incl. `RANGES`, `SOS`, `MARKER` blocks),
-  PuLP's CPLEX-style `.lp` quirks, CBC's exact `.sol` status/data lines
-  (verified against PuLP's parser and CBC's `CbcSolver.cpp` output code).
-- **LP**: bounded-variable primal simplex with composite Phase 1; dual
-  simplex for warm re-solves after bound changes — sparse pivot row via
-  a row-wise mirror of A, incrementally maintained duals with lazily
-  materialized reduced costs, long-step bound flips, and a short tabu
-  on just-fixed rows (on degenerate cut faces 95% of dual pivots were
-  re-fixes of the last three rows; the tabu breaks the ping-pong);
-  wall-clock deadline checked inside the pivot loop. Warm starts keep each touched
-  nonbasic on its current bound side (Clp semantics) instead of
-  re-snapping to the lower bound. A second, fuller dual engine
-  (`simplex/dual2.go`: dual steepest edge, Harris two-pass ratio test,
-  status-favoring cost perturbation, run to optimality) is
-  property-tested but gated off behind `CBC_DUAL2=1`: measured on the
-  target instances it trades the tuned root trajectory for no bound
-  gain.
-- **Basis factorization**: singleton triangularization with a sparse-LU
-  kernel (in-place row elimination, counted arenas — allocation-free on
-  the hot path) and product-form (eta) updates — O(nnz) pivots, periodic
-  refactorization. No dense inverse. Per-factor data is int32-compacted
-  and arena-consolidated, and all solve scratch is shared per LP, so a
-  refactorization costs a handful of allocations instead of a dozen.
-- **Presolve**: activity-based bound tightening run to fixpoint via a
-  row worklist, big-M coefficient tightening for binaries,
-  CglProbing-style binary probing (infeasibility fixing plus
-  integer-only merged implied bounds), and singleton-column elimination
-  (costed continuous singletons that pin their row or sit at a bound
-  are substituted out and reconstructed exactly at postsolve).
-- **Cuts**: Gomory mixed-integer cuts at the root, with support/dynamism
-  hygiene, and retraction (with retries) of batches that degrade the LP
-  numerically; rounds are budgeted in pivots (speed-invariant work
-  units), so the cut set is a deterministic function of the problem and
-  survives engine speed changes — wall clock only remains as a safety
-  cap; probing implication cuts
-  (CglProbing as a cut generator) on large instances, with slackened
-  implied bounds so propagation drift can never cut off the optimum;
-  TwoMIR-lite cuts (sparse pairwise tableau-row aggregations through the
-  MIR derivation) on large instances; single-row MIR cuts
-  (CglMixedIntegerRounding2-style, VUB/bound substitution with a divisor
-  search) seed the first two rounds on large instances — later MIR
-  rounds are measured-negative (row bloat, face drift); slack cuts are
-  dropped before the
-  tree so only root-active rows ride into node re-solves.
-- **Branch and bound**: best-first with depth-first plunging, warm-started
-  child bases, node-level bound propagation on branching, monotone bound
-  propagation, bound-based optimality proof at exit, reduced-cost fixing
-  re-run on every improving incumbent, SOS1/SOS2 via Beale–Tomlin
-  splitting; a failed pass restarts once on the same model, inheriting
-  cuts, fixings and probe facts.
-- **Branching**: CBC reliability branching — a column whose pseudocost
-  isn't yet trusted (fewer than `numberBeforeTrust`=10 observed gains
-  either way) is strong-branched with cheap capped dual probes to seed
-  it; trusted columns are scored straight from their pseudocost. The
-  branch variable is the best CBC score (max-weighted blend before an
-  incumbent, product rule after). Untrusted columns float to the top so
-  the per-node strong-branch budget (`maxStrong`=5) is spent where the
-  pseudocosts are least reliable — so it runs at every depth yet
-  self-limits once columns are seeded. CBC-style strong-branch fixing: a
-  probe side that is infeasible or cannot beat the incumbent fixes the
-  variable at the node without spending a branch.
-- **Heuristics**: caller-provided MIP start (`mip.Model.MIPStart`,
-  completed via a warm child solve before the cut loop so reduced-cost
-  fixing bites; the trivial start is deliberately not polished — measured
-  as pure pivot burn), 1-opt incumbent polish on real tree incumbents
-  (CbcHeuristicLocal-style binary flips via warm dual re-solves), face walk (least-degradation dive along the LP-optimal
-  face — proves optimality outright on degenerate alternate-optima
-  instances), RENS, feasibility pump, batch rounding dive, RINS-lite
-  warm-started from the node's own basis, with exponential failure
-  backoff; heuristic bursts are time-boxed
-  (root MaxTime/3, deeper MaxTime/8) and skipped once the incumbent
-  sits near the node bound, so the tree keeps its budget.
-- **Anti-degeneracy**: EXPAND (Gill et al.) on the primal ratio test —
-  expanding working bounds with a guaranteed minimum step, exact
-  snap-back at refactorization and a cleanup re-price before concluding;
-  full Bland's rule (entering and leaving) after a degenerate streak;
-  Clp-style bound perturbation in cold solves with clean-bound restore.
-- **CLI**: honors the flags PuLP sends (`-max`, `-sec`, `-ratio`,
-  `-allow`, `-maxNodes`, `-solve`, `-initialSolve`, `-solution`);
-  unrecognized flags are consumed tolerantly.
+- **Formats**: free-format MPS (`RANGES`/`SOS`/`MARKER`), PuLP's CPLEX `.lp`
+  quirks, CBC's exact `.sol` status/data lines.
+- **LP**: bounded-variable primal simplex (composite Phase 1) + dual simplex
+  for warm re-solves (row-wise pivot row, incremental duals, long-step bound
+  flips, just-fixed-row tabu, in-loop deadline). A fuller DSE dual
+  (`simplex/dual2.go`: steepest edge, Harris ratio test, perturbation) drives
+  deep node re-solves.
+- **Scaling** (on by default, as Clp; `CBC_SCALE=0` disables): Clp geometric
+  row/column scaling, source-matched to `ClpPackedMatrix::scale` / `ClpSimplex`
+  — internal to the LP, with bounds/solution/duals/tableau unscaled at the
+  boundary. Like Clp, a well-conditioned matrix is left unscaled
+  (byte-identical); it bites on ill-conditioned models like the evcc big-M
+  cases (see [Benchmarks](#benchmarks-evcc-golden-cases-apple-m4)).
+- **Factorization**: singleton triangularization + sparse-LU kernel,
+  product-form (eta) updates, periodic refactorize; no dense inverse;
+  int32-compacted arenas, per-LP scratch. True Forrest-Tomlin (`simplex/ft.go`,
+  `CBC_FT=1`): row-spike update, O(nnz) R-file, per-pivot parity with the eta
+  path on the large cases; off by default (see below).
+- **Presolve**: activity-based bound tightening to fixpoint, big-M binary
+  coefficient tightening, multi-pass CglProbing binary probing with
+  probing-propagated coefficient strengthening (CBC's Cgl0003I "strengthened
+  rows": one-sided big-M rows tighten against each probe side's implied
+  activity), fixed-column (LB==UB) elimination, implied-free equality-chain
+  substitution (CglPreProcess doubletons, `CBC_SUBST=0` disables) and
+  singleton-column elimination — all with exact primal/dual postsolve.
+- **Cuts**: root Gomory (GMI) with hygiene + numeric retraction, CglProbing
+  implication cuts, knapsack cover, clique, zero-half, flow cover, c-MIR
+  (Marchand-Wolsey), TwoMIR-lite and single-row MIR on large instances;
+  pivot-budgeted rounds; slack cuts dropped before the tree.
+- **Branch & bound**: best-first + depth-first plunging, warm child bases,
+  node bound propagation, reduced-cost fixing per incumbent, SOS1/2, one
+  restart inheriting cuts/fixings/probes; periodic in-tree rounds of the
+  globally-valid cut families with cold-restarted open nodes.
+- **Branching**: CBC reliability branching (pseudocosts, `numberBeforeTrust`=10,
+  capped strong-branch probes, `maxStrong`=5, CBC score) + strong-branch fixing.
+- **Heuristics** (reduced-sub-problem first, as CBC's mini branch and bound):
+  RENS — integral-fix + single-shot rounding + node-capped sub-MIP on the
+  integral-fixed neighborhood — leads each burst, faceWalk is the fallback;
+  RINS as a node-capped sub-MIP on the agree-fixed neighborhood
+  (CbcHeuristicRINS), run per new incumbent; MIP-start completion,
+  pivot-budgeted 1-opt polish and feasibility pump, rounding dive;
+  time-boxed, pivot-capped bursts.
+- **Anti-degeneracy**: EXPAND ratio test, full Bland's after a degenerate
+  streak, Clp bound perturbation in cold solves.
+- **CLI**: PuLP's flags (`-max`/`-sec`/`-ratio`/`-allow`/`-maxNodes`/`-solve`/
+  `-initialSolve`/`-solution`); unknown flags tolerated.
 
 ## Missing vs. real CBC
 
-- **Cut families beyond GMI, probing, single-row MIR and pairwise
-  TwoMIR**: no knapsack cover, clique, flow-cover, or lift-and-project
-  cuts; no cuts below the root. A sound multi-row c-MIR generator (equality-chain
-  aggregation with exact variable-bound substitution, property-tested)
-  exists in `mip/cmir.go` but stays unwired: measured on the target
-  instances it separates nothing that GMI + probing have not already
-  found.
-- **Simpler dual pricing than Clp**: the production dual picks the most
-  violated row (plus the revisit tabu) instead of dual steepest edge,
-  and runs unperturbed. The Clp-style engine (DSE, Harris ratio test,
-  cost perturbation — `simplex/dual2.go`) is property-tested but gated
-  off as measured-negative on the target instances. BTRAN is hypersparse
-  (activation-graph guarded, bitwise-identical to the dense path) for
-  mostly-zero right-hand sides and FTRAN skips zero pivots naturally,
-  but there is no Clp-style hypersparse bookkeeping across the eta file
-  (measured ~20% result density bounds the further payoff).
-- **Partial CglPreProcess-style reductions**: singleton columns are
-  eliminated, but rows never are, and the evcc instances' singletons are
-  penalty slacks (cost fights the row — a `max(0, ·)` term no linear
-  presolve can remove), so node LPs stay large on them (real CBC works
-  on a ~4x smaller reduced model via row aggregation).
-- **`-mips <file>` warm start is parsed but not wired** to
-  `Model.MIPStart`, so `warmStart=True` in PuLP buys nothing yet.
-- **No multi-threaded search.** `-threads N` is accepted, ignored.
-- **Format gaps**: free-format MPS only; no `OBJSENSE` section (sense
-  comes from `-max`, as PuLP conveys it); the negative-`UP`-bound MPS
-  convention is not implemented. PuLP never exercises any of these.
-- **Two failing PuLP tests**: `test_measuring_solving_time` (a
-  ~16,500-variable bin-packing instance must find an incumbent within 10s)
-  and `test_infeasible` (expects the specific variable values real CBC's
-  pivoting lands on for a degenerate infeasible LP — reproducing them would
-  mean cloning CBC's tie-breaking, not fixing a correctness bug).
+- **Forrest-Tomlin gated off** (`CBC_FT=1`): the only gated feature not on by
+  default. Its old 2–79× regression was a Bartels-Golub-style trailing-block
+  update growing the R-file by Θ(m−p) ops per pivot; rewritten as true FT
+  (single sparse row-spike elimination, O(nnz(row)) R-ops) it reaches per-pivot
+  parity with the eta path (021: 50µs vs 52µs), but whole-solve still tends to
+  land in larger node basins on the golden suite. Scaling, the extra cut
+  families (`CBC_CGL`) and the DSE dual (`CBC_DUAL2`) are all on by default
+  and pass the golden suite.
+- **DSE dual is ~4× CBC wall** on the hardest case (pivot counts already 4–33×
+  down toward CBC's).
+- **Node-local in-tree cuts implemented but gated** (`CBC_LOCALCUTS=1`): GMI
+  cuts from a node's basis are stored as free rows (vacuous globally) and
+  activated per subtree via bound overrides on their logical variables — the
+  full local lifecycle without LP row add/remove — with CBC-style
+  effectiveness pruning (a batch that doesn't lift the node bound is
+  retracted; kept batches drop non-binding cuts; two failures disable local
+  cuts for the model). With pruning it proves 020 (57s, 1.1k nodes — was a
+  timeout unpruned) but still loses to the 16s default, so it stays opt-in.
+- **Per-solve pivot caps**: heuristic windows cap every LP at 2m+200 pivots
+  (`SetIterCap`, honored by the primal loop and the DSE dual) — CBC's
+  hot-start/heuristic iteration caps. This is what made fixed-column
+  elimination shippable: single degenerate LP grinds (018: 192k pivots in
+  one pump projection) now fail fast instead of eating the budget.
+- **Strong-branch probe cost is at CBC's *share*, not CBC's *wall***: real
+  CBC 2.10.3 on 020 runs 2032 probes / 55k hot-start iterations (27/probe,
+  56% of all its simplex work); cbcgo runs 1022 probes / 82k pivots
+  (80/probe, 50% of total) — the probe *economics* match, the absolute gap
+  is per-pivot engine constants. Every CBC hot-start mechanism was built and
+  measured on 020: DSE/perturbed probe duals (+0.7s), probe stall-exit
+  (weak pseudocost seeds, tree 774→1567 nodes), higher probe caps (pure
+  degenerate grind), pre-probe refactorize (neutral), and Clp's crunch —
+  which ships opt-in (`CBC_CRUNCH=1`): probes solve a row-subset LP with
+  provably-redundant rows dropped (~24% of 020's rows, bounds exactly equal;
+  021 probe pivots 128→28), but the changed probe roundoff re-rolls 020's
+  tree lottery (one refactorize interval loses its proof), so defaults stay
+  byte-identical. Probes also skip solution extraction (312MB of the 020
+  alloc profile was probe-side arrays nobody read).
+- **Gap-scheduled diving** (CBC runs heuristics only while the gap is open):
+  cbcgo used to burst diving heuristics at every 256th node unconditionally.
+  On 020 the lone mid-tree burst fired with the incumbent already within 0.02
+  of the optimum, found nothing, and cost ~26k pivots down the full
+  rens→faceWalk→fpump→dive chain. Gating the burst on the open-gap condition
+  skips it: 020 208k→183k pivots, 12.9→10.9s, **tree identical** (774 nodes),
+  robustness 5/5.
+- **Presolve reduction gap is CoinPresolve column elimination, not
+  doubletons.** A structural census of the golden models finds **0 duplicate
+  rows, 0 duplicate columns, 0 equality doubletons** (every equality row has
+  3+ nonzeros; the abundant 2-term rows are all inequalities) — matching real
+  CBC, which prints 0 substitutions. Yet CBC reduces 020 to 1375 rows / 1399
+  cols where cbcgo reaches 2032 / 2421. The ~1000-column gap is 260 free
+  columns + 721 continuous singletons (the `rowBlocks&&colBlocks` case).
+  Free-column removal ships opt-in (`CBC_FREECOL=1`, CoinPresolve empty-column
+  removal): optimum-preserving and ~2× on 018 (31746→13917 pivots), but the
+  perturbed model re-rolls 020's proof-fragile tree (774→3400 nodes), so it
+  stays off by default. Fixing (105 = CBC's 105) and big-M coefficient
+  strengthening (301 ≈ CBC's 304, `Cgl0010I`-style) already match and ship on.
+- **Gap semantics**: default absolute gap is 1e-5, mirroring CBC's default
+  cutoff increment (`CbcCutoffIncrement`); `-allow`/`-ratio` override it.
+- **No multi-threaded search** (`-threads` accepted, ignored); **`-mips` warm
+  start** parsed but not wired; **format gaps** (free MPS only, no `OBJSENSE`,
+  no negative-`UP` — PuLP never exercises these).
+- **Two failing PuLP tests**: `test_measuring_solving_time` (16.5k-var
+  bin-packing, incumbent within 10s) and `test_infeasible` (expects CBC's exact
+  tie-breaking on a degenerate infeasible LP — not a correctness bug).
+
+## Benchmarks (evcc golden cases, Apple M4)
+
+The evcc battery-optimizer models: 1e6-range big-M coefficients make them
+ill-conditioned; the two levers are Clp scaling and CglProbing coefficient
+strengthening (both on by default, as CBC/Clp). Reference solver: real CBC
+2.10.3 (PuLP's bundled binary), defaults on both sides.
+
+Wall-clock, nodes, objective:
+
+| case | main (pre-rewrite) | this branch | real CBC |
+|---|---|---|---|
+| 018 | 4.9s, 18291.45 | **0.34s, 7 nodes, 18291.4519** | 0.04s, 0 nodes, 18291.4519 |
+| 021 | 5.8s, **8.6901 (wrong)** | **3.2s, 3 nodes, 8.70087** | 0.09s, 0 nodes, 8.70083 |
+| 020 | 60s, **−140 (garbage)** | **10.9s, 774 nodes, 0.55835 proven** | 3.6s, 833 nodes, 0.55835 |
+
+Tree robustness — nodes (and wall) as solve roundoff is perturbed via the
+refactorize interval `CBC_MAXETAS` ∈ {24, 32, 48, 64, 100}:
+
+| case | before strengthening | after | real CBC (any seed) |
+|---|---|---|---|
+| 018 | 27–336 nodes, 0.3–6.4s | **7–10 nodes, 0.20–0.65s** | 0 nodes |
+| 021 | 3–291 nodes, 2.6–31s | **3 nodes every run, 2.7–5.7s** | 0 nodes |
+| 020 | never proven | **proven 5/5, 10.3–24.6s** | 833 nodes, 3.6s |
+
+Probing coefficient strengthening lifts 018's pre-cut root bound from 18092
+to 18291.44 and stops node counts swinging with roundoff; fixed-column
+elimination (020: −364 cols), equality-chain substitution and per-solve
+pivot caps plus gap-scheduled diving take 020 from 59.8s to 10.9s with every refactorize interval
+proving. 020 root parity: preprocessing fixes 105 = CBC's 105
+(~350 rows strengthened vs CBC's 501), root cut bound within 1% of CBC's
+closed distance (−0.664 vs −0.658 from −0.885).
+
+**Why 020 is ~3× CBC's wall, decomposed.** The tree is already at parity —
+774 nodes vs CBC's 833. The 10.9s-vs-3.6s gap factors cleanly into pivot
+*volume* × per-pivot *cost*: cbcgo runs 182619 pivots at 59.7 µs each, CBC
+99465 iterations at 36.2 µs — **1.84× volume × 1.65× per-pivot = 3.03×**, the
+observed wall ratio. The per-pivot 1.65× is the Go sparse-triangular-solve
+(memory-bound `s -= cv[k]·y[r]` gather; ~45% of the solve is the dual BTRAN)
+vs Clp's C++ kernel — a codegen floor, not an algorithm gap. The volume 1.84×
+is strong-branch probes (81748 pivots vs CBC's 55266 strong-branch iterations,
+1.5×, on these 1e6-conditioned models) plus the root incumbent dive: faceWalk fires once at the root and
+spends 37711 pivots to find the first feasible point, where CBC's
+DiveCoefficient does it in 706 — a 53× gap. The model forces incremental
+per-variable diving (batch rounding via RENS fails on 020), so faceWalk
+re-solves once per fixed integer; CBC's cheaper (crunched / hot-started)
+re-solves and coefficient selection are exactly the two things that re-roll
+020's roundoff-fragile tree. Every volume-cutting lever was measured and
+re-rolls that tree: faceWalk pivot budget → timeout (loses the root incumbent),
+`CBC_CRUNCH`
+row-subset probes → 846 nodes (slower), `CBC_FREECOL` → 3400 nodes, probe
+stall-exit / higher caps / DSE probes → all worse. The tree-safe wins that
+ship (gap-scheduled diving, concrete-sort ratio test, pooled propagate) took
+020 from 12.6s to 10.9s without moving a single node. Reaching CBC's 3.6s
+needs a C++-class kernel, not a correctness or search-quality fix.

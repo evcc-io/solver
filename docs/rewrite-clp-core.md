@@ -1,0 +1,60 @@
+# Rewrite: Clp-faithful engine core
+
+Goal: reach CBC/Clp wall-clock and pivot-count parity. The existing feature
+ports (reliability branching, DSE `updateWeights`, warm cut re-solves, TwoMir)
+are matched to source and active, but KPI/time parity is blocked: CBC wins
+because its engine is **co-designed** on a reduced model where no vertex is a
+razor edge. Retrofitting single features onto cbcgo's full-size model perturbs
+the fragile 020 optimum (proven: DSE-everywhere, D1, Markowitz LU, warm cut
+re-solves each regress 020 in isolation).
+
+So the parity path is a coordinated core rewrite, not more feature flags.
+
+References (local): `../Clp` (ClpSimplexDual, ClpFactorization,
+ClpDualRowSteepest), `../CoinUtils` (CoinFactorization = Forrest-Tomlin LU),
+`../cbc` (CbcNode, CglPreProcess wiring).
+
+## Components, in dependency order
+
+1. **Forrest-Tomlin factorization** (`CoinFactorization`) — replace cbcgo's
+   product-form eta updates with FT (`replaceColumn` / `updateColumnFT`).
+   Cheaper, more stable updates; enables sparse two-column FTRAN so the DSE
+   `tau` solve is nearly free. This is the per-pivot cost lever.
+2. **Full Markowitz + threshold pivoting** in the LU — sparser kernel, but only
+   safe once (1) gives FT stability; on the current engine it perturbs 020.
+3. **`CglPreProcess` model reduction** — coefficient strengthening + forcing/
+   redundant-row removal to the ~1375-row model CBC solves. Requires (4) so the
+   reduced model keeps its cut strength.
+4. **Full `Cgl` suite** — Gomory, Probing, Knapsack, Clique, MixedIntegerRound2,
+   FlowCover, TwoMir, ZeroHalf run every node (CBC frequency), so the reduced
+   model's bound holds.
+5. **`ClpSimplexDual` dual loop** — incremental infeasibility list + partial
+   pricing (`numberWanted`), Harris ratio, proper degeneracy/perturbation.
+
+Parity is expected only once 1+3+4 land together (the co-design). Each lands
+behind a measurement gate and is benchmarked against `../optimizer` golden +
+real CBC (`cbc_run.py`) before activation.
+
+## Status
+
+- [x] 1. Forrest-Tomlin factorization — sparse L-col/U-row LU + O(nnz) solves,
+      alloc-free pooled `replaceColumn`, WIRED behind `CBC_FT` (clone-safe).
+      NUMERICALLY STABLE: trailing-block Bartels-Golub with PARTIAL PIVOTING,
+      expressed as a general R-file (interleaved swap + elimination ops),
+      property-tested; |mult|<=1. Correct end-to-end on the golden suite.
+      TRUE FT: the trailing-block re-triangularization is now sparse Hessenberg
+      elimination on the U rows (O(spike + fill), no dense block, no block cap),
+      with an `ftFillCap` bail to refactorize on pathological fill. ~10x faster
+      per update than the dense block; PuLP suite under `CBC_FT` matches the
+      default engine and is no slower. Stays active on large trailing blocks.
+- [~] 2. Sparse factorize — shortest-row + largest-entry pivoting, sparse
+      L-columns + U-rows, no dense work matrix, property-tested. Not yet fast:
+      needs a singleton pre-pass and bucketed pivot search (currently O(m^2)
+      scans), and full Markowitz; not yet faster than the tuned dense path.
+- [ ] 3. CglPreProcess (large subsystem — not started)
+- [x] 4. Cgl generators — 9 of 9: GMI, probing, single-row MIR, TwoMir (active);
+      knapsack-cover, clique, zero-half, flow-cover (PVRW), lift-and-project
+      (lifted cover cuts) behind CBC_CGL. All sound (soundness-tested +
+      golden 13/13 objectives correct with CBC_CGL=1).
+- [~] 5. Dual loop — `dual2.go` DSE dual is built and active via the mixed
+      engine (shipped); Clp partial-pricing / infeasibility-list not ported.

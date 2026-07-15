@@ -6,7 +6,8 @@ package simplex
 
 import (
 	"math"
-	"sort"
+	"os"
+	"slices"
 	"time"
 
 	"cbcgo/problem"
@@ -91,12 +92,21 @@ type LP struct {
 	pricingWindow int
 	pricingCursor int // scan position for partial pricing
 
-	fws *factorWS // reusable factorization workspace
-	dws *dualWS   // reusable dualRun workspace
+	fws  *factorWS // reusable factorization workspace
+	dws  *dualWS   // reusable dualRun workspace
+	d2ws *dual2WS  // reusable dual2Run (DSE node re-solve) workspace
 
 	// dseOff suspends the DSE dual (dual2) so this solve runs on the
 	// canonical dualRun vertex; DSE is reserved for deep node re-solves.
 	dseOff bool
+
+	// ftBCR/ftBCV pool the basis-column buffers fed to the FT refactorize.
+	ftBCR [][]int32
+	ftBCV [][]float64
+
+	// Clp-style geometric scaling (CBC_SCALE): row/col scales map original
+	// space to a conditioned scaled space; nil when off (boundaries unscale).
+	rowScale, colScale []float64
 
 	// run/recomputeBasics per-call vectors, reused (single-threaded)
 	runCost, runY, runA, residual []float64
@@ -122,16 +132,25 @@ type State struct {
 	value   []float64
 	f       *factor // basis factorization, shared between clones
 	etas    []eta   // product-form updates since f was built
+	ft      *ftLU   // Forrest-Tomlin factor (CBC_FT); when set, supersedes f+etas
 }
 
 // ftranVec computes Binv*v in place (v by row in, by basis position out).
 func (st *State) ftranVec(v []float64) {
+	if st.ft != nil {
+		st.ft.ftran(v)
+		return
+	}
 	st.f.ftran(v)
 	applyEtas(st.etas, v)
 }
 
 // btranVec computes Binv^T*w in place (w by basis position in, by row out).
 func (st *State) btranVec(w []float64) {
+	if st.ft != nil {
+		st.ft.btran(w)
+		return
+	}
 	applyEtasT(st.etas, w)
 	st.f.btran(w)
 }
@@ -139,6 +158,40 @@ func (st *State) btranVec(w []float64) {
 // refactorize rebuilds st's basis factorization and clears its eta file;
 // on (numerical) failure the existing factor+etas stay valid.
 func (lp *LP) refactorize(st *State) bool {
+	if ftEnabled { // FT drives solves; build only the FT factor unless it fails
+		if lp.ftBCR == nil {
+			lp.ftBCR = make([][]int32, lp.m)
+			lp.ftBCV = make([][]float64, lp.m)
+		}
+		for pos, j := range st.basicOf {
+			rows, vals := lp.column(int(j))
+			cr := lp.ftBCR[pos][:0]
+			for _, r := range rows {
+				cr = append(cr, int32(r))
+			}
+			lp.ftBCR[pos] = cr
+			lp.ftBCV[pos] = append(lp.ftBCV[pos][:0], vals...)
+		}
+		ftOK := false
+		if st.ft != nil && st.ft.m == lp.m {
+			if st.ft.rebuild(lp.ftBCR, lp.ftBCV) {
+				ftOK = true
+			} else {
+				st.ft = nil
+			}
+		} else if ft := newFTLUSparse(lp.m, lp.ftBCR, lp.ftBCV); ft != nil {
+			st.ft = ft
+			ftOK = true
+		}
+		if ftOK {
+			st.etas = nil
+			if st.f != nil { // keep st.f as an emergency fallback; skip factorize
+				return true
+			}
+			// no fallback yet: build st.f once below, then reuse it
+		}
+		// FT singular or first solve: build the sparseLU fallback below
+	}
 	cols := make([]int32, lp.m)
 	for pos, j := range st.basicOf {
 		cols[pos] = int32(j)
@@ -186,6 +239,13 @@ func Build(p *problem.Problem) *LP {
 		lp.lb[n+i], lp.ub[n+i] = lb, ub
 		lp.cost[n+i] = 0
 	}
+	if scaleEnabled {
+		isInt := make([]bool, n)
+		for j := range p.Cols {
+			isInt[j] = p.Cols[j].Integer
+		}
+		lp.scaleModel(isInt) // transform stored A/bounds/cost into scaled space
+	}
 	lp.colRow32 = make([][]int32, n+m)
 	lp.colVal32 = make([][]float64, n+m)
 	for j := range n + m {
@@ -221,6 +281,113 @@ func Build(p *problem.Problem) *LP {
 	// partial pricing disabled: extra pivots from window-local entering
 	// choices dominate scan savings when each pivot is O(m^2) on dense binv
 	return lp
+}
+
+// scaleEnabled gates Clp-style geometric scaling; on by default (as Clp),
+// but scaleModel skips already-well-conditioned matrices. CBC_SCALE=0 disables.
+var scaleEnabled = os.Getenv("CBC_SCALE") != "0"
+
+// scaleModel computes Clp geometric row/col scales and transforms A/bounds/
+// cost to scaled space; integer columns keep colScale=1 (clean rounding).
+func (lp *LP) scaleModel(isInt []bool) {
+	n, m := lp.n, lp.m
+	// Clp: leave a well-conditioned matrix unscaled (byte-identical default)
+	smallest, largest := math.Inf(1), 0.0
+	for j := range n {
+		for _, v := range lp.colVal[j] {
+			if a := math.Abs(v); a > 1e-20 {
+				smallest = math.Min(smallest, a)
+				largest = math.Max(largest, a)
+			}
+		}
+	}
+	if largest == 0 || (smallest >= 0.5 && largest <= 2.0) {
+		return
+	}
+	rs := make([]float64, m)
+	cs := make([]float64, n)
+	for i := range rs {
+		rs[i] = 1
+	}
+	for j := range cs {
+		cs[j] = 1
+	}
+	// geometric passes: scale so each row/col's |a| geomean -> 1
+	for pass := 0; pass < 5; pass++ {
+		rmin := make([]float64, m)
+		rmax := make([]float64, m)
+		for i := range rmin {
+			rmin[i] = math.Inf(1)
+		}
+		for j := range n {
+			for k, i := range lp.colRow[j] {
+				a := math.Abs(lp.colVal[j][k]) * rs[i] * cs[j]
+				if a == 0 {
+					continue
+				}
+				rmin[i] = math.Min(rmin[i], a)
+				rmax[i] = math.Max(rmax[i], a)
+			}
+		}
+		for i := range m {
+			if rmax[i] > 0 {
+				rs[i] /= math.Sqrt(rmin[i] * rmax[i])
+			}
+		}
+		cmin := make([]float64, n)
+		cmax := make([]float64, n)
+		for j := range cmin {
+			cmin[j] = math.Inf(1)
+		}
+		for j := range n {
+			for k, i := range lp.colRow[j] {
+				a := math.Abs(lp.colVal[j][k]) * rs[i] * cs[j]
+				if a == 0 {
+					continue
+				}
+				cmin[j] = math.Min(cmin[j], a)
+				cmax[j] = math.Max(cmax[j], a)
+			}
+		}
+		for j := range n {
+			if isInt[j] {
+				continue // keep integer columns unscaled
+			}
+			if cmax[j] > 0 {
+				cs[j] /= math.Sqrt(cmin[j] * cmax[j])
+			}
+		}
+	}
+	// apply: Â = a_ij*rs_i*cs_j; bounds/cost move to the scaled space
+	for j := range n {
+		for k, i := range lp.colRow[j] {
+			lp.colVal[j][k] *= rs[i] * cs[j]
+		}
+		if lp.lb[j] > -inf {
+			lp.lb[j] /= cs[j]
+		}
+		if lp.ub[j] < inf {
+			lp.ub[j] /= cs[j]
+		}
+		lp.cost[j] *= cs[j]
+	}
+	for i := range m {
+		if lp.lb[n+i] > -inf {
+			lp.lb[n+i] *= rs[i]
+		}
+		if lp.ub[n+i] < inf {
+			lp.ub[n+i] *= rs[i]
+		}
+	}
+	lp.rowScale, lp.colScale = rs, cs
+}
+
+// varScale returns x̂/x for variable j (structural 1/colScale, logical rowScale).
+func (lp *LP) varScale(j int) float64 {
+	if j < lp.n {
+		return 1 / lp.colScale[j]
+	}
+	return lp.rowScale[j-lp.n]
 }
 
 func (lp *LP) nTotal() int { return lp.n + lp.m }
@@ -278,19 +445,30 @@ func (lp *LP) resetNonbasic(st *State, j int) {
 // Clone returns a deep copy, safe to mutate independently of st (used to
 // warm-start a branch-and-bound child node from its parent's basis).
 func (st *State) Clone() *State {
-	return &State{
+	c := &State{
 		status:  append([]varStat(nil), st.status...),
 		basicOf: append([]int(nil), st.basicOf...),
 		value:   append([]float64(nil), st.value...),
 		f:       st.f, // immutable, shared
 		etas:    append([]eta(nil), st.etas...),
 	}
+	if st.ft != nil {
+		c.ft = st.ft.clone() // mutable: each child owns its FT factor
+	}
+	return c
 }
 
 // WarmSolve resolves from st after bound changes on touched. A touched
 // nonbasic keeps its side when still valid (snap-to-lower mangles the basis).
 func (lp *LP) WarmSolve(st *State, touched []int) (Status, *State, float64) {
 	return lp.warmSolve(st, touched, true)
+}
+
+// PrimalResolve re-optimizes from st with the primal simplex — use after an
+// objective change, which breaks the dual feasibility WarmSolve assumes.
+func (lp *LP) PrimalResolve(st *State) Status {
+	lp.recomputeBasics(st)
+	return lp.run(st)
 }
 
 func (lp *LP) warmSolve(st *State, touched []int, preserve bool) (Status, *State, float64) {
@@ -368,6 +546,14 @@ func (lp *LP) WarmSolveExtended(prev *State, prevM int) (Status, *State, float64
 // after at most `cap` dual pivots); ClearProbe restores normal solving.
 func (lp *LP) SetProbe(cap int) { lp.probeMode, lp.IterCap = true, cap }
 func (lp *LP) ClearProbe()      { lp.probeMode, lp.IterCap = false, 0 }
+
+// Probing reports probe mode: callers can skip work a probe discards.
+func (lp *LP) Probing() bool { return lp.probeMode }
+
+// SetIterCap bounds pivots per solve without probe semantics (0 = off):
+// heuristic solves use it so a degenerate grind returns IterLimit instead of
+// burning the budget (CBC caps heuristic/hot-start iterations the same way).
+func (lp *LP) SetIterCap(cap int) { lp.IterCap = cap }
 
 // dualPivotCap bounds dual pivots per re-solve; a degenerate dual bails to
 // the primal run instead of grinding forever.
@@ -503,7 +689,15 @@ func (lp *LP) dualRun(st *State) {
 			}
 		}
 		ws.cands = cands
-		sort.Slice(cands, func(a, b int) bool { return cands[a].ratio < cands[b].ratio })
+		slices.SortFunc(cands, func(a, b dualCand) int {
+			switch {
+			case a.ratio < b.ratio:
+				return -1
+			case a.ratio > b.ratio:
+				return 1
+			}
+			return 0
+		})
 
 		// dual long step (Clp "dual with flips"): boxed candidates that
 		// can't absorb the violation get flipped; the overshooter pivots
@@ -600,6 +794,15 @@ type dualWS struct {
 	touched                   []int
 	cands                     []dualCand
 	stamp                     []int32 // pivot index when row was last fixed
+}
+
+// dual2WS pools dual2Run's per-solve scratch (Clp keeps persistent work
+// arrays on ClpSimplex) so a warm node re-solve allocates nothing hot-path.
+type dual2WS struct {
+	d, w, rowR, tau, a, delta, alphaRow, costBuf, y []float64
+	seen                                            []bool
+	touched                                         []int
+	cands                                           []dual2Cand
 }
 
 // dualCand is one eligible entering candidate in the dual ratio test.
@@ -737,10 +940,32 @@ func (lp *LP) solveFrom(st *State) (Status, *State, float64) {
 
 func (lp *LP) objective(st *State) float64 {
 	var s float64
+	if lp.colScale != nil {
+		for j := range lp.n {
+			s += lp.rawObj[j] * lp.colScale[j] * st.value[j]
+		}
+		return s
+	}
 	for j := range lp.n {
 		s += lp.rawObj[j] * st.value[j]
 	}
 	return s
+}
+
+// unscaleBound/scaleBound convert a stored scaled bound to/from original,
+// preserving the ±inf sentinels (sc = x̂/x is always positive).
+func unscaleBound(b, sc float64) float64 {
+	if b <= -inf || b >= inf {
+		return b
+	}
+	return b / sc
+}
+
+func scaleBound(b, sc float64) float64 {
+	if b <= -inf || b >= inf {
+		return b
+	}
+	return b * sc
 }
 
 // InternalObjective returns the signed (always-minimized) objective, so
@@ -749,8 +974,14 @@ func (lp *LP) InternalObjective(st *State) float64 {
 	return lp.objective(st) * lp.objSign
 }
 
-// Bound returns variable j's current [lb,ub].
-func (lp *LP) Bound(j int) (float64, float64) { return lp.lb[j], lp.ub[j] }
+// Bound returns variable j's current [lb,ub] in original (unscaled) space.
+func (lp *LP) Bound(j int) (float64, float64) {
+	if lp.colScale == nil {
+		return lp.lb[j], lp.ub[j]
+	}
+	sc := lp.varScale(j)
+	return unscaleBound(lp.lb[j], sc), unscaleBound(lp.ub[j], sc)
+}
 
 // NumRows returns m, the row (and logical-variable) count.
 func (lp *LP) NumRows() int { return lp.m }
@@ -791,21 +1022,47 @@ func (lp *LP) TableauRow(st *State, r int, dst []float64) {
 		}
 		dst[j] = s
 	}
+	if lp.colScale != nil {
+		// map the scaled tableau row back to original variable units so
+		// cut derivation (original bounds, original rows) stays consistent
+		sbr := lp.varScale(st.basicOf[r])
+		for j := range lp.nTotal() {
+			dst[j] *= lp.varScale(j) / sbr
+		}
+	}
 }
 
-// ZeroCost returns a zero cost vector of the right length for SwapCost.
-func (lp *LP) ZeroCost() []float64 { return make([]float64, len(lp.cost)) }
-
-// SwapCost replaces the internal phase-2 cost vector (e.g. for a feasibility
-// pump projection) and returns the previous one; objective() is unaffected.
-func (lp *LP) SwapCost(c []float64) []float64 {
-	old := lp.cost
-	lp.cost = c
-	return old
+// ObjectiveOrig returns the structural objective in ORIGINAL space (length n),
+// so callers (e.g. the feasibility pump) work unscaled like CBC's OSI layer.
+func (lp *LP) ObjectiveOrig() []float64 {
+	c := make([]float64, lp.n)
+	for j := range lp.n {
+		c[j] = lp.rawObj[j] * lp.objSign
+	}
+	return c
 }
 
-// SetBound overrides variable j's [lb,ub] for subsequent solves.
-func (lp *LP) SetBound(j int, lb, ub float64) { lp.lb[j] = lb; lp.ub[j] = ub }
+// SetObjectiveOrig installs an original-space structural objective (length n),
+// scaling it into the internal cost; objective()/InternalObjective unaffected.
+func (lp *LP) SetObjectiveOrig(c []float64) {
+	for j := range lp.n {
+		v := c[j]
+		if lp.colScale != nil {
+			v *= lp.colScale[j]
+		}
+		lp.cost[j] = v
+	}
+}
+
+// SetBound overrides variable j's [lb,ub] (given in original space).
+func (lp *LP) SetBound(j int, lb, ub float64) {
+	if lp.colScale != nil {
+		sc := lp.varScale(j)
+		lp.lb[j], lp.ub[j] = scaleBound(lb, sc), scaleBound(ub, sc)
+		return
+	}
+	lp.lb[j], lp.ub[j] = lb, ub
+}
 
 // NumCols returns the number of structural columns.
 func (lp *LP) NumCols() int { return lp.n }
@@ -840,9 +1097,10 @@ func (lp *LP) run(st *State) Status {
 	phase1Cost, y, a := lp.runCost, lp.runY, lp.runA
 	degen := 0 // consecutive zero-step pivots; Bland's rule breaks cycles
 	cleaned := false
+	ubChecked := false // verified an unbounded ray against a fresh factorization
 	lp.xtol = xtolInit
 	for iter := 0; ; iter++ {
-		if iter > maxIter {
+		if iter > maxIter || (lp.IterCap > 0 && iter >= lp.IterCap) {
 			return IterLimit
 		}
 		if iter%1024 == 0 && !lp.Deadline.IsZero() && time.Now().After(lp.Deadline) {
@@ -892,6 +1150,15 @@ func (lp *LP) run(st *State) Status {
 			if inPhase1 {
 				return Infeasible
 			}
+			// A stale factorization can fake a ray; refactorize + reprice and
+			// re-test before concluding, as CBC/Clp do (mirrors the opt path).
+			if !ubChecked {
+				ubChecked = true
+				lp.refactorize(st)
+				lp.recomputeBasics(st)
+				lp.xtol = xtolInit
+				continue
+			}
 			return Unbounded
 		}
 		if inPhase1 {
@@ -906,6 +1173,7 @@ func (lp *LP) run(st *State) Status {
 		}
 		lp.pivot(st, q, dir, a, t, row, isFlip)
 		cleaned = false
+		ubChecked = false
 	}
 }
 
@@ -1129,6 +1397,25 @@ func (lp *LP) pivot(st *State, q int, dir float64, a []float64, t float64, leave
 		st.value[leaving] = ub
 	}
 
+	if st.ft != nil { // Forrest-Tomlin column swap in place of an eta
+		cb := st.ft.colBuf
+		for i := range cb {
+			cb[i] = 0
+		}
+		rows, vals := lp.column(q)
+		for k, r := range rows {
+			cb[r] = vals[k]
+		}
+		ok := st.ft.replaceColumn(leaveRow, cb)
+		st.basicOf[leaveRow] = q
+		st.status[q] = basic
+		if !ok || st.ft.nUpd > maxEtas { // too many updates: rebuild ft
+			lp.refactorize(st)
+			lp.recomputeBasics(st)
+		}
+		return
+	}
+
 	idx := make([]int32, len(wsIdx))
 	val := make([]float64, len(wsVal))
 	copy(idx, wsIdx)
@@ -1148,7 +1435,7 @@ func (lp *LP) Solution(st *State) (x, rowActivity, reducedCost, rowPrice []float
 	x = append([]float64(nil), st.value[:lp.n]...)
 	rowActivity = make([]float64, lp.m)
 	for i := range lp.m {
-		rowActivity[i] = -st.value[lp.n+i] * -1 // logical var value == row activity (y_i = Ax_i)
+		rowActivity[i] = st.value[lp.n+i] // logical var value == row activity
 	}
 	y := make([]float64, lp.m)
 	duals(st, lp.cost, lp.m, y)
@@ -1160,5 +1447,35 @@ func (lp *LP) Solution(st *State) (x, rowActivity, reducedCost, rowPrice []float
 	for j := range lp.n {
 		reducedCost[j] = lp.reducedCost(y, lp.cost, j) * lp.objSign
 	}
+	if lp.colScale != nil { // unscale to original space
+		for j := range lp.n {
+			x[j] *= lp.colScale[j]
+			reducedCost[j] /= lp.colScale[j]
+		}
+		for i := range lp.m {
+			rowActivity[i] /= lp.rowScale[i]
+			rowPrice[i] *= lp.rowScale[i]
+		}
+	}
 	return
+}
+
+// VarValueOrig returns basic-variable value in original (unscaled) space.
+func (lp *LP) VarValueOrig(st *State, j int) float64 {
+	v := st.value[j]
+	if lp.colScale != nil {
+		v /= lp.varScale(j)
+	}
+	return v
+}
+
+// Scaled reports whether geometric scaling is active on this LP.
+func (lp *LP) Scaled() bool { return lp.colScale != nil }
+
+// ColScale returns column j's scale (x_j = ColScale*x̂_j), 1 when unscaled.
+func (lp *LP) ColScale(j int) float64 {
+	if lp.colScale == nil {
+		return 1
+	}
+	return lp.colScale[j]
 }

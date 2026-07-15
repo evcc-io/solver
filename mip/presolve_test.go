@@ -1,7 +1,9 @@
 package mip
 
 import (
+	"math/rand"
 	"testing"
+	"time"
 
 	"cbcgo/problem"
 )
@@ -40,5 +42,95 @@ func TestPresolveCoefficientTightening(t *testing.T) {
 	}
 	if got := p.Cols[y].Coef[0]; got != -3 {
 		t.Errorf("column-side coef for y = %v, want -3", got)
+	}
+}
+
+// TestProbeStrengthenSound: probing coefficient strengthening must preserve
+// every integer-feasible point of random binary big-M MIPs.
+func TestProbeStrengthenSound(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	for trial := 0; trial < 300; trial++ {
+		p := problem.New()
+		nb := 2 + rng.Intn(4) // binaries
+		nc := 1 + rng.Intn(3) // bounded continuous
+		for i := 0; i < nb; i++ {
+			p.AddCol("b", 0, 1, rng.NormFloat64(), true, nil, nil)
+		}
+		for i := 0; i < nc; i++ {
+			p.AddCol("x", 0, 1+4*rng.Float64(), rng.NormFloat64(), false, nil, nil)
+		}
+		n := nb + nc
+		nr := 2 + rng.Intn(5)
+		for i := 0; i < nr; i++ {
+			var idx []int
+			var coef []float64
+			for j := 0; j < n; j++ {
+				if rng.Float64() < 0.6 {
+					idx = append(idx, j)
+					c := rng.NormFloat64() * 3
+					if j < nb && rng.Float64() < 0.5 {
+						c *= 100 // big-M-ish binary coefficient
+					}
+					coef = append(coef, c)
+				}
+			}
+			if len(idx) == 0 {
+				continue
+			}
+			kind := problem.LE
+			if rng.Float64() < 0.5 {
+				kind = problem.GE
+			}
+			p.AddRow("r", idx, coef, kind, rng.NormFloat64()*5)
+		}
+		// brute force: per binary assignment, the continuous box corners are
+		// NOT sufficient for feasibility in general — instead compare row-wise
+		// feasibility of many sampled mixed points before vs after probing.
+		type pt []float64
+		var pts []pt
+		for mask := 0; mask < 1<<nb; mask++ {
+			for s := 0; s < 8; s++ {
+				x := make(pt, n)
+				for j := 0; j < nb; j++ {
+					x[j] = float64((mask >> j) & 1)
+				}
+				for j := nb; j < n; j++ {
+					x[j] = p.Cols[j].UB * rng.Float64()
+				}
+				pts = append(pts, x)
+			}
+		}
+		feas := func(pr *problem.Problem, x pt) bool {
+			for j, c := range pr.Cols {
+				if x[j] < c.LB-1e-6 || x[j] > c.UB+1e-6 {
+					return false
+				}
+			}
+			for ri := range pr.Rows {
+				r := &pr.Rows[ri]
+				rlb, rub := r.Bounds()
+				act := 0.0
+				for k, j := range r.Idx {
+					act += r.Coef[k] * x[j]
+				}
+				if rub < problem.Inf && act > rub+1e-6 {
+					return false
+				}
+				if rlb > -problem.Inf && act < rlb-1e-6 {
+					return false
+				}
+			}
+			return true
+		}
+		before := make([]bool, len(pts))
+		for i, x := range pts {
+			before[i] = feas(p, x)
+		}
+		probe(p, time.Time{})
+		for i, x := range pts {
+			if before[i] && !feas(p, x) {
+				t.Fatalf("trial %d: integer-feasible point %v cut off by probing", trial, x)
+			}
+		}
 	}
 }

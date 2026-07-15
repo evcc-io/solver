@@ -48,7 +48,7 @@ func (m *Model) probingCuts(x []float64, deadline time.Time) int {
 				wl[k], wu[k] = p.Cols[k].LB, p.Cols[k].UB
 			}
 			wl[j], wu[j] = float64(side), float64(side)
-			if !propagate(p, wl, wu) {
+			if !propagate(p, wl, wu, nil) {
 				// side infeasible: the binary is fixed the other way
 				v := 1 - float64(side)
 				p.Cols[j].LB, p.Cols[j].UB = v, v
@@ -88,6 +88,77 @@ func (m *Model) probingCuts(x []float64, deadline time.Time) int {
 						added++
 					} else if side == 0 && x[k]+d*f < lb-vtol {
 						// z=0 forces x_k >= l': x_k + (l'-l0)z >= l'
+						p.AddRow("", []int{k, j}, []float64{1, d}, problem.GE, lb)
+						added++
+					}
+				}
+			}
+		}
+	}
+	return added
+}
+
+// probingCutsNode probes fractional binaries under the NODE bounds (lb0/ub0)
+// and adds implication rows valid only in that subtree (CBC probes at every
+// node); an infeasible side becomes a local fixing row, not a global change.
+func (m *Model) probingCutsNode(x, lb0, ub0 []float64, deadline time.Time) int {
+	p := m.P
+	n := len(p.Cols)
+	inf := problem.Inf
+	wl, wu := make([]float64, n), make([]float64, n)
+	added := 0
+	for j := range n {
+		if added >= 2*maxCutsPer || (!deadline.IsZero() && time.Now().After(deadline)) {
+			break
+		}
+		if !p.Cols[j].Integer || lb0[j] != 0 || ub0[j] != 1 {
+			continue
+		}
+		f := x[j]
+		if f < intTol || f > 1-intTol {
+			continue
+		}
+		for side := range 2 {
+			copy(wl, lb0)
+			copy(wu, ub0)
+			wl[j], wu[j] = float64(side), float64(side)
+			if !propagate(p, wl, wu, nil) {
+				// side infeasible under the node bounds: local fixing row
+				if side == 1 {
+					p.AddRow("", []int{j}, []float64{1}, problem.LE, 0)
+				} else {
+					p.AddRow("", []int{j}, []float64{1}, problem.GE, 1)
+				}
+				added++
+				break
+			}
+			for k := range n {
+				if k == j || added >= 2*maxCutsPer {
+					continue
+				}
+				l0, u0 := lb0[k], ub0[k]
+				scale := math.Max(1, math.Max(math.Abs(l0), math.Abs(u0)))
+				slack := 1e-7 * scale
+				minTight := 1e-4 * scale
+				vtol := 1e-6 * scale
+				if u0 < inf && wu[k] < u0-minTight {
+					ub := wu[k] + slack
+					d := u0 - ub
+					if side == 1 && x[k]+d*f > u0+vtol {
+						p.AddRow("", []int{k, j}, []float64{1, d}, problem.LE, u0)
+						added++
+					} else if side == 0 && x[k]-d*f > ub+vtol {
+						p.AddRow("", []int{k, j}, []float64{1, -d}, problem.LE, ub)
+						added++
+					}
+				}
+				if l0 > -inf && wl[k] > l0+minTight {
+					lb := wl[k] - slack
+					d := lb - l0
+					if side == 1 && x[k]-d*f < l0-vtol {
+						p.AddRow("", []int{k, j}, []float64{1, -d}, problem.GE, l0)
+						added++
+					} else if side == 0 && x[k]+d*f < lb-vtol {
 						p.AddRow("", []int{k, j}, []float64{1, d}, problem.GE, lb)
 						added++
 					}
@@ -169,10 +240,11 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 	}
 	var cands []cand
 	for r := range mm {
-		j, v := st.BasicVar(r)
+		j, _ := st.BasicVar(r)
 		if j >= n || !m.P.Cols[j].Integer {
 			continue
 		}
+		v := m.LP.VarValueOrig(st, j)
 		f := v - math.Floor(v)
 		if f < cutFracMin || f > 1-cutFracMin {
 			continue
@@ -285,8 +357,9 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 	tab := make([]float64, nt)
 	added := 0
 	for _, cd := range cands {
-		_, v := st.BasicVar(cd.r)
-		f0 := v - math.Floor(v)
+		j, _ := st.BasicVar(cd.r)
+		f0 := m.LP.VarValueOrig(st, j)
+		f0 -= math.Floor(f0)
 		clear(tab)
 		m.LP.TableauRow(st, cd.r, tab)
 		if derive(tab, f0, max(200, n/3)) {
@@ -309,7 +382,8 @@ func (m *Model) gomoryCuts(st *simplex.State) int {
 		for i := range topN {
 			tabs[i] = make([]float64, nt)
 			m.LP.TableauRow(st, cands[i].r, tabs[i])
-			_, bval[i] = st.BasicVar(cands[i].r)
+			jb, _ := st.BasicVar(cands[i].r)
+			bval[i] = m.LP.VarValueOrig(st, jb)
 		}
 		agg := make([]float64, nt)
 		pairAdded := 0

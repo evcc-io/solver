@@ -2,13 +2,27 @@
 // with product-form (eta) updates so pivots cost O(nnz) instead of O(m^2).
 package simplex
 
-import "math"
+import (
+	"math"
+	"os"
+	"strconv"
+)
 
 const (
 	pivotTol   = 1e-10 // singleton pivots below this go to the kernel
 	etaDropTol = 1e-12 // eta entries below this are dropped
-	maxEtas    = 32    // refactorize when the eta file grows past this
 )
+
+// 64 (was 32): with scaling default-on higher intervals are 021-safe, and 64
+// lands 020's fixed-column-eliminated model in a proven 15s basin (32 does not)
+var maxEtas = envInt("CBC_MAXETAS", 64)
+
+func envInt(k string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(k)); err == nil && v > 0 {
+		return v
+	}
+	return def
+}
 
 // triPivot resolves one variable by substitution: basis position pos pivots
 // on row row with diagonal a.
